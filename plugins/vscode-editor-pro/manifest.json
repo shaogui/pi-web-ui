@@ -1,0 +1,85 @@
+{
+	"id": "vscode-editor-pro",
+	"name": "编辑器 Pro",
+	"version": "0.2.1",
+	"icon": "🗃️",
+	"iconSvg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M14 2H6a2 2 0 0 0-2 2v11\"/><path d=\"M14 2v5h5\"/><path d=\"M14 2l5 5v5\"/><path d=\"M2 17s1.8-3 5.5-3 5.5 3 5.5 3-1.8 3-5.5 3S2 17 2 17Z\"/><circle cx=\"7.5\" cy=\"17\" r=\"1\"/><path d=\"M15 18h6\"/><path d=\"M18 15l3 3-3 3\"/></svg>",
+	"description": "多格式文件工作台：图片（缩放/平移/棋盘底）、PDF、音视频、SVG 双模、字体、Markdown 预览、CSV/TSV 表格、JSON 折叠树、二进制 Hex 正则原生渲染（不再把图片当文本打开），文本类用 CodeMirror 编辑并 Ctrl+S 保存；左栏文件树 + 多标签 + Ctrl+P 快速打开，另带全工作区/指定目录的内容搜索与批量替换，同时向宿主文件树注册上述格式的查看器。与「源代码管理」联动：它的「在编辑器中打开」会在这里定位到行，每次保存后立刻回叫它刷新状态。",
+	"descriptionEn": "Multi-format file workbench: native rendering for images (zoom/pan/checkerboard), PDF, video/audio, SVG (image or source), fonts, Markdown preview, CSV/TSV tables, collapsible JSON trees and binary hex dumps — no more opening a PNG as text. Text files open in CodeMirror with Ctrl+S save, alongside a lazy file tree, tabs, Ctrl+P quick open, and workspace-wide or directory-scoped content search with batch replace; the same viewers are registered with the host file tree. Source Control hands files over here (its “open in editor” button lands on the right line) and every save pings it to refresh.",
+	"apiVersion": 2,
+	"permissions": ["fs", "fs:read", "fs:write", "http"],
+	"view": true,
+	"fileHandlers": [
+		{
+			"id": "media",
+			"label": "编辑器 Pro",
+			"labelEn": "Editor Pro",
+			"extensions": [
+				".png",
+				".apng",
+				".jpg",
+				".jpeg",
+				".jfif",
+				".gif",
+				".webp",
+				".avif",
+				".bmp",
+				".ico",
+				".cur",
+				".tif",
+				".tiff",
+				".heic",
+				".heif",
+				".svg",
+				".pdf",
+				".mp4",
+				".m4v",
+				".webm",
+				".ogv",
+				".mov",
+				".mp3",
+				".wav",
+				".ogg",
+				".oga",
+				".opus",
+				".flac",
+				".m4a",
+				".aac",
+				".ttf",
+				".otf",
+				".woff",
+				".woff2"
+			],
+			"priority": 90
+		}
+	],
+	"settings": [
+		{
+			"key": "autoReload",
+			"type": "boolean",
+			"label": "外部改动自动刷新",
+			"labelEn": "Reload on external change",
+			"default": true,
+			"hint": "切回标签页时若磁盘上的 mtime 变了就重新加载（有未保存修改时只提示不覆盖）",
+			"hintEn": "Re-read the file when its mtime changed while the tab was inactive (never discards unsaved edits)"
+		},
+		{
+			"key": "imageCheckerboard",
+			"type": "boolean",
+			"label": "图片棋盘透明底",
+			"labelEn": "Checkerboard behind images",
+			"default": true,
+			"hint": "透明 PNG/SVG 下铺灰白棋盘格，便于看清透明区域",
+			"hintEn": "Draw a grey/white checkerboard behind transparent images"
+		},
+		{
+			"key": "restoreTabs",
+			"type": "boolean",
+			"label": "恢复上次打开的标签",
+			"labelEn": "Restore last session's tabs",
+			"default": true,
+			"hint": "按工作区记住已打开的标签页，重新进入时自动恢复",
+			"hintEn": "Remember open tabs per workspace and reopen them"
+		}
+	]
+}
