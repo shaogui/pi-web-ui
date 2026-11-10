@@ -1,7 +1,10 @@
-# AI 待办（`待办` 页签，0.12.0）
+# AI 待办（`待办` 页签，0.17.0）
 
-> 目标：**和我有关的事，不用我记着**。插件盯着一份本地待办库，持续给「一句话判断 + 可执行步骤」，
+> 目标：**和我有关的事，不用我记着**。插件盯着一份本地待办库，回答「现在先做什么」，
 > 需要动手时我点一个按钮，AI 就去做（对外发消息这类动作先给我看草稿）。
+>
+> 0.17.0 的信息架构：**今天 / 收件箱 / 全部**。列表一条一行，建议、出处、历史全在右侧详情里；
+> AI 只在用户点「AI 今天怎么办」或「让 AI 给建议」时调用 —— 打开页签不再自动烧额度。
 
 ## 1. 为什么不是「飞书任务面板」
 
@@ -64,7 +67,8 @@
 1. `normalizeTodo` 幂等，未知字段丢弃；`doneAt` 只跟 `status` 走；
 2. `ref` 的 `kind:id` 是**跨同步去重键**（飞书任务按 `guid`、消息按 `messageId`），没有稳定 ID 就不去重；
 3. 动作的 `ranAt` 必须活过每一次 normalize —— 丢了它，界面会让人把同一件事做第二遍；
-4. 排序：未完成 → 有截止（早的靠前）→ 优先级 → 最近更新；完成/搁置沉底但**不隐藏**。
+4. 排序：未完成 → 有截止（早的靠前）→ 优先级 → 最近更新；完成/搁置沉底但**不隐藏**；
+5. 只有日期（00:00）的截止按**当天结束**算（`dueDeadline`）：否则早上记的「今天」下一秒就显示逾期。
 
 容量：单文件 `storage.json` 原子写，`TODO_LIMIT = 300` 条封顶。
 
@@ -74,6 +78,13 @@
 | ------------------ | -------------------------------------------------------------------------------------------------------------- |
 | `todos.candidates` | 跟 `todos` 同文件内的 `candidates` 字段：**待采纳候选**（消息提取产出，最多 20 条，按标题去重、id 由标题哈希） |
 | `todos.config`     | 自动获取配置：`{autoSync, autoExtract, intervalMin, lastRunAt, lastResult, lastError}`，默认全关               |
+
+同文件内还有两个 0.17.0 新增字段：
+
+| 字段                  | 作用                                                                                               |
+| --------------------- | -------------------------------------------------------------------------------------------------- |
+| `ignoredCandidateIds` | 用户点过「忽略」的候选 id（最多 200 条）。下一轮提取直接跳过它们 —— 否则「收起」之后同一批又回来。 |
+| `briefing`            | 最近一次「AI 今天怎么办」的结果：`{summary, order[{id,why}], drop[{id,why}], ids, at, model}`。    |
 
 候选要落盘的理由：自动提取是在面板**没开着**的时候跑的，没落盘就等于白花一次模型额度
 （而且用户还会从通知里知道「发现了 N 条」，回来看不到就成了假的）。
@@ -91,32 +102,48 @@
 - `reply` 缺收件人 → **降级成 `insert`**：「宁可让用户自己粘一下，也不要把消息发给模型猜出来的对象」；
 - 预算：prompt ≤ 6000 字（`host.llm.complete` 硬上限 8000），`maxChars: 1600`，超时 75s。
 
-调度策略：
+### 3.1 AI 简报（0.17.0，`POST /todos/briefing`）
 
-| 场景                   | 行为                                                                 |
-| ---------------------- | -------------------------------------------------------------------- |
-| 打开「待办」页签       | 自动给「未完成 + 建议过期」的前 3 条生成建议（一次打开只跑一轮）     |
-| 点「AI 建议」/「重算」 | `force: true`，只算这一条                                            |
-| 点「AI 梳理」          | 同上，批量最多 3 条（逾期/今天优先）                                 |
-| 6 小时内               | 不重复算（`ADVICE_TTL_MS`），不花用户额度                            |
-| 点「没用」             | 清掉建议并记 `adviceMutedAt`，下次换说法（不会立刻重算，避免死循环） |
+逐条建议回答「这件事怎么做」，简报回答「今天先做什么」。两者分开，是因为前者的成本
+（每条一次模型调用）不适合在用户打开清单时静默发生：
+
+| 项       | 口径                                                                                      |
+| -------- | ----------------------------------------------------------------------------------------- |
+| 输入     | 未完成里最靠前的 8 条：标题 / 截止 / 优先级 / 状态 / 来源 / 已有建议                      |
+| 输出     | `{summary, order[{id,why}], drop[{id,why}]}`；`id` 必须来自输入，编的 id 在解析层直接丢掉 |
+| 保鲜期   | 30 分钟（`BRIEFING_TTL_MS`），且要求「当前未完成集合」与生成时一致；不一致只标「已过期」  |
+| 何时调用 | **只**在用户点「AI 今天怎么办 / 刷新」时。打开页签、切页签都不调用                        |
+| 降级     | 回包不是 JSON → 取首行当 summary（还能读，但排不出顺序）                                  |
+
+调度策略（逐条建议）：
+
+| 场景               | 行为                                                                 |
+| ------------------ | -------------------------------------------------------------------- |
+| 打开「待办」页签   | **不再自动算**（0.17.0 起；额度只在用户点的时候花）                  |
+| 点「让 AI 给建议」 | `force: true`，只算详情里这一条                                      |
+| 点「重算」         | 同上                                                                 |
+| 6 小时内           | 已有建议不重复算（`ADVICE_TTL_MS`）；点「重算」才强制                |
+| 点「没用」         | 清掉建议并记 `adviceMutedAt`，下次换说法（不会立刻重算，避免死循环） |
 
 服务端还有一道 `advising` 集合：同一条待办在飞时直接跳过，连点两次不会烧两份额度。
 
 ## 4. 一键处理（`execute`）
 
-| 动作     | 服务端行为                                                                             | 前端要求                       |
-| -------- | -------------------------------------------------------------------------------------- | ------------------------------ |
-| `reply`  | 用**服务端存的那份文本与收件人**调 `im +messages-send`，`uuid = f(todo.id, action.id)` | 先摊开草稿，点「确认发送」才发 |
-| `agent`  | `host.chat({text: buildAgentTask(todo), accountId: "feishu-pro:todo"})`                | 先 `confirm`                   |
-| `insert` | 只回 `{directive:{type:"insert"}}`，不产生副作用                                       | 插进对话输入框（失败落剪贴板） |
-| `open`   | 只回 `{directive:{type:"open",url}}`                                                   | `window.open`                  |
+| 动作     | 服务端行为                                                                             | 前端要求                         |
+| -------- | -------------------------------------------------------------------------------------- | -------------------------------- |
+| `reply`  | 用**服务端存的那份文本与收件人**调 `im +messages-send`，`uuid = f(todo.id, action.id)` | 先摊开草稿，点「确认发送」才发   |
+| `agent`  | `host.chat({text: buildAgentTask(todo), accountId: "feishu-pro:todo"})`                | 先展示任务文本，再点「确认派单」 |
+| `insert` | 只回 `{directive:{type:"insert"}}`，不产生副作用                                       | 插进对话输入框（失败落剪贴板）   |
+| `open`   | 只回 `{directive:{type:"open",url}}`                                                   | `window.open`                    |
 
 三条红线：
 
 1. **前端只能指定「哪一个动作」，不能指定「发什么」**：文本与收件人一律取服务端存过的那份（`/todos/execute` 只收 `{id, actionId}`）；
 2. **幂等键稳定**：`replyUuidFor(todo, action)`，重试/连点在飞书侧被去重，不会发两遍（与 `im_send` 同一条铁律）；
 3. **`agent` 的提示词由服务端固定生成**（`buildAgentTask`）：写清"只处理这一件事""收件人不明确就别发""用工具真做完，别只给计划"。
+
+0.17.0 起确认框是**内联**的（不再 `window.confirm`）：reply 摊开草稿（收件人 + 正文 + 确认发送），
+agent 摊开任务文本（确认派单）。两者都还在详情里，不跳页、不弹系统对话框。
 
 派出去的运行走独立账号 `feishu-pro:todo`，与「私聊自动问答」（`feishu-pro:auto`）的会话互不覆盖。
 `onRunEvent` 按 `runId` 认领：assistant 文本攒着，`run_end` 时写进 `history` 并发一条通知，状态从 `doing` 回到 `open`
@@ -138,8 +165,11 @@
 默认一次最多看 8 个会话（`EXTRACT_CHATS`）、每个会话 20 条、总消息 60 条
 （超了从最早的丢：最近的对话才会产生新待办）。
 
-同包是候选列表（不落库）：`{items:[{title, detail, dueAt, priority, reason}]}`。
-界面上点「记下」才 `POST /todos/create`（`source: "extract"`），已在库里的同名标题会被服务端过滤掉。
+同包是候选列表：`{items:[{title, detail, dueAt, priority, reason}]}`，服务端会先归一成带
+`id`（标题哈希）的候选再落盘 —— 界面的「记下 / 忽略」都只传这个 id。
+界面上点「记下」才建待办（`source: "extract"`），已在库里的同名标题会被服务端过滤掉；
+点「忽略」把 id 记进 `ignoredCandidateIds`，**下一轮提取不再出现它**（「收起全部」同义）。
+候选正文由服务端存过的那份决定：前端不拼、也改不了（与动作同一条红线）。
 
 ## 6. 飞书任务：双向同步（`lib/cli-tasks.mjs`）
 
@@ -174,8 +204,9 @@ PATCH /open-apis/task/v2/tasks/:task_guid   → { task: {...}, update_fields: [.
 **调度器在 `index.mjs`，不在服务层** —— 服务层保持纯函数 + 注入依赖，单测可以一行跑一轮
 （`todoService.autoRun()`）；宿主侧只负责「什么时候跑」。
 
-- 配置存 `todos.config`，默认 `{autoSync:false, autoExtract:false}`。「⏱ 自动」一开关同时管两件事，
-  间隔可选 **15 / 30 / 60 / 120 分钟**（`normalizeTodoConfig` 夹在 15–360）；
+- 配置存 `todos.config`，默认 `{autoSync:false, autoExtract:false}`。界面上是**两个独立开关**
+  （定时同步只读、不花额度；定时提取会花模型额度），间隔可选 **15 / 30 / 60 / 120 分钟**
+  （`normalizeTodoConfig` 夹在 15–360）；
 - 一轮 = `sync()`（拉飞书任务）+ `extract()`（从本地缓存的会话消息提候选），候选落盘并 `notify` 一句；
 - 时间口径是**纯函数** `autoNextAt()`：没跑过 → 立刻；过点（服务停了一晚）→ 立刻补一轮；否则 `lastRunAt + interval`；
 - `lastRunAt` 失败也写 —— 否则过点后每个 tick 都会重跑，变成热循环；
@@ -185,75 +216,87 @@ PATCH /open-apis/task/v2/tasks/:task_guid   → { task: {...}, update_fields: [.
 
 ## 8. 路由与工具
 
-| 方法 + 路径                    | 作用                                                                          |
-| ------------------------------ | ----------------------------------------------------------------------------- |
-| `GET /todos`                   | 快照（items / candidates / config / nextAutoAt / stats / capabilities）       |
-| `POST /todos/create`           | 新增（title 必填；`toFeishu: true` 才在飞书建任务）                           |
-| `POST /todos/update`           | `{id, patch}`，改过的字段 + 完成态写回飞书，失败回 `writeBack.warning`        |
-| `POST /todos/delete`           | 删除（不删飞书任务；联动条目记 `deletedTaskIds`，不再被同步拉回）             |
-| `POST /todos/sync`             | 合并飞书任务（只增改）                                                        |
-| `POST /todos/config`           | `{autoSync?, autoExtract?, intervalMin?, restart?}` 自动获取配置（夹 15–360） |
-| `POST /todos/advise`           | `{ids?, force?, limit≤3}` 生成建议                                            |
-| `POST /todos/mute`             | 清掉这条建议并静音                                                            |
-| `POST /todos/execute`          | `{id, actionId}` 执行动作                                                     |
-| `POST /todos/extract`          | 从本地缓存的会话消息提取候选（同时落盘；回包带 `pending` 供前端直接渲染）     |
-| `POST /todos/adopt`            | `{id}` 采纳一条候选（正文取服务端存过的那份）                                 |
-| `POST /todos/candidates-clear` | 收起全部候选（不建待办）                                                      |
+| 方法 + 路径                     | 作用                                                                                         |
+| ------------------------------- | -------------------------------------------------------------------------------------------- |
+| `GET /todos`                    | 快照（items / candidates / config / nextAutoAt / stats / capabilities / running / briefing） |
+| `POST /todos/create`            | 新增（title 必填；`toFeishu: true` 才在飞书建任务）                                          |
+| `POST /todos/update`            | `{id, patch}`，改过的字段 + 完成态写回飞书，失败回 `writeBack.warning`                       |
+| `POST /todos/delete`            | 删除（不删飞书任务；联动条目记 `deletedTaskIds`，不再被同步拉回）                            |
+| `POST /todos/sync`              | 合并飞书任务（只增改）                                                                       |
+| `POST /todos/config`            | `{autoSync?, autoExtract?, intervalMin?, restart?}` 自动获取配置（夹 15–360）                |
+| `POST /todos/advise`            | `{ids?, force?, limit≤3}` 生成建议                                                           |
+| `POST /todos/briefing`          | `{force?}` 生成/读取今天的简报（30 分钟保鲜，列表变了才重算）                                |
+| `POST /todos/mute`              | 清掉这条建议并静音                                                                           |
+| `POST /todos/execute`           | `{id, actionId}` 执行动作                                                                    |
+| `POST /todos/extract`           | 从本地缓存的会话消息提取候选（归一后落盘；回包带 `pending`，带 id）                          |
+| `POST /todos/adopt`             | `{id}` 采纳一条候选（正文取服务端存过的那份）                                                |
+| `POST /todos/candidates-ignore` | `{id}` 忽略一条候选（`{all:true}` = 收起全部）；记进 `ignoredCandidateIds`，不再复活         |
+| `POST /todos/candidates-clear`  | 兼容旧路由：等价于 `candidates-ignore {all:true}`                                            |
 
 AI 工具 `feishu_todo`（与 `feishu_pro` 分开：一个"读飞书"、一个"管我自己的事"，参数面完全不同）：
 
 ```
-action=list     看现在有哪些事（带 stats 与能力位）
-action=add      记一条（to_feishu=true 时同时建飞书任务 —— 会真的在远程建东西，先确认）
-action=update   改状态/优先级/截止（联动条目会回写飞书）
-action=advise   生成建议（不执行）
-action=handle   执行一个动作（kind=agent 会真跑一轮 —— 先确认）
-action=mute     这条建议没用
-action=sync     同步飞书任务
-action=config   开关自动获取（auto_sync / auto_extract / interval_min）
+action=list      看现在有哪些事（带 stats 与能力位）
+action=add       记一条（to_feishu=true 时同时建飞书任务 —— 会真的在远程建东西，先确认）
+action=update    改状态/优先级/截止（联动条目会回写飞书）
+action=advise    生成建议（不执行）
+action=briefing  今天先做什么（带 order/drop，默认读 30 分钟缓存；force=true 重算）
+action=handle    执行一个动作（kind=agent 会真跑一轮 —— 先确认）
+action=mute      这条建议没用
+action=sync      同步飞书任务
+action=config    开关自动获取（auto_sync / auto_extract / interval_min）
 ```
 
 ## 9. 前端（`client/todo-view.mjs`）
 
-**排版原则：一条待办 = 一行**（标题 + 截止 + 优先级 + 行尾图标操作），建议再占一行；
-正文/步骤/历史/来源全部折叠到「▾ 展开」后面。这块不是文档阅读器，是扫一眼就要下手的清单。
+**信息架构：今天 / 收件箱 / 全部。**
 
-| 元素        | 折叠态                                                                                   | 展开态                   |
-| ----------- | ---------------------------------------------------------------------------------------- | ------------------------ |
-| 标题        | 单行省略（`title` 兜底全文）                                                             | 允许换行                 |
-| 正文        | 单行省略                                                                                 | 完整分行（左边框引用块） |
-| AI 判断     | 单行省略 + `n 步` 小标签 + 生成时间                                                      | 完整换行                 |
-| AI 步骤     | 不渲染（只显示条数）                                                                     | `<ol>` 全部              |
-| 来源/发送者 | 不渲染                                                                                   | 追加到标签行             |
-| 历史        | 不渲染                                                                                   | 最近 4 条                |
-| 操作        | 行尾 21px 图标按钮（✦ 建议 / ✎ 编辑 / ⏸ 搁置 / ▾ 展开 / 🗑 删除），`title` + `aria-label` | 同左                     |
+| 分段   | 内容                                                                 | 回答的问题     |
+| ------ | -------------------------------------------------------------------- | -------------- |
+| 今天   | 逾期 → 今天到期 → AI 处理中；顶部是「AI 简报」（如果有）             | 现在该做什么   |
+| 收件箱 | 来自消息的候选 → 待安排（无截止）→ 以后（有截止但不在今天）          | 还有什么没安排 |
+| 全部   | 待处理 / AI 处理中 / 已完成 / 以后再说；搜索是**全局**的，不按分段裁 | 那件事去哪了   |
+
+**排版原则：一条待办 = 一行**（勾选 + 标题 + 截止/优先级 + 飞书标签），只有 AI 正在跑时才多一行进度。
+正文、步骤、来源、历史、动作按钮全部在右侧详情里 —— 列表不是文档阅读器，是扫一眼就要下手的清单。
+
+| 元素     | 列表                     | 详情                                    |
+| -------- | ------------------------ | --------------------------------------- |
+| 标题     | 单行省略（`title` 兜底） | 头部单行省略，点「编辑」可改            |
+| 正文     | 不渲染                   | 完整分行（保留换行）                    |
+| AI 判断  | 不渲染                   | 概要 + 步骤 `<ol>` + 动作按钮           |
+| 来源     | 只有「飞书」标签         | 发送者 + 「看原话」（切到会话页并打开） |
+| 历史     | 不渲染                   | 最近 6 条，可展开全部                   |
+| 行内操作 | 勾选（完成/重开）        | 完成 / 以后再说 / 删除（两步确认）      |
 
 其它约束：
 
-- **同步状态可见**：`ref.kind === "task"` 的条目紧凑行就有「飞书」小标签（同步了却没标出来，人会以为白联动）；
-- **新建默认不同步**：输入框旁一个「飞书」勾选，默认不勾（建远程任务是显式动作）；
-  `capabilities.taskWrite` 缺失时勾选框直接禁用 + `title` 说缺什么；
-- **自动获取**：工具栏「⏱ 自动」+ 间隔 `select`；开启后按钮变「⏱ 自动 · 30分」并高亮，状态栏跟一行「自动每 N 分钟」；
-- **候选常驻**：候选块从 `/todos` 快照渲染（不只在手动提取后），行内「记下」走 `/todos/adopt`，
-  「收起」走 `/todos/candidates-clear`；
-- 打字不整页重渲染：内联编辑期间 `editingId` 非空时跳过自动刷新；
-- 危险动作的视觉分离：`reply` 用主色按钮（唯一会对外说话的动作），其余是普通按钮；
-- 能力缺失就把按钮**禁用 + 说明缺什么**（没有 `llm` 就说"宿主未提供模型补全"），不是点了才报错；
-- 派单后轮询（5s × 最多 30 次）等 `history` 里出现结果，跑完自动停并在状态栏说一句。
+- **捕获本地解析**：`明天 10 点 / 周五下午 3 点 / 3月5日 / !高 / !!` 由 `client/capture-parse.mjs`
+  解析成 chips（可点 × 去掉），标题与 `dueAt` 一起 POST。**不调模型** —— 捕获必须打字就有反馈；
+- **「同步飞书」是显式动作**：输入区的勾选默认不勾，`capabilities.taskWrite` 缺失时禁用 + `title` 说明；
+- **低频运维收进「⋯」**：同步飞书任务 / 从消息提取 / 定时同步 / 定时提取（两个独立开关）/ 间隔 / 清空候选；
+- **候选是单条动作**：记下 / 忽略 / 原话；忽略走 `/todos/candidates-ignore`，下一轮不再出现；
+- **确认框内联**：reply 摊开草稿（收件人 + 正文），agent 摊开任务文本；不使用 `window.confirm`；
+- **危险动作的视觉分离**：`reply` 用主色（唯一会对外说话的动作），其余是普通按钮；
+- **能力缺失就把按钮禁用 + 说明缺什么**（没有 `llm` 就说"宿主未提供模型补全"），不是点了才报错；
+- 编辑期间跳过详情重渲染（否则光标会跳）；成功提示 5 秒自动消失，错误留在提示条里；
+- **AI 进度可见**：`doing` 行显示「AI 正在处理 · 已 m:ss」（`snapshot.running`），完成后结果写进历史；
+  运行丢了（服务重启）不无限轮询，详情里给「结束这次处理」；
+- **键盘**：`/` 记一条、`j/k` 选择、`x` 完成、`Enter` 打开详情、`Esc` 关闭；
+- 窄面板（≤760px）详情整页覆盖列表，返回键回列表（容器查询，不写死 z-index）。
 
 ## 10. 回归测试
 
 ```bash
-npx vitest run tests/unit/feishu-pro-todo.test.ts tests/unit/feishu-pro-todo-view.test.ts
+npx vitest run tests/unit/feishu-pro-todo.test.ts tests/unit/feishu-pro-todo-view.test.ts tests/unit/feishu-pro-todo-extract.test.ts
 ```
 
-`feishu-pro-todo.test.ts`（服务端与纯函数）：归一幂等、`doneAt` 与状态联动、来源去重、排序与统计、
-合并飞书任务不覆盖建议、动作白名单与「无收件人不发」、`ranAt` 存活、回包解析（围栏/纯文本降级）、
-CLI 适配的 flag 重试与 `writeBack:false`、**`createTask`/`updateTask` 的 body 形状与「只带显式字段」**、
-**自动获取的配置夹取 / `autoNextAt` 口径 / 候选去重、落盘**、服务层的创建（含 `toFeishu` 成功与降级）、
-编辑回写（只 PATCH 真改过的字段、完成走 `setDone`）、**`autoRun` 的开关门禁与失败不抛**、候选采纳。
+`feishu-pro-todo.test.ts`（纯函数 + 服务层）：捕获解析（明天/周X/月日/只有钟点/优先级/不猜）、
+`dueDeadline` 与「今天 00:00 不算逾期」、`bucketTodo` / `buildSections` 的三段分组、简报解析
+（编造的 id 丢掉、纯文本降级）、简报缓存、候选忽略后不再出现、`normalizeStore` 保留新字段。
 
-`feishu-pro-todo-view.test.ts`（jsdom）：草稿二次确认、agent 的 confirm 取消、打勾改状态、回车新增、
-候选采纳（走 `/todos/adopt`，不自己拼正文）、快照候选常驻渲染与收起、**自动开关/间隔发往 `/todos/config`**、
-**新建勾「飞书」才带 `toFeishu`（无写权限则禁用）**、回写失败按错误色提示且不清列表、
-同步 warning 着色、接口失败不清空列表、能力缺失时按钮禁用。
+`feishu-pro-todo-view.test.ts`（jsdom）：列表一行一条（建议/正文不在行内）、点行开详情并「看原话」、
+收件箱里候选与无截止条目、候选「记下/忽略」只发 id、reply 先草稿后确认、agent 先看任务再派单
+（不弹原生 confirm）、本地解析后创建带 `dueAt`、简报只在点击时请求、删除两步确认、能力缺失时禁用。
+
+`feishu-pro-todo-extract.test.ts`：提取来源是全局缓存、分层读取与 CLI 回源封顶。

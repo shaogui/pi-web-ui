@@ -14,9 +14,9 @@
 
 import { PLUGIN_ID, normalizeConfig } from "./lib/config.mjs";
 import { existsSync } from "node:fs";
-import { mkdir, readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdir, readFile, stat } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import {
 	RECENT_LIMIT,
 	clearRecentStore,
@@ -56,14 +56,14 @@ import {
 } from "./lib/chats.mjs?v=0.14.1";
 import { normalizeOrderBy, toMs } from "./lib/docs.mjs";
 // AI 待办：本地库（纯函数）+ 服务层 + 飞书任务适配（lark-cli `api` 兜底）。
-import { createTodoService } from "./lib/todo-service.mjs?v=0.14.1";
+import { createTodoService } from "./lib/todo-service.mjs?v=0.17.0";
 import {
 	createTask as createTaskViaCli,
 	listMyTasks as listMyTasksViaCli,
 	setTaskDone as setTaskDoneViaCli,
 	updateTask as updateTaskViaCli,
 } from "./lib/cli-tasks.mjs?v=0.14.1";
-import { TODO_ADVICE_LIMIT } from "./lib/todo-store.mjs?v=0.14.1";
+import { TODO_ADVICE_LIMIT } from "./lib/todo-store.mjs?v=0.17.0";
 // lark-cli 通道：重构后的主路径（凭证与接口都交给官方 CLI；不可用时各能力回落上面的 OpenAPI 实现）。
 import { CliError, createCliRunner, discoverCli, toCliErrorPayload } from "./lib/cli-bridge.mjs";
 import {
@@ -98,7 +98,7 @@ import {
 	createAutoReplier,
 	matchAutoReply,
 	normalizeAutoConfig,
-} from "./lib/auto-reply.mjs?v=0.14.1";
+} from "./lib/auto-reply.mjs?v=0.18.0";
 // 会话页按需「让 AI 代写回复」：预览 / 直发共用同一个生成引擎。
 import { createChatAiReplier, splitReplyText } from "./lib/chat-ai.mjs?v=0.16.0";
 import {
@@ -163,7 +163,7 @@ export {
 	todoKeyOf,
 	todoStats,
 	upsertTodo,
-} from "./lib/todo-store.mjs?v=0.14.1";
+} from "./lib/todo-store.mjs?v=0.17.0";
 export {
 	buildAdvicePrompt,
 	buildAgentTask,
@@ -539,7 +539,36 @@ export default {
 			// 新增消息 → 自动回复引擎（未启用时引擎自己会跳过，不产生任何副作用）。
 			// 注意自激回环：以 user 身份回包时 dm-watch 会因 selfOpenId 自己滤掉，不会自己答自己。
 			onNew: (list) => {
-				void autoReplier?.onMessages(list);
+				// 群聊默认只回 @我 的：飞书把被 @ 的人放在 `mentions[].id`（open_id），这里用自己的
+				// openId 标一个 `mentionMe`。不知道自己是谁时留 `undefined`（引擎会放行，不误杀）。
+				const selfId = currentOpenId || "";
+				const rows = (Array.isArray(list) ? list : []).map((record) =>
+					record && typeof record === "object" && record.chatKind === "group"
+						? {
+								...record,
+								mentionMe: selfId
+									? Array.isArray(record.mentions)
+										? record.mentions.some((m) => m?.id === selfId)
+										: false
+									: undefined,
+							}
+						: record,
+				);
+				// 前置分析要最近几条上下文（"嗯" / "就按这个来" 离开上下文没法判）。
+				// 只读**本地缓存**：不为 triage 多打一次飞书接口，也不额外 spawn CLI。
+				const recentByChat = new Map();
+				for (const record of rows) {
+					const chatId = String(record?.chatId ?? "");
+					if (!chatId || recentByChat.has(chatId)) continue;
+					try {
+						const cached = chatCache.chat(chatId, { limit: 8 }).rows || [];
+						// 缓存是新到旧，提示词要旧到新。
+						recentByChat.set(chatId, cached.slice().reverse());
+					} catch {
+						recentByChat.set(chatId, []);
+					}
+				}
+				void autoReplier?.onMessages(rows, { recentByChat });
 			},
 			// 后台轮询拉到的每一页都进本地会话缓存：界面打开会话时直接读，
 			// 不再为同一批消息另走一次 CLI（这正是「选中会话要等一会」的根因）。
@@ -1199,26 +1228,48 @@ export default {
 			};
 		}
 
-		/* ------------------------ 私聊自动问答（onNew → chat → 回包） ------------------------ */
+		/* ------------------------ 私聊自动问答（onNew → triage → 回包/动手） ------------------------ */
 		//
-		// 闭环：dm-watch 轮询出新消息 → 引擎判定该不该回（白名单/冷却/限频/陈旧）→ host.chat 无头跑一轮
-		// → 收 assistant 文本 → 以「我」或机器人身份发回去。
+		// 闭环：dm-watch 轮询出新消息 → 引擎判定该不该接（白名单/冷却/限频/陈旧）
+		// → **前置分析**（一次 llm.complete：reply / work / escalate / ignore）
+		// → 直接发 / 无头跑一轮 / 只通知+待办 / 不回。
 		//
-		// 三道安全闸：默认关闭、白名单空则谁都不回、`dryRun` 可先只看不发。
+		// 三道安全闸：默认关闭、范围与会话都空则谁都不回、`dryRun` 可先只看不发。
 		// 回包失败**不重试**（与发送同一条铁律：宁可少发，不可重发）。
 		// 顶栏「后台任务」条（先声明再赋值：引擎的 onActivity 会引用它）。
 		let bgTask = null;
+		/** work 的 scratch 根：放在数据目录下，按 chatId 分目录（多轮要能续上上一轮的产物）。 */
+		const WORK_ROOT = join(host.dataDir, "feishu-pro", "runs");
+		/**
+		 * 转人工落待办：todoService 在下面才创建，这里用惰性引用。
+		 * 建失败只记日志 —— 通知已经发出去了，不能因为待办库异常把整条链拖挂。
+		 */
+		let createEscalationTodo = null;
 		autoReplier = createAutoReplier({
 			storage: host.storage,
 			chat: (req) => host.chat(req),
 			send: (args) => sendChatText(args),
+			// 前置分析：无工具、有超时的小补全；宿主没注入就自动退回"只写正文"。
+			llm: host.llm,
+			// work 的沙盒：目录名只留安全字符（chatId 本来就是 oc_ 开头，这里再兜一层）。
+			prepareWorkDir: async (chatId) => {
+				const safe = String(chatId || "unknown").replace(/[^A-Za-z0-9_-]/g, "");
+				const dir = join(WORK_ROOT, safe || "unknown");
+				await mkdir(dir, { recursive: true });
+				return dir;
+			},
+			createTodo: (input) => (createEscalationTodo ? createEscalationTodo(input) : null),
+			abortRun: (conversationId) => host.abortRun?.(conversationId),
+			// 跨重启幂等：同一条消息最多产生一次副作用（agent 跑一轮可能建待办/写文件）。
+			inbox: host.inbox,
 			log,
 			notify: (level, content, contentEn) => host.notify?.(level, content, contentEn),
 			onActivity: (snapshot) => {
-				// 顶栏「后台任务」条：队列里有没有在跑、上次回给谁、错了什么，一眼看得到。
+				// 顶栏「后台任务」条：队列里有没有在跑、本小时回了几条、动手几次、错了什么。
+				const work = snapshot.worksLastHour ? ` · 动手 ${snapshot.worksLastHour}` : "";
 				bgTask?.update({
 					status: snapshot.enabled
-						? `已启用 · 在跑 ${snapshot.inflight} · 本小时 ${snapshot.sentLastHour}${snapshot.lastError ? ` · 错误：${snapshot.lastError}` : ""}`
+						? `已启用 · 在跑 ${snapshot.inflight} · 本小时 ${snapshot.sentLastHour}${work}${snapshot.lastError ? ` · 错误：${snapshot.lastError}` : ""}`
 						: "未启用",
 				});
 			},
@@ -1240,6 +1291,57 @@ export default {
 		});
 		if (typeof offRunEvent === "function") disposers.push(offRunEvent);
 		void autoReplier.load().catch(() => {});
+
+		/**
+		 * 「全部私聊 / 全部群组」能不能真的覆盖到，取决于 dm-watch 有没有在轮询那类会话：
+		 * 全部群组要 `syncGroups`、全部私聊要 `autoDiscover`。面板据此就地提示 ——
+		 * 勾了不等于收得到，不能让人对着一个不生效的勾选猜。
+		 */
+		function autoScopeSnapshot() {
+			const dm = dmWatcher.status();
+			const budget = dm.candidates?.budget || {};
+			return {
+				enabled: Boolean(dm.config?.enabled),
+				autoDiscover: Boolean(dm.config?.autoDiscover),
+				syncGroups: Boolean(dm.config?.syncGroups),
+				p2p: Number(dm.candidates?.p2p) || 0,
+				groups: Number(dm.candidates?.groups) || 0,
+				budget: { chats: Number(budget.chats) || 0, groups: Number(budget.groups) || 0 },
+				// 预览要一个具体会话：给面板几个真正在轮询的，避免勾了「全部」却没处可预览。
+				sample: (Array.isArray(dm.chats) ? dm.chats : []).slice(0, 5).map((chat) => ({
+					id: String(chat?.id || ""),
+					name: String(chat?.name || ""),
+					kind: String(chat?.kind || ""),
+				})),
+			};
+		}
+
+		/** `/auto/state` 与 `/auto/config` 共用一份下发形状（面板两处读同一份字段）。 */
+		function autoStatePayload() {
+			return { ...autoReplier.status(), hostChat: typeof host.chat === "function", sync: autoScopeSnapshot() };
+		}
+
+		/**
+		 * 素材目录校验：work 运行可以**读**这里的文件并摘给外部的人，配错的代价是整台机器
+		 * 变成素材库。所以只接受真实存在的目录，并挡掉"根 / 主目录 / 数据目录 / 工作区根"。
+		 */
+		async function checkedLibraryDir(raw) {
+			const dir = String(raw ?? "").trim();
+			if (!dir) return "";
+			const abs = resolve(dir);
+			let info = null;
+			try {
+				info = await stat(abs);
+			} catch {
+				info = null;
+			}
+			if (!info?.isDirectory()) throw new Error(`素材目录不存在或不是目录：${abs}`);
+			const banned = new Set(
+				[resolve("/"), resolve(homedir()), resolve(host.dataDir), resolve(host.cwd)].map((p) => resolve(p)),
+			);
+			if (banned.has(abs)) throw new Error("素材目录不能是根目录 / 用户主目录 / 数据目录 / 工作区根");
+			return abs;
+		}
 
 		/* --------------------- 会话页 AI 回复（按需，点击即触发） --------------------- */
 		//
@@ -1329,11 +1431,49 @@ export default {
 			log,
 		});
 		await todoService.load().catch(() => {});
+		// 自动回复的「转人工」落到同一个待办库：ref.kind=chat + 消息 id → 重试不会建出两条。
+		createEscalationTodo = (input) => todoService.create(input);
 		// 待办派的 agent 运行也要认领：与自动回复共用 onRunEvent，但按 runId 各认各的。
 		const offTodoRun = host.onRunEvent?.((ev) => {
-			todoService.handleRunEvent(ev);
+			if (todoService.handleRunEvent(ev)) publishTodoBadge();
 		});
 		if (typeof offTodoRun === "function") disposers.push(offTodoRun);
+
+		/**
+		 * 顶栏「待办」入口：一个按钮 + 逾期/今天数量。
+		 * manifest 的 topbar 只能静态徽标，这里用 ui.register 注册同一个入口并动态 update badge；
+		 * 宿主没有 ui.register（老版本）就安静跳过 —— 入口不是主流程，不能因此让插件激活失败。
+		 */
+		let todoBadgeReady = false;
+		function publishTodoBadge() {
+			try {
+				const stats = todoService.snapshot().stats || {};
+				const pending = (Number(stats.overdue) || 0) + (Number(stats.today) || 0);
+				const badge = pending > 0 ? String(Math.min(pending, 99)) : "";
+				if (!todoBadgeReady) {
+					const off = host.ui?.register?.({
+						id: "feishu-pro-todos",
+						slot: "topbar.primary",
+						label: "待办",
+						labelEn: "To-dos",
+						hint: pending > 0 ? `${pending} 条今天到期或已逾期` : "打开待办清单",
+						hintEn: pending > 0 ? `${pending} due today or overdue` : "Open to-dos",
+						kind: "view",
+						view: `plugin:${PLUGIN_ID}`,
+						icon: "✓",
+						order: 59,
+						badge,
+					});
+					if (typeof off === "function") disposers.push(off);
+					todoBadgeReady = true;
+				} else {
+					host.ui?.update?.("feishu-pro-todos", { badge });
+				}
+			} catch {
+				/* 顶栏入口失败不影响待办本身 */
+			}
+		}
+		publishTodoBadge();
 
 		// 自动获取的**调度器在宿主侧**：服务层保持“不起定时器”，面板/单测直接调 autoRun 即可。
 		// 间隔下限 15 分钟（服务层已夹住），`unref` 掉不让 server 退出被这个定时器吊住。
@@ -1355,6 +1495,7 @@ export default {
 			} catch (err) {
 				log("warn", `feishu-pro 待办自动获取失败：${String(err?.message || err)}`);
 			} finally {
+				publishTodoBadge();
 				armTodoAuto();
 			}
 		};
@@ -2108,7 +2249,7 @@ export default {
 				"GET",
 				"/auto/state",
 				async (req, res) => {
-					sendOk(res, { ...autoReplier.status(), hostChat: typeof host.chat === "function" });
+					sendOk(res, autoStatePayload());
 				},
 			],
 			[
@@ -2119,14 +2260,26 @@ export default {
 					await autoReplier.setConfig({
 						enabled: body.enabled,
 						chatIds: body.chatIds,
+						// 范围开关（全部私聊 / 全部群组）与「群里只回 @我」。
+						allDms: body.allDms,
+						allGroups: body.allGroups,
+						groupMentionOnly: body.groupMentionOnly,
 						as: body.as,
 						cooldownSec: body.cooldownSec,
 						maxPerHour: body.maxPerHour,
 						staleSec: body.staleSec,
 						dryRun: body.dryRun,
 						signature: body.signature,
+						triage: body.triage,
+						workEnabled: body.workEnabled,
+						maxWorkPerHour: body.maxWorkPerHour,
+						runTimeoutSec: body.runTimeoutSec,
+						// 目录要过存在性/越界校验：配错等于把整台机器变成可对外摘录的素材库。
+						...(body.libraryDir === undefined ? {} : { libraryDir: await checkedLibraryDir(body.libraryDir) }),
+						escalateTodo: body.escalateTodo,
+						redact: body.redact,
 					});
-					sendOk(res, { ...autoReplier.status(), hostChat: typeof host.chat === "function" });
+					sendOk(res, autoStatePayload());
 				},
 			],
 			[
@@ -2143,6 +2296,9 @@ export default {
 					const record = {
 						chatId,
 						chatName: latest.name,
+						// 会话种类决定「全部私聊 / 全部群组」与「群里只回 @我」在预览里怎么判：
+						// 与 dm-watch 的记录同口径（`chatKind`），拿不到就是 unknown（范围开关不命中）。
+						chatKind: latest.mode,
 						id: last.id,
 						senderName: last.from,
 						senderType: "user",
@@ -2151,7 +2307,11 @@ export default {
 						createTimeMs: Date.parse(last.at) || 0,
 						self: Boolean(last.self),
 					};
-					sendOk(res, { chatId, message: last, ...(await autoReplier.preview(record)) });
+					sendOk(res, {
+						chatId,
+						message: last,
+						...(await autoReplier.preview(record, { recent: latest.items })),
+					});
 				},
 			],
 		];
@@ -2237,6 +2397,19 @@ export default {
 					sendOk(res, await todoService.adopt({ id: firstParam(body.id), toFeishu: Boolean(body.toFeishu) }));
 				},
 			],
+			[
+				"POST",
+				"/todos/briefing",
+				async (req, res) => sendOk(res, await todoService.briefing({ force: Boolean(bodyOf(req).force) })),
+			],
+			[
+				"POST",
+				"/todos/candidates-ignore",
+				async (req, res) => {
+					const body = bodyOf(req);
+					sendOk(res, await todoService.ignoreCandidates({ id: firstParam(body.id), all: Boolean(body.all) }));
+				},
+			],
 			["POST", "/todos/candidates-clear", async (req, res) => sendOk(res, await todoService.clearCandidates())],
 		);
 
@@ -2244,6 +2417,10 @@ export default {
 			const off = host.route?.(method, path, (req, res) => {
 				Promise.resolve()
 					.then(() => handler(req, res))
+					// 待办的写操作会改变「逾期 + 今天」的数量：顺手更新顶栏徽标（不让它等到下次重启）。
+					.then(() => {
+						if (method === "POST" && path.startsWith("/todos")) publishTodoBadge();
+					})
 					.catch((err) => {
 						if (err instanceof CliError) log("warn", `feishu-pro ${method} ${path}: ${err.message}`);
 						else log("warn", `feishu-pro ${method} ${path} failed: ${String(err?.message || err)}`);
@@ -2685,10 +2862,11 @@ export default {
 			name: "feishu_todo",
 			label: "飞书待办",
 			description:
-				"Manage the user's own to-do list kept by this pi-web-ui instance: list items, add or update one, generate an AI plan for an item, run one of that plan's actions, and turn the background auto sync/extract on or off.",
+				"Manage the user's own to-do list kept by this pi-web-ui instance: list items, add or update one, produce a one-shot briefing for today, generate an AI plan for an item, run one of that plan's actions, and turn the background auto sync/extract on or off.",
 			promptSnippet: "read and manage the user's to-do list",
 			promptGuidelines: [
 				"Use action=list before answering what the user still owes or what is due soon",
+				"Use action=briefing when the user asks what to do first today; it returns a summary plus ordered ids (cached for 30 minutes)",
 				"Add an item the moment the user asks to remember something; keep `title` under 40 chars and put the rest in `detail`",
 				"Set to_feishu=true only when the user wants the item to exist in Feishu Tasks too (it creates a real remote task)",
 				"action=advise only writes a plan (summary + steps + actions); action=handle kind=agent starts a real background run — confirm intent first",
@@ -2700,8 +2878,12 @@ export default {
 				properties: {
 					action: {
 						type: "string",
-						enum: ["list", "add", "update", "advise", "handle", "mute", "sync", "config"],
+						enum: ["list", "add", "update", "advise", "briefing", "handle", "mute", "sync", "config"],
 						description: "The to-do action to perform.",
+					},
+					force: {
+						type: "boolean",
+						description: "briefing: regenerate even when the cached briefing is still fresh.",
 					},
 					id: { type: "string", description: "update/advise/handle/mute: the todo id from action=list." },
 					title: { type: "string", description: "add: short title (max 40 chars)." },
@@ -2804,6 +2986,28 @@ export default {
 						});
 						const items = result.snapshot.items.filter((todo) => result.results.some((row) => row.id === todo.id));
 						return JSON.stringify({ ok: true, results: result.results, items: items.map(clipped) }, null, 2);
+					}
+					case "briefing": {
+						const out = await todoService.briefing({ force: Boolean(args.force) });
+						const brief = out.briefing || null;
+						return JSON.stringify(
+							{
+								ok: true,
+								summary: brief?.summary || "",
+								order: (brief?.order || []).map((row) => ({
+									id: row.id,
+									title: out.snapshot.items.find((item) => item.id === row.id)?.title || "",
+									why: row.why,
+								})),
+								drop: (brief?.drop || []).map((row) => ({
+									id: row.id,
+									title: out.snapshot.items.find((item) => item.id === row.id)?.title || "",
+									why: row.why,
+								})),
+							},
+							null,
+							2,
+						);
 					}
 					case "handle": {
 						const snap = todoService.snapshot();

@@ -20,6 +20,8 @@
  *     本文件不起定时器（保持"纯服务 + 注入依赖"，单测能一行跑一遍）。
  */
 import {
+	BRIEFING_ITEM_LIMIT,
+	BRIEFING_TTL_MS,
 	TODO_ADVICE_LIMIT,
 	TODO_CONFIG_KEY,
 	TODO_LIMIT,
@@ -27,10 +29,13 @@ import {
 	applyTodoPatch,
 	autoNextAt,
 	isAdviceFresh,
+	isBriefingFresh,
 	mergeCandidates,
 	mergeFeishuTasks,
 	normalizeAction,
+	normalizeCandidate,
 	normalizeDeletedTaskIds,
+	normalizeIgnoredCandidateIds,
 	normalizeStore,
 	normalizeTodo,
 	normalizeTodoConfig,
@@ -45,11 +50,14 @@ import {
 } from "./todo-store.mjs";
 import {
 	ADVICE_SYSTEM,
+	BRIEFING_SYSTEM,
 	EXTRACT_SYSTEM,
 	buildAdvicePrompt,
 	buildAgentTask,
+	buildBriefingPrompt,
 	buildExtractPrompt,
 	parseAdviceReply,
+	parseBriefingReply,
 	parseExtractReply,
 	replyUuidFor,
 	sanitizeOutgoingText,
@@ -177,11 +185,16 @@ export function createTodoService(deps = {}) {
 			stats: todoStats(store.items, { now: now() }),
 			syncedAt: store.syncedAt || 0,
 			adviceTtlMs: ADVICE_TTL_MS,
+			briefing: store.briefing || null,
+			briefingFresh: isBriefingFresh(store.briefing, store.items, { now: now(), ttlMs: BRIEFING_TTL_MS }),
 			config: { ...autoConfig },
 			nextAutoAt: autoNextAt(autoConfig, { now: now() }),
 			autoRunning,
+			/** 正在跑的 AI 派单：界面用它显示「正在做 + 已耗时」，而不是只有一个猜测中的 doing 标签。 */
+			running: [...pendingRuns.entries()].map(([runId, job]) => ({ runId, id: job.todoId, at: job.at })),
 			capabilities: {
 				advice: Boolean(llm && typeof llm.complete === "function"),
+				briefing: Boolean(llm && typeof llm.complete === "function"),
 				agent: Boolean(chat && typeof chat === "function"),
 				send: Boolean(send && typeof send === "function"),
 				feishuTasks: Boolean(tasks && typeof tasks.list === "function"),
@@ -463,6 +476,34 @@ export function createTodoService(deps = {}) {
 	}
 
 	/**
+	 * AI 简报：一次调用回答「今天先做什么、什么可以放一放」。
+	 * 与逐条建议分开：打开页签不再自动烧 3 次额度，只有用户点「AI 今天怎么办」才跑。
+	 */
+	async function briefing({ force = false } = {}) {
+		await load();
+		if (!llm || typeof llm.complete !== "function") throw new Error("宿主没有提供 llm 补全：无法生成简报");
+		const items = sortTodos(store.items)
+			.filter((todo) => todo.status === "open" || todo.status === "doing")
+			.slice(0, BRIEFING_ITEM_LIMIT);
+		if (!items.length) return { briefing: null, empty: true, snapshot: snapshot() };
+		if (!force && isBriefingFresh(store.briefing, store.items, { now: now() })) {
+			return { briefing: store.briefing, cached: true, snapshot: snapshot() };
+		}
+		const result = await llm.complete({
+			prompt: buildBriefingPrompt(items, { now: now(), stats: todoStats(store.items, { now: now() }) }),
+			system: BRIEFING_SYSTEM,
+			maxChars: 1200,
+			timeoutMs: 75_000,
+		});
+		if (!result?.ok) throw new Error(str(result?.error || "生成简报失败", 300));
+		const parsed = parseBriefingReply(result.text, { now: now(), items, model: result.model || "" });
+		if (!parsed) throw new Error("模型没有给出可用的简报");
+		store = { ...store, briefing: parsed, updatedAt: now() };
+		save();
+		return { briefing: parsed, snapshot: snapshot() };
+	}
+
+	/**
 	 * 执行建议里的一个动作。
 	 * - `insert` / `open` 是纯前端指令（不产生副作用），服务端只回 directive；
 	 * - `reply` 真的发消息（带幂等键）；`agent` 派一轮无头运行。
@@ -501,7 +542,7 @@ export function createTodoService(deps = {}) {
 					const oldest = pendingRuns.keys().next().value;
 					pendingRuns.delete(oldest);
 				}
-				pendingRuns.set(runId, { todoId: todo.id, text: "" });
+				pendingRuns.set(runId, { todoId: todo.id, text: "", at: now() });
 			}
 			const marked = markActionRan(todo.id, action.id, {
 				kind: "agent",
@@ -647,9 +688,17 @@ export function createTodoService(deps = {}) {
 			timeoutMs: 75_000,
 		});
 		if (!result?.ok) throw new Error(str(result?.error || "提取失败", 300));
-		const candidates = parseExtractReply(result.text, { now: now() });
+		const candidates = parseExtractReply(result.text, { now: now() })
+			// 先归一：候选 id 由标题哈希而来，界面「记下 / 忽略」都靠它（返回给前端的也必须是带 id 的）。
+			.map((item) => normalizeCandidate(item, { now: now() }))
+			.filter(Boolean);
 		const known = new Set(store.items.map((item) => str(item.title).replace(/\s+/g, "")));
-		const fresh = candidates.filter((item) => !known.has(item.title.replace(/\s+/g, "")));
+		// 用户点过「忽略」的候选不再端上来：否则每轮自动提取都在重复同一批。
+		const ignored = new Set(normalizeIgnoredCandidateIds(store.ignoredCandidateIds));
+		const fresh = candidates.filter((item) => {
+			if (known.has(item.title.replace(/\s+/g, ""))) return false;
+			return !item.id || !ignored.has(item.id);
+		});
 		// 候选也落盘：自动提取会在面板关着的时候跑，回来还得看得见（否则白花额度）。
 		const merged = mergeCandidates(store.candidates, fresh, { now: now() });
 		if (merged.added > 0) {
@@ -698,13 +747,31 @@ export function createTodoService(deps = {}) {
 		return { todo: find(todo.id), snapshot: snapshot() };
 	}
 
-	/** 收起候选（不建待办）：清空列表，下次提取重新找。 */
-	async function clearCandidates() {
+	/**
+	 * 忽略候选：
+	 *  - 传 id = 只忽略这一条（其他候选保留，下一轮提取不再出现它）；
+	 *  - all = 全部收起（等价于把当前这批都记为「不要」）。
+	 * 「收起」不能只是清空列表：清空后下一轮又原样端上来，用户会以为按钮没生效。
+	 */
+	async function ignoreCandidates({ id = "", all = false } = {}) {
 		await load();
-		const cleared = (store.candidates || []).length;
-		store = { ...store, candidates: [] };
+		const current = Array.isArray(store.candidates) ? store.candidates : [];
+		const ids = all ? current.map((row) => str(row?.id, 64)).filter(Boolean) : [str(id, 64)].filter(Boolean);
+		if (!ids.length) return { ignored: 0, snapshot: snapshot() };
+		const gone = new Set(ids);
+		store = {
+			...store,
+			candidates: current.filter((row) => !gone.has(str(row?.id, 64))),
+			ignoredCandidateIds: normalizeIgnoredCandidateIds([...ids, ...(store.ignoredCandidateIds || [])]),
+		};
 		save();
-		return { cleared, snapshot: snapshot() };
+		return { ignored: ids.length, snapshot: snapshot() };
+	}
+
+	/** 兼容旧路由：`/todos/candidates-clear` 的语义收敛为「全部忽略」。 */
+	async function clearCandidates() {
+		const out = await ignoreCandidates({ all: true });
+		return { cleared: out.ignored, snapshot: out.snapshot };
 	}
 
 	/** 改自动获取配置（默认关；开关一变，调度器由 index.mjs 重新排期）。 */
@@ -811,9 +878,11 @@ export function createTodoService(deps = {}) {
 		remove,
 		sync,
 		advise,
+		briefing,
 		execute,
 		extract,
 		adopt,
+		ignoreCandidates,
 		clearCandidates,
 		setConfig,
 		autoRun,

@@ -11,7 +11,7 @@
  * 分区（导航顺序 = 使用频率）：
  *   1 lark-cli 与身份   装 / 配 / 登 三态 + 设备码（唯一会卡住其他一切的一步）
  *   2 消息同步与提醒     后台轮询开关（sync-panel 托管）
- *   3 私聊自动问答       会以你本人名义开口，默认关（auto-reply-panel 托管）
+ *   3 自动问答           私聊 / 群聊都可能自动开口，默认关（auto-reply-panel 托管）
  *   4 诊断与数据         缓存 / 发现 / 会话清单 / 提醒历史 + 危险操作（红框 + 二次确认）
  *   5 关于与排错         CLI 版本与路径、可复制的命令、通道边界说明
  *
@@ -34,7 +34,7 @@ const STYLE_ID = "fp-set-styles";
 const SECTIONS = [
 	{ id: "status", label: "lark-cli 与身份", icon: "🔑" },
 	{ id: "sync", label: "消息同步与提醒", icon: "🔁" },
-	{ id: "auto", label: "私聊自动问答", icon: "💬" },
+	{ id: "auto", label: "自动问答", icon: "💬" },
 	{ id: "diag", label: "诊断与数据", icon: "📊" },
 	{ id: "about", label: "关于与排错", icon: "🧾" },
 ];
@@ -253,12 +253,12 @@ export function mountSettingsView({ panel, call, getInfo, refreshInfo } = {}) {
 				</div>
 			</section>
 
-			<!-- ③ 私聊自动问答（auto-reply-panel 托管） -->
+			<!-- ③ 自动问答：私聊 / 群聊（auto-reply-panel 托管） -->
 			<section class="fp-card fp-set-sec" id="fp-set-auto" data-sec="auto">
 				<div class="fp-card-head">
 					<div class="fp-card-titles">
-						<span class="fp-card-title">私聊自动问答</span>
-						<span class="fp-card-desc">轮询到白名单会话里的新消息 → 跑一轮 agent → 以「我 / 机器人」身份回包。<b>默认关闭，白名单为空则谁都不回</b>；建议先开「空跑」看一天话术。</span>
+						<span class="fp-card-title">自动问答</span>
+						<span class="fp-card-desc">轮询到新消息 → 跑一轮 agent → 以「我 / 机器人」身份回包。范围可勾「全部私聊 / 全部群组」，也可只填指定会话；<b>默认关闭，范围与会话都为空则谁都不回</b>，群消息默认只回 @我。建议先开「空跑」看一天话术。</span>
 					</div>
 					<div class="fp-set-sechead-right"><span class="fp-pill warn" title="用你的账号发出，收件人看到的是你本人">以你名义发言</span></div>
 				</div>

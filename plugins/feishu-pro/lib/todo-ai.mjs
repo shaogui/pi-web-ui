@@ -13,7 +13,16 @@
  *
  * 预算：`host.llm.complete` 的 prompt 硬上限 8000 字、system 4000 字，这里按 6000 / 1600 收口。
  */
-import { ACTION_TEXT_LIMIT, normalizeAdvice, normalizePriority, toMs, TODO_PRIORITIES } from "./todo-store.mjs";
+import {
+	ACTION_TEXT_LIMIT,
+	BRIEFING_ITEM_LIMIT,
+	normalizeAdvice,
+	normalizeBriefing,
+	normalizePriority,
+	toMs,
+	TODO_PRIORITIES,
+} from "./todo-store.mjs";
+import { extractJson } from "./json-text.mjs";
 
 const PROMPT_BUDGET = 6000;
 const MESSAGE_BUDGET = 4200;
@@ -90,50 +99,10 @@ export function buildAdvicePrompt(todo = {}, { now = Date.now(), selfName = "", 
 const PRIORITY_SET = new Set(TODO_PRIORITIES);
 
 /**
- * 从模型的自由文本里抠出第一个完整 JSON 值。
- * 手写扫描而不是正则：字符串里出现的 `}` / `]` 会让正则提前收尾（真实踩过）。
+ * 解析器搬到了 `json-text.mjs`（自动回复的前置分析也要用同一份）。
+ * 这里 re-export：既有调用方与单测的 import 路径不变。
  */
-export function extractJson(text) {
-	const raw = String(text ?? "").replace(/^\uFEFF/, "");
-	const fence = /```(?:json|JSON)?\s*([\s\S]*?)```/.exec(raw);
-	const body = fence ? fence[1] : raw;
-	for (const open of ["{", "["]) {
-		const start = body.indexOf(open);
-		if (start < 0) continue;
-		const parsed = scanJson(body, start, open === "{" ? "}" : "]");
-		if (parsed !== undefined) return parsed;
-	}
-	return undefined;
-}
-
-function scanJson(body, start, closer) {
-	let depth = 0;
-	let inString = false;
-	let escaped = false;
-	for (let i = start; i < body.length; i += 1) {
-		const ch = body[i];
-		if (inString) {
-			if (escaped) escaped = false;
-			else if (ch === "\\") escaped = true;
-			else if (ch === '"') inString = false;
-			continue;
-		}
-		if (ch === '"') inString = true;
-		else if (ch === "{" || ch === "[") depth += 1;
-		else if (ch === "}" || ch === "]") {
-			depth -= 1;
-			if (depth === 0) {
-				if (ch !== closer) return undefined;
-				try {
-					return JSON.parse(body.slice(start, i + 1));
-				} catch {
-					return undefined;
-				}
-			}
-		}
-	}
-	return undefined;
-}
+export { extractJson };
 
 /** 模型只吐了没结构的纯文本时，退化成「首行是判断、下面几行是步骤」。 */
 function fallbackAdvice(reply, { now = Date.now() } = {}) {
@@ -247,6 +216,66 @@ export function parseExtractReply(reply, { now = Date.now() } = {}) {
 		if (items.length >= 5) break;
 	}
 	return items;
+}
+
+/* ------------------------------- AI 简报 ------------------------------- */
+
+export const BRIEFING_SYSTEM = [
+	"你是一名执行助理，要在用户打开清单的十秒内回答两件事：现在先做什么、什么可以先放一放。",
+	"只输出一个 JSON 对象，不要 markdown 代码围栏，不要解释文字。结构：",
+	'{"summary":"≤80字：今天的整体判断（最该先做哪件、为什么，不要复述标题）",',
+	' "order":[{"id":"输入里的待办 id","why":"≤30字：为什么排在这里"}],',
+	' "drop":[{"id":"输入里的待办 id","why":"≤30字：为什么现在可以先不做"}]}',
+	"规则：",
+	"1. id 必须原样来自输入，禁止编造；没有合适的就留空数组；",
+	"2. order 最多 3 条、drop 最多 2 条，按重要性排序；",
+	"3. 只依据输入里的截止、优先级、建议判断，不要猜金额、进度或人名；",
+	"4. 信息不足就在 summary 里说清还缺什么，不要编。",
+].join("\n");
+
+/** 简报输入：只给判断需要的字段（id 必须原样带回，界面靠它对回条目）。 */
+export function buildBriefingPrompt(items = [], { now = Date.now(), stats = null, selfName = "" } = {}) {
+	const rows = (Array.isArray(items) ? items : []).slice(0, BRIEFING_ITEM_LIMIT).map((todo) => ({
+		id: todo?.id || "",
+		title: clip(todo?.title, 120),
+		due: todo?.dueAt ? dayLabel(todo.dueAt) : "",
+		priority: todo?.priority || "normal",
+		status: todo?.status === "doing" ? "AI 正在处理" : "待处理",
+		from: clip(todo?.ref?.sender || todo?.ref?.title, 40),
+		advice: clip(todo?.advice?.summary, 120),
+	}));
+	const head = [
+		`现在是 ${dayLabel(now)}${selfName ? `，我是 ${selfName}` : ""}。`,
+		stats
+			? `清单统计：待处理 ${stats.open || 0} 条，逾期 ${stats.overdue || 0} 条，今天到期 ${stats.today || 0} 条。`
+			: "",
+		"下面是未完成的事，请按系统提示的 JSON 结构给一份今天的简报：",
+	].filter(Boolean);
+	const body = JSON.stringify(rows, null, 1);
+	let prompt = `${head.join("\n")}\n${body}`;
+	// 超预算就从最不重要的（数组尾部）丢：排序本身已经把逾期/今天放前面了。
+	while (prompt.length > PROMPT_BUDGET && rows.length > 1) {
+		rows.pop();
+		prompt = `${head.join("\n")}\n${JSON.stringify(rows, null, 1)}`;
+	}
+	return clip(prompt, PROMPT_BUDGET);
+}
+
+/** 解析简报：结构化失败就退化成"一段话"，至少还能读。 */
+export function parseBriefingReply(reply, { now = Date.now(), items = [], model = "" } = {}) {
+	const raw = String(reply ?? "");
+	const ids = (Array.isArray(items) ? items : []).map((item) => String(item?.id || "")).filter(Boolean);
+	const json = extractJson(raw);
+	if (json && typeof json === "object" && !Array.isArray(json)) {
+		const briefing = normalizeBriefing({ ...json, ids, at: now, model }, { now, items });
+		if (briefing) return briefing;
+	}
+	const text = raw
+		.replace(/```[\s\S]*?```/g, "")
+		.replace(/[{}"]/g, "")
+		.trim();
+	if (!text) return null;
+	return normalizeBriefing({ summary: clip(text.split(/\n+/)[0] || text, 300), ids, at: now, model }, { now, items });
 }
 
 /**

@@ -1704,6 +1704,8 @@ export function mountChatsView({ panel, call, say, onOpenSettings } = {}) {
 
 	return {
 		refresh: loadList,
+		/** 供其它页签跳转（待办的「看原话」要落到具体会话）。 */
+		openChat,
 		destroy() {
 			disposed = true;
 			stopAutoRefresh();

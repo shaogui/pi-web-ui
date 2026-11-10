@@ -33,6 +33,14 @@ export const TODO_AUTO_DEFAULT_MINUTES = 30;
 export const TODO_CANDIDATE_LIMIT = 20;
 /** 删掉的联动任务（guid）最多记多少条：只用于「别在下次同步时又拉回来」。 */
 export const TODO_DELETED_TASK_LIMIT = 100;
+/** 被用户「忽略」的候选 id 上限：忽略过的候选不该在下一轮提取里复活。 */
+export const TODO_IGNORED_CANDIDATE_LIMIT = 200;
+/** AI 简报的保鲜期：半小时内重复点只是看同一份，不重复花额度。 */
+export const BRIEFING_TTL_MS = 30 * 60_000;
+/** 简报里最多排几条、建议放一放几条；以及一次简报最多看几条未完成。 */
+export const BRIEFING_ORDER_LIMIT = 3;
+export const BRIEFING_DROP_LIMIT = 2;
+export const BRIEFING_ITEM_LIMIT = 8;
 
 export const TODO_STATUSES = ["open", "doing", "done", "dropped"];
 export const TODO_PRIORITIES = ["low", "normal", "high", "urgent"];
@@ -371,6 +379,73 @@ export function normalizeDeletedTaskIds(raw) {
 	return out;
 }
 
+/**
+ * 被忽略的候选 id：与「删除的飞书任务」同一套思路 —— 用户说了不要，
+ * 下一轮提取就不该再把同一条端上来（否则每次自动提取都在重复打扰）。
+ */
+export function normalizeIgnoredCandidateIds(raw) {
+	const list = Array.isArray(raw) ? raw : [];
+	const seen = new Set();
+	const out = [];
+	for (const row of list) {
+		const id = text(row, 64);
+		if (!id || seen.has(id)) continue;
+		seen.add(id);
+		out.push(id);
+		if (out.length >= TODO_IGNORED_CANDIDATE_LIMIT) break;
+	}
+	return out;
+}
+
+/* ------------------------------- AI 简报 ------------------------------- */
+
+/**
+ * 简报归一：只保留「当前列表里真的存在」的 id。
+ * 模型编一个不存在的 id 时，界面不该出现一条点不动的建议 —— 直接丢。
+ */
+export function normalizeBriefing(raw, { now = Date.now(), items = null } = {}) {
+	if (!raw || typeof raw !== "object") return null;
+	const known = Array.isArray(items) ? new Set(items.map((item) => text(item?.id, 64)).filter(Boolean)) : null;
+	const pick = (list, limit) => {
+		const out = [];
+		for (const row of Array.isArray(list) ? list : []) {
+			const id = text(row?.id, 64);
+			if (!id || (known && !known.has(id))) continue;
+			if (out.some((item) => item.id === id)) continue;
+			out.push({ id, why: text(row?.why ?? row?.reason, 120) });
+			if (out.length >= limit) break;
+		}
+		return out;
+	};
+	const summary = text(raw.summary ?? raw.judgement, SUMMARY_CAP);
+	const order = pick(raw.order ?? raw.sequence, BRIEFING_ORDER_LIMIT);
+	const drop = pick(raw.drop ?? raw.postpone, BRIEFING_DROP_LIMIT);
+	if (!summary && !order.length && !drop.length) return null;
+	return {
+		summary,
+		order,
+		drop,
+		/** 生成时看到的条目快照：列表一变，简报就"过期"，但不清空（避免每次打勾都重算）。 */
+		ids: Array.isArray(raw.ids) ? raw.ids.map((id) => text(id, 64)).filter(Boolean) : [],
+		model: text(raw.model, 120),
+		at: num(raw.at, now) || now,
+	};
+}
+
+/** 简报是否还能直接用：既没过期，也还对应同一批待办。 */
+export function isBriefingFresh(briefing, items, { now = Date.now(), ttlMs = BRIEFING_TTL_MS } = {}) {
+	if (!briefing || !briefing.at) return false;
+	if (now - num(briefing.at, 0) >= Math.max(60_000, num(ttlMs, BRIEFING_TTL_MS))) return false;
+	const known = new Set((Array.isArray(briefing.ids) ? briefing.ids : []).map((id) => text(id, 64)));
+	if (!known.size) return true;
+	// 只比「生成时真的喂给模型的那一批」（同样的排序取前 N 条）：
+	// 拿全部未完成去比，20 条清单永远"不新鲜"，每次点都重算，等于没有缓存。
+	const current = sortTodos(items)
+		.filter((item) => item.status === "open" || item.status === "doing")
+		.slice(0, BRIEFING_ITEM_LIMIT);
+	return current.every((item) => known.has(item.id)) && known.size === current.length;
+}
+
 /** 存储归一：兼容"只存了数组"的老数据。 */
 export function normalizeStore(raw, { now = Date.now() } = {}) {
 	const src = raw && typeof raw === "object" ? raw : {};
@@ -392,6 +467,9 @@ export function normalizeStore(raw, { now = Date.now() } = {}) {
 		// 自动提取出来的候选也要落盘：面板没开着的时候发现的事，回来还得看得见。
 		candidates: mergeCandidates([], Array.isArray(src) ? [] : src.candidates, { now }).items,
 		deletedTaskIds: normalizeDeletedTaskIds(Array.isArray(src) ? [] : src.deletedTaskIds),
+		ignoredCandidateIds: normalizeIgnoredCandidateIds(Array.isArray(src) ? [] : src.ignoredCandidateIds),
+		// 简报是"一次模型调用"的结果：落盘才能在面板重开后直接显示，不必再花一次额度。
+		briefing: Array.isArray(src) ? null : normalizeBriefing(src.briefing, { now }),
 		syncedAt: Array.isArray(src) ? 0 : num(src.syncedAt, 0),
 		updatedAt: Array.isArray(src) ? 0 : num(src.updatedAt, 0),
 	};
@@ -477,8 +555,9 @@ export function todoStats(items, { now = Date.now() } = {}) {
 		out[status] = (out[status] || 0) + 1;
 		if (status === "done" || status === "dropped") continue;
 		const due = num(todo?.dueAt, 0);
-		if (due && due < now) out.overdue += 1;
-		else if (due && due < dayEnd) out.today += 1;
+		const deadline = dueDeadline(due);
+		if (deadline && deadline < now) out.overdue += 1;
+		else if (deadline && deadline < dayEnd) out.today += 1;
 		if (todo?.priority === "urgent") out.urgent += 1;
 	}
 	return out;
@@ -490,14 +569,26 @@ export function startOfDay(ms = Date.now()) {
 	return d.getTime();
 }
 
+/**
+ * 只有日期没有钟点（00:00）的截止按**当天结束**算。
+ * 不这么算的话，早上记一条「今天」的事，下一秒统计里就变成「逾期」—— 用户会以为坏了。
+ */
+export function dueDeadline(dueMs) {
+	const ms = num(dueMs, 0);
+	if (!ms) return 0;
+	const d = new Date(ms);
+	return d.getHours() === 0 && d.getMinutes() === 0 ? startOfDay(ms) + 24 * 60 * 60_000 - 1 : ms;
+}
+
 /** 截止状态：给前端一个词，前端别再自己算（两边算不一样的"今天"很常见）。 */
 export function dueInfo(todo, { now = Date.now() } = {}) {
 	const due = num(todo?.dueAt, 0);
 	if (!due) return { kind: "none", ms: 0 };
 	if (todo?.status === "done" || todo?.status === "dropped") return { kind: "closed", ms: due };
-	if (due < now) return { kind: "overdue", ms: due };
+	const deadline = dueDeadline(due);
+	if (deadline < now) return { kind: "overdue", ms: due };
 	const dayEnd = startOfDay(now) + 24 * 60 * 60_000;
-	if (due < dayEnd) return { kind: "today", ms: due };
+	if (deadline < dayEnd) return { kind: "today", ms: due };
 	const d = Math.round((startOfDay(due) - startOfDay(now)) / (24 * 60 * 60_000));
 	return { kind: d <= 3 ? "soon" : "later", ms: due, days: d };
 }

@@ -422,6 +422,18 @@ function mount(el, _ctx) {
 		reading: null,
 	};
 
+	// 记住上次停留的页签：顶栏「待办」入口和「飞书 Pro」入口打开的是同一个视图，
+	// 不记的话每次点「待办」都会落回默认页（默认页现在是待办本身）。
+	const TAB_KEY = "fp.tab";
+	const readTab = () => {
+		try {
+			const saved = localStorage.getItem(TAB_KEY) || "";
+			return ["chats", "todos", "contacts", "docs", "settings"].includes(saved) ? saved : "";
+		} catch {
+			return "";
+		}
+	};
+
 	const contactsPanel = root.querySelector('[data-panel="contacts"]');
 	const chatsPanel = root.querySelector('[data-panel="chats"]');
 	// 会话页：双栏（列表 + 只读消息）自己管 DOM，entry 只提供传输层。
@@ -440,6 +452,12 @@ function mount(el, _ctx) {
 		call,
 		say: (text, tone) => status.show(text, tone),
 		compose: (text) => insertToComposer(text),
+		// 「看原话」：切到会话页并打开来件会话（两个页签之间只有 entry 知道怎么切）。
+		onOpenChat: (chatId) => {
+			if (!chatId) return;
+			switchTab("chats");
+			void chatsView.openChat?.(chatId);
+		},
 	});
 	const settingsPanel = root.querySelector('[data-panel="settings"]');
 	// 设置页：分区导航 + 分组区（lark-cli 三态 / 同步 / 自动问答 / 诊断 / 关于），自己管 DOM。
@@ -754,6 +772,11 @@ function mount(el, _ctx) {
 
 	function switchTab(tab) {
 		state.tab = tab;
+		try {
+			localStorage.setItem(TAB_KEY, tab);
+		} catch {
+			/* 隐私模式下写不了：不影响切换 */
+		}
 		const panels = [
 			[chatsPanel, "chats", "flex"],
 			[todosPanel, "todos", "flex"],
@@ -801,7 +824,7 @@ function mount(el, _ctx) {
 		const button = target.closest("button");
 		const tabBtn = target.closest(".fp-tab");
 		if (tabBtn) {
-			switchTab(tabBtn.dataset.tab || "contacts");
+			switchTab(tabBtn.dataset.tab || "todos");
 			return;
 		}
 		const modeBtn = target.closest(".fp-doc-mode");
@@ -919,8 +942,8 @@ function mount(el, _ctx) {
 
 	/* --------------------------------- 启动 --------------------------------- */
 
-	// 默认落在「会话」：这块是日常入口，通讯录/云文档是按需去的
-	switchTab("chats");
+	// 默认落在「待办」：这是每天要看的清单；上次停在哪个页签就回哪个（顶栏「待办」入口依赖它）。
+	switchTab(readTab() || "todos");
 	void refreshState().then(() => {
 		// 0.10.0 起只有 lark-cli 一条通道：按 install → config → login 三态引导，别让人在这里空等。
 		const cli = state.info?.cli;
