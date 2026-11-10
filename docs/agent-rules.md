@@ -87,6 +87,7 @@
 - **宿主提供的包只能声明在 `peerDependencies`（`"*"`）**：pi 扩展加载器只扫 `dependencies`（命中 `@earendil-works/pi-coding-agent` / `typebox` 就告警：嵌套副本会绕开加载器注入、搞出重复运行时模块）。本包同时是扩展与独立服务端，服务端子进程真要这两个包（`PI_WEB_SDK=bundled` 也要自带副本）→ 落在 `optionalDependencies`（npm 默认照装）。守卫 `tests/unit/extension-host-packages.test.ts`。
 - **布局页改名 / 插件 `arrange.label` 必须落到渲染层**：合并引擎对「显式指定的文案」置 `UiSlotEntry.labelExplicit`；内置条目（顶栏按钮、底栏数值徽标）一直画写死的 i18n 与实时数值，只有旗立着时才让位（名字型顶掉内置文案；数值型把名字插在数值前，不吞实时数据）。只在设置页生效 = 假承诺（`#555`，守卫 `tests/unit/bar-item-unified.test.ts`）。
 - **插件修改必须递增版本号（Bump Version）**：内置官方插件（`plugins/<id>/`）凡修改了代码/功能/静态资源（非纯文档），必须同步递增 `manifest.json` 中的 `version`（若有 `package.json` 的 `version` 须保持一致）。原因：随包热同步（`syncBuiltinPlugins`）与更新器（`plugin-updater`）均以 `compareVersions(srcVer, tgtVer) > 0` 作为升级判定的唯一权威事实源；若漏改版本号，老用户更新主程序后数据目录中的旧插件代码永远不会被热更新覆盖，导致缺陷滞留（守卫：`tests/unit/plugin-version-bump-guard.test.ts`）。
+- **插件代码目录是纯缓存，状态只住 `plugin-data/<id>/`**：`plugins/<id>/` 会被物化/升级重放（完整性由回执 `.pi-materialized.json` 裁定，半残就地补齐），所以设置 / 机密 / 定时任务 / 能力确认标记一律走 `pluginStateDir()`，不得写在代码目录里；复制黑名单只能在 `server/fs-copy.ts` 按**相对路径**判定——`cpSync` 的 filter 拿到的是绝对路径，npm -g 安装（包目录本身就含 `node_modules`）会把整棵树过滤成空副本还被当成已安装（守卫：`tests/unit/plugin-copy-single-source.test.ts`、`plugin-bundled.test.ts`、`plugin-paths.test.ts`，来源 `#856`）。
 - **修改测试插件一定要及时更新本地插件**：本地实际运行加载的插件位于数据目录（`<dataDir>/plugins/<id>/`，如 `~/.pi-web/plugins/<id>/`）。修改或测试工作区内置插件时，除递增版本号外，必须及时将最新源码同步覆盖至本地数据目录的对应插件中，防止开发调试时因旧代码缓存导致行为脱节。
 - **国际化字面量要求**：`i18n.tsx` 的词条值必须使用字符串字面量（仅允许 `+` 拼接），确保 `scripts/i18n-diff.mjs` 静态解析器正常运行。
 
@@ -117,20 +118,28 @@
 
 ## 七、终端命令执行（防卡死）
 
-挂死只有四类根因，规则按**根因**写，不要按「看起来卡住的命令」逐个打补丁（`| sort` 只是缓冲导致看不到进度，读的是 EOF，本身不会死锁）：
+挂死只有五类根因，规则按**根因**写，不要按「看起来卡住的命令」逐个打补丁（`| sort` 只是缓冲导致看不到进度，读的是 EOF，本身不会死锁）：
 
 1. **等 stdin**：`npx` 安装确认、`git commit` 无 `-m`、REPL、`read -p`。必须显式非交互（`CI=true`、`npx --yes`、`npm i --no-audit --no-fund`、`git commit -m`）；执行器一律把子进程 stdin 接 `/dev/null`，读到 EOF 即返回。
-2. **不退出**：`--watch`、dev server、前台 daemon、死循环。禁止前台跑，改用后台托管 + 轮询。
+2. **不退出**：`--watch`、dev server、前台 daemon、死循环。禁止前台跑。**产品内（任意用户项目）用 `bash({background:true})`**：调用立即返回 job id + 日志路径，进程登记在顶栏「后台任务」面板（可单独停止 / 全部关闭 / 不参与遗留清理）；源码仓库与 CI 里仍用 `safe-exec --detach` 托管 + 轮询。
 3. **pager**：`less` / `more` / `git log` 默认分页器等 TTY 按键。用 `PAGER=cat`、`GIT_PAGER=cat`、`git --no-pager`；执行器默认注入。
 4. **输出淹没上下文 / 后台子进程继承 stdout**：原始输出先落盘，只回显尾部；分析用 `grep` / `read --offset` 分步读，禁止 `cmd | sort` / `| less` / `| head` 这类必须吃到 EOF、T 掉 TTY 或持住管道句柄才算完的直连管道。
+5. **静默卡死**：进程活着但再也不产出（等锁、等网络、等一个拿不到的句柄、把活丢给已死的孙进程）。靠 `--idle-timeout` 判：连续 N 秒零输出即强杀。只给「正常跑必有心跳输出」的任务开（默认关闭）；构建 / 类型检查这类天然安静的别开。
 
 时长分档与用法（`scripts/safe-exec.mjs`，跨平台 Node 包装器）：
 
-| 场景               | 命令                                                               | 判据                   |
-| ------------------ | ------------------------------------------------------------------ | ---------------------- |
-| 单测 / lint / 类型 | `node scripts/safe-exec.mjs --timeout 60 -- npx vitest run <file>` | 超时返回 `124`         |
-| 全量构建 / 编译    | `--timeout 600`，必带 `--log`                                      | 超时返回 `124`         |
-| 预计 >3 分钟       | `--detach` 托管 + `--status <pidfile>` 轮询 + `--kill` 终止        | 启动立即返回           |
-| AI 单次工具调用    | pi `bash` 工具的 `timeout` 参数 + 会话级工具看门狗                 | 超时 `session.abort()` |
+| 场景               | 命令                                                               | 判据                                    |
+| ------------------ | ------------------------------------------------------------------ | --------------------------------------- |
+| 单测 / lint / 类型 | `node scripts/safe-exec.mjs --timeout 60 -- npx vitest run <file>` | 超时返回 `124`                          |
+| 全量构建 / 编译    | `--timeout 600`，必带 `--log`                                      | 超时返回 `124`                          |
+| 预计 >3 分钟       | `--detach` 托管 → `--wait <jobfile> --json` 轮询 → `--kill` 终止   | 启动立即返回；`--wait` 提前结束提前返回 |
+| AI 单次工具调用    | pi `bash` 工具的 `timeout` 参数 + 会话级工具看门狗                 | 超时 `session.abort()`                  |
 
 `124` 意味着**换策略**，不是重试：先读日志定位卡点（慢？卡网络？等锁？），再调分档或改后台。进程树终止以 `server/process-utils.ts` 的 `killPidTree` 为单源，不另行手写 `taskkill` / `kill -9` 片段。守卫：`tests/unit/safe-exec.test.ts`。
+
+后台托管协议（AI 照抄即可，禁自行发明轮询方式）：
+
+1. **起**：`--detach --timeout <总秒> [--idle-timeout <N>] --log <path> -- <cmd...>`，从输出（或 `--json`）拿 `job=<jobfile>`。
+2. **等**：只跑 `node scripts/safe-exec.mjs --wait "<jobfile>" --wait-sec 10 --json`。它内部计时，任务提前结束立刻返回，到点则返回这段时间的 `newOutput`（游标已推进，**不会重复输出**）。不写 `sleep`、不拼 `&&`、不依赖 `$?`。
+3. **判**：`status` 为 `RUNNING` 继续 `--wait`；`SUCCESS` / `FAILED` 看 `exitCode` 与日志；`ABORTED`（含 `childAlive: true` 的「看门狗宽限后未死透」）说明子进程还在跑，先 `--kill` 再重跑；`TIMEOUT` / `IDLE_TIMEOUT` 禁止原样重试，先读日志改分档或去掉管道；`pipesForced: true` 说明有孙进程继承了输出管道且已强制结算，日志可能只到 exit 为止。
+4. **收**：`--kill "<jobfile>"` 先杀子进程树再收守护进程；产物三件套 `.pid` / `.state.json` / `.cursor` 留在日志旁，终态后可直接删。`--status` 可以随手查（只读，不消费增量），别用 `--status` 代替 `--wait` 做轮询循环。

@@ -29,7 +29,10 @@ npm run format       # prettier 全仓库格式化（.prettierrc.json：tabs + �
 npm run format:check # 只检查不改写（CI 跑这个）
 npm run build        # build:web (vite) + build:server (tsc) + build:dsh-runtime + build:mermaid-vendor + build:runtrace-vendor
 npm start            # 跑编译产物 dist/server/index.js（生产）
-npm test             # Vitest 单测与仓库守卫（tests/unit/，含部分浏览器/进程集成，零 token）
+npm test             # Vitest 快池（快慢分层见下文「两个池」，≈180s）
+npm run test:changed # 开发回路：只跑受 Git 改动影响的文件（改叶子模块时几秒~几十秒）
+npm run test:integration # 重型集成池：真 git / 真子进程 / 真 Hub（≈170s）
+npm run test:all     # 两池都跑（提交前/CI 的完整门禁）
 npm run test:smoke   # 零 token 协议冒烟聚合跑器（tests/run-smoke.mjs，82 个自包含测试；--core 只跑 PR 快检子集；--no-build 跳过套件前的构建）
 npm run test:freeze  # 冻结/重连回归测试（Playwright，需要本机 chromium headless）
 ```
@@ -38,23 +41,43 @@ Electron 相关依赖（`electron` / `electron-builder` 的二进制）走 npmmi
 
 ## 命令执行防卡死
 
-`scripts/safe-exec.mjs` 是跨平台（Windows / macOS / Linux）的命令执行器，给 AI、CI 和人工终端共用。它只做三件事：子进程 **stdin 接到 `/dev/null`**（交互确认、pager、REPL 一律读到 EOF，不再挂死）、**硬超时后杀整棵进程树**（复用 `server/process-utils.ts` 的 `killPidTree`，Win 走 `taskkill /T /F`）、**原始输出先落盘只回显尾部**（不稀释上下文）。
+两条入口，职责不重叠：
+
+| 场景                                 | 用哪个                                                 | 为什么                                                                                                                           |
+| ------------------------------------ | ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| 产品内（任意用户项目）跑长驻服务     | `bash({ background: true })`（`server/job-runner.ts`） | 进程挂在 server 里，prompt 立刻返回 job id + 日志路径，顶栏「后台任务」面板可见可停；不依赖 `scripts/`，npm / 桌面安装版天然可用 |
+| 源码仓库 / CI / 人工终端跑一次性命令 | `scripts/safe-exec.mjs`                                | 调用方不常驻，靠 `--detach` 守护进程 + jobfile 三件套（`.pid`/`.state.json`/`.cursor`）托管                                      |
+
+`background: true` 的 timeout 语义与前台**故意不同**（`server/bash-timeout.ts` 分两条归一）：前台缺省 120s、上限 3600s；后台缺省 / 传 0 = **不限**，显式正数才计时（上限 7 天，仅防手滑）。所以起 FastAPI 这类服务不会被“默认 120s”杀掉。日志落 `<dataDir>/jobs/<id>-<slug>.log`，任务结束（正常退出 / 超时 / 空闲 / 被停 / 起不来）会发一条通知，有对话归属时还会补一条系统消息。
+
+`scripts/safe-exec.mjs` 是跨平台（Windows / macOS / Linux）的命令执行器，给 AI、CI 和人工终端共用。它治的是五类挂死：子进程 **stdin 接到空设备**（交互确认、pager、REPL 一律读到 EOF）、**硬超时 + 空闲超时**（连续 N 秒无任何输出判静默卡死）、**杀整棵进程树**（`server/process-utils.ts` 的 `killPidTree` 为单源：Win `taskkill /T /F`，Posix `kill(-pgid)`）、**原始输出先落盘只回显尾部**、**跨平台轮询**（`--wait` 在 Node 里计时，不拼 `sleep` / `&&` / `$?`）。
 
 ```bash
 node scripts/safe-exec.mjs --timeout 60 -- npx vitest run tests/unit/foo.test.ts   # 短任务：单测/lint/typecheck
 node scripts/safe-exec.mjs --timeout 600 --log .safe-exec/build.log -- npm run build # 长构建：必带 --log
-node scripts/safe-exec.mjs --detach --timeout 1800 -- npm run build                # >3 分钟：后台托管，立即返回
-node scripts/safe-exec.mjs --status .safe-exec/20260101T000000-npm-run-build.pid    # 轮询（打印存活 + 日志尾）
-node scripts/safe-exec.mjs --kill .safe-exec/20260101T000000-npm-run-build.pid      # 终止（杀进程树）
+node scripts/safe-exec.mjs --detach --timeout 1800 --idle-timeout 300 -- npm run build # >3 分钟：托管，立即返回
+node scripts/safe-exec.mjs --wait .safe-exec/20260101T000000-npm-run-build.pid --wait-sec 10 --json  # 轮询
+node scripts/safe-exec.mjs --status .safe-exec/20260101T000000-npm-run-build.pid --json              # 立即查
+node scripts/safe-exec.mjs --kill .safe-exec/20260101T000000-npm-run-build.pid                      # 终止
 ```
 
-退出码约定：`0` 成功、`124` 硬超时（**不许原样重试**，先读日志定位卡点再改分档）、`127` 命令不存在、其余透传真实退出码。日志默认落 `.safe-exec/`（已 gitignore），可用 `--log` 指定。`--stream` 把输出实时 echo 到终端（给人看），默认只落盘 + 尾部 40 行。
+`--detach` 起的是 **detached 守护进程**（内部模式 `--supervise`）：它自己每秒巡检空闲时长与总时长并强杀，**不依赖 AI 来轮询**——AI 崩了、终端关了，到点照样清场。父进程只写 job 规格就退出，**不持有日志句柄**（Windows 上正是这一步带来 `EBUSY` 和退出挂住）。Job 三件套：`.pid`（规格，一次性写）、`.state.json`（状态/终态）、`.cursor`（增量游标，供 `--wait` 只回新输出）。
+
+状态机：`RUNNING` / `SUCCESS` / `FAILED` / `TIMEOUT` / `IDLE_TIMEOUT` / `KILLED` / `ENOENT` / `ABORTED`（守护进程被外部杀掉，或看门狗 8s 宽限后子进程仍未死 → 终态也可能是 `ABORTED`，先 `--kill` 再重跑）/ `UNKNOWN`。`--json` 输出 `status` / `exitCode` / `reason` / `elapsedSec` / `idleSec` / `childAlive` / `terminal` / `orphanAlive` / `pipesForced` / `newOutput` / `next`（`next` 就是下一条该跑的命令）。
+
+`--status` 是**只读观测者**（只算增量、不推进 `.cursor`），`--wait` 才是消费者（推进游标）：前者可以随手反复调，不会偷走主循环的输出。子进程已退出但孙进程仍持有输出管道时，`--wait` 会先等 1.5s 排空，随后强拆管道并自行结算，标 `pipesForced: true`（旧实现会一直等到硬超时）。
+
+退出码约定：`0` 成功、`124` 硬超时或空闲超时（**不许原样重试**，先读日志定位卡点再改分档）、`127` 命令不存在、`2` 用法错误，其余透传真实退出码。日志默认落 `.safe-exec/`（已 gitignore），可用 `--log` 指定。`--stream` 把输出实时 echo 到终端（给人看），默认只落盘 + 尾部 40 行。`--idle-timeout` 默认关闭：构建/类型检查本来就可能长时间安静，只有确认「正常运行必有心跳输出」的任务才开。
+
+`--kill` 先杀子进程树（Posix 的 `-pid` 只对进程组组长有效），再收守护进程；只有子 PID 还没发布时才退化为单杀守护进程并明确告警。`ABORTED` 且子进程仍活的任务不会被当成「已结束」跳过，`--kill` 会继续清场并把终态改写成 `KILLED`。
 
 Windows 上 `npx` / `npm` / `pnpm` / `yarn` 是 `.cmd` 垫片，直接 `spawn` 会 ENOENT：执行器会按 `PATHEXT` 解析，只有命中 `.cmd` / `.bat` 才转 cmd.exe（相对路径自动还原成反斜杠绝对路径），其余命令保持直连 spawn，不经 shell。
 
 时限分档：单测/lint/typecheck 60 秒、全量构建 600 秒、预计 >3 分钟一律 `--detach` 托管；AI 的单次 bash 调用另有 pi 工具层 `timeout` 参数与会话看门狗兜底，三者不重叠也不互相替代。
 
-**不要再手写 `timeout 60s` / `nohup ... &` / `ps -p` 前缀**：Windows 上 `timeout` 是「等待按键 N 秒」的 `timeout.exe`（语义正好相反），`nohup`、`ps -p` 也不存在；Git Bash、PowerShell、cmd 三套语义各不相同，跨平台只能由 Node 包装器统一。
+**不要再手写 `timeout 60s` / `nohup ... &` / `ps -p` / `sleep 5` 前缀**：Windows 上 `timeout` 是「等待按键 N 秒」的 `timeout.exe`（语义正好相反），`nohup`、`ps -p`、`sleep` 的 cmd / PowerShell / bash 语法各不相同；空设备也不是一个名字（`/dev/null` vs `NUL`），`$?` 三元语法同样不通用。跨平台只能由 Node 包装器统一：等待用 `--wait`，查状态用 `--status --json`，终止用 `--kill`。
+
+`--shell` 只在命令必须整行交给 shell 时用（`--shell "<整行命令>"`，必要时配 `--shell-bin`）。`--shell-bin auto` 在 Windows 下优先探测真 Git Bash（`C:\Program Files\Git\bin\bash.exe`），类 Unix 用 `bash -c`，因此 `cd /e/pi-web-ui && ...` 这类 POSIX 路径才不会被 `cmd.exe` 认错盘符；解释器也可以是 `powershell` / `pwsh`（走 `-NoProfile -NonInteractive -Command`）。
 
 ## CI
 
@@ -155,6 +178,33 @@ spawn 后记录 `server.pid`，测试收尾（含异常 catch 路径）用 `proc
 ### 验证项
 
 本地迭代先运行与变更相关的 `npx vitest run <测试文件>`；涉及协议时运行 `npm run check:protocol` 和对应 `tests/*-test.mjs`，涉及真实 UI 交互时再跑相关浏览器测试。测试 server 使用隔离端口与独立 data-dir；Chromium 由 `tests/lib/chrome.mjs` 逐平台探测，`PI_WEB_CHROME` 可覆盖。提交前按 `AGENTS.md` 完成改动文件格式化、`npm run typecheck` 和相关单测；全量 `npm test` 与分层 `test:smoke` 继续由 CI 执行，共享基础设施变更时本地也应跑相应全量套件。
+
+### 测试耗时观测（慢在哪）
+
+`vitest.config.ts` 的 `silent: true` 会吞掉默认 reporter 的 per-file 行，全量跑十几分钟却看不到任何耗时。因此配了 `tests/lib/test-timing-reporter.mjs`：每条用例一行「结束时刻 + 耗时」，收尾再打「最慢文件 Top10 / 最慢用例 Top20」。
+
+```bash
+npm test                              # 默认 PI_TEST_TIMING=all，逐条打印
+PI_TEST_TIMING=slow npm test          # 只打 ≥1s 的用例（PI_TEST_SLOW_MS 可改阈值）
+PI_TEST_TIMING=off npm test           # 只留收尾小结
+npx vitest run --reporter=json --outputFile=<tmp>/timing.json   # 事后逐用例复用
+```
+
+本地实测基线（Windows 12C/24T，1028 个文件 / ≈12.5k 用例）：墙钟 ≈705s，用例累计 ≈1955s，并行系数 2.78×。**约 75% 的时间集中在 6 个真实集成文件**（`device-hub-artifact-integration` / `device-local-integration` / `device-hub-integration` / `task-workspace` / `canvas-workspace` / `device-center-runtime-code-artifact`），它们真跑 git 子进程与 Hub HTTP；这些文件单跑最慢用例 17–52s，4 worker 满载下会被拉长约 2.3×。
+
+两条据此定的规矩：① **重集成用例的超时预算写 90s**（与 `task-workspace` 对齐），别写 20–30s——那是零余量，满载时稳态假红，且每条假红要白烧 30s；② 同一文件内的用例是串行的，把几百秒的重活拆成多个文件比调 worker 数更有效。
+
+### 两个池：默认快池 + 重型集成池
+
+单选那个数字（`maxWorkers`）救不了这个套件：**重型池**从 4 抬到 8，同一条用例从 30s 膨胀到 83s、其余撞 60s/90s 预算，并发上去反而更慢且假红；而**快池**恰好相反，它卡在 1023 次 fork 上，worker 越多越快。所以按成本分层，清单单源在 [`tests/lib/suite-partition.mjs`](../tests/lib/suite-partition.mjs)（判据：实测 ≥60s）：
+
+| 池           | 入口                       | 内容                                          | 预算                         |
+| ------------ | -------------------------- | --------------------------------------------- | ---------------------------- |
+| 快池（默认） | `npm test`                 | 除下表之外的全部单测（1023 文件 / 12.4k 条）  | 8 worker · 60s（实测 ≈186s） |
+| 重型集成     | `npm run test:integration` | 6 个真 git / 真子进程 / 真 Hub 文件（111 条） | 4 worker · 90s（实测 ≈470s） |
+| 全量         | `npm run test:all`         | 两个都跑                                      | —                            |
+
+`PI_TEST_ALL=1 npx vitest run` 也能一次跑完全部；CI 的 `Unit tests` 与 `Integration tests` 两步分别跑两个池（`tests/unit/test-suite-partition.test.ts` 守卫「两边拼起来必须等于 `tests/unit/**` 全集」，防止某个文件被 exclude 后再也没人跑）。重文件新增时往清单里加一行即可。
 
 ### 测试家族速查
 
