@@ -112,9 +112,11 @@ export function mountAutoReplyPanel(container, opts = {}) {
 				<div class="fp-field-hint">以你本人身份回包时，对方看到的是你。</div>
 			</div>
 			<div class="fp-field">
-				<div class="fp-field-label">频率</div>
+				<div class="fp-field-label">频率与时效</div>
 				<label class="fp-check">冷却 <input type="number" class="fp-input fp-auto-num fp-auto-cooldown" min="0" max="3600" step="5" aria-label="冷却秒数" /> 秒</label>
 				<label class="fp-check">每小时上限 <input type="number" class="fp-input fp-auto-num fp-auto-cap" min="0" max="1000" step="1" aria-label="每小时上限" /></label>
+				<label class="fp-check">旧消息超过 <input type="number" class="fp-input fp-auto-num fp-auto-stale" min="0" max="86400" step="10" aria-label="旧消息过期秒数" /> 秒不回</label>
+				<div class="fp-field-hint">轮询有延迟：超过这个时长的消息视为历史积压，不自动补答。<b>0 = 不限时效</b>，重启后可能把积压的消息补答一遍。</div>
 			</div>
 		</div>
 		<div class="fp-field">
@@ -153,6 +155,7 @@ export function mountAutoReplyPanel(container, opts = {}) {
 	const elAs = $(".fp-auto-as");
 	const elCooldown = $(".fp-auto-cooldown");
 	const elCap = $(".fp-auto-cap");
+	const elStale = $(".fp-auto-stale");
 	const elIds = $(".fp-auto-ids");
 	const elCount = $(".fp-auto-count");
 	const elSig = $(".fp-auto-signature");
@@ -194,6 +197,7 @@ export function mountAutoReplyPanel(container, opts = {}) {
 			elAs.value = cfg.as === "bot" ? "bot" : "user";
 			elCooldown.value = String(cfg.cooldownSec ?? 20);
 			elCap.value = String(cfg.maxPerHour ?? 20);
+			elStale.value = String(cfg.staleSec ?? 300);
 			elIds.value = String(cfg.chatIds ?? "");
 			elSig.value = String(cfg.signature ?? "");
 		}
@@ -256,6 +260,15 @@ export function mountAutoReplyPanel(container, opts = {}) {
 		}
 	}
 
+	/** 过期时效：空/非法一律回到 300（把输入框清空不该等于「不限」，那会把积压全补答一遍）。 */
+	function staleSecValue() {
+		const raw = String(elStale.value ?? "").trim();
+		if (!raw) return 300;
+		const n = Math.round(Number(raw));
+		if (!Number.isFinite(n) || n < 0) return 300;
+		return Math.min(n, 86_400);
+	}
+
 	function patch() {
 		return {
 			enabled: elEnabled.checked,
@@ -263,6 +276,7 @@ export function mountAutoReplyPanel(container, opts = {}) {
 			as: elAs.value,
 			cooldownSec: Number(elCooldown.value) || 0,
 			maxPerHour: Number(elCap.value) || 0,
+			staleSec: staleSecValue(),
 			chatIds: elIds.value,
 			signature: elSig.value,
 		};
@@ -306,13 +320,15 @@ export function mountAutoReplyPanel(container, opts = {}) {
 				return;
 			}
 			const result = await call("/auto/preview", { method: "POST", body: { chatId: ids[0] } });
-			elPreview.value = `[判定] ${result.accepted ? "会被回复" : `不会回（${result.reason}）`}\n\n${result.prompt || ""}`;
+			// 判定走服务端**已保存**的配置：表单有未保存改动时必须说清楚，否则「我明明把过期改成 600 了」会反复出现。
+			const staleNote = dirty ? "（按已保存的配置判定；刚才的改动先点「保存并生效」）" : "";
+			elPreview.value = `[判定] ${result.accepted ? "会被回复" : `不会回（${result.reason}）`}${staleNote}\n\n${result.prompt || ""}`;
 			elHint.textContent = result.accepted ? "" : `当前配置下这条消息不会触发回复：${result.reason}`;
 			elHint.className = `fp-auto-msg fp-auto-hint${result.accepted ? "" : " err"}`;
 		}),
 	);
 
-	for (const el of [elEnabled, elDry, elAs, elCooldown, elCap, elIds, elSig]) {
+	for (const el of [elEnabled, elDry, elAs, elCooldown, elCap, elStale, elIds, elSig]) {
 		el?.addEventListener("input", () => {
 			markDirty(true);
 			if (el === elIds) paintCount(elIds.value);

@@ -99,6 +99,8 @@ import {
 	matchAutoReply,
 	normalizeAutoConfig,
 } from "./lib/auto-reply.mjs?v=0.14.1";
+// 会话页按需「让 AI 代写回复」：预览 / 直发共用同一个生成引擎。
+import { createChatAiReplier, splitReplyText } from "./lib/chat-ai.mjs?v=0.16.0";
 import {
 	fetchChatInfo as fetchChatInfoViaCli,
 	fetchChatMessages as fetchChatMessagesViaCli,
@@ -171,6 +173,8 @@ export {
 	parseExtractReply,
 } from "./lib/todo-ai.mjs?v=0.14.1";
 export { listMyTasks as listMyTasksShape, normalizeCliTask } from "./lib/cli-tasks.mjs?v=0.14.1";
+// 会话页 AI 回复：纯函数（提示词 / 清洗 / 分片）单测直接 import，不必起插件。
+export { buildReplyPrompt, cleanAiReply, splitReplyText } from "./lib/chat-ai.mjs?v=0.16.0";
 export {
 	ANON_OWNER,
 	RECENT_LIMIT,
@@ -1237,6 +1241,19 @@ export default {
 		if (typeof offRunEvent === "function") disposers.push(offRunEvent);
 		void autoReplier.load().catch(() => {});
 
+		/* --------------------- 会话页 AI 回复（按需，点击即触发） --------------------- */
+		//
+		// 与上面的自动回复**分开**：这里没有白名单/冷却，判定就是「人在会话页点了一下」。
+		// 预览模式只生成不发；直发模式生成后立刻以当前身份发出去。两条路径共用同一个引擎，
+		// 认领规则也一样：`host.chat` 回执的 runId → onRunEvent 拿 assistant 文本。
+		const chatAiReplier = createChatAiReplier({ chat: (req) => host.chat(req), log });
+		const offChatAiRun = host.onRunEvent?.((ev) => {
+			void chatAiReplier.handleRunEvent(ev);
+		});
+		if (typeof offChatAiRun === "function") disposers.push(offChatAiRun);
+		// 停用时把还在等结果的调用收掉（别让浏览器请求悬到 180s 超时）。
+		disposers.push(() => chatAiReplier.stop());
+
 		/* -------------------------------- AI 待办 -------------------------------- */
 		//
 		// 「与我有关 + 持续给建议 + 必要时一键让 AI 处理」。
@@ -1955,6 +1972,103 @@ export default {
 					// 而不是等 5s 轮询把整页重拉一遂（也就不会“发了却买不到”）。
 					if (sent?.chatId && isValidChatId(sent.chatId)) refreshChatInBackground(sent.chatId, { force: true });
 					sendOk(res, sent);
+				},
+			],
+			[
+				"POST",
+				"/chat/ai-reply",
+				async (req, res) => {
+					const body = bodyOf(req);
+					const chatId = String(body.chatId ?? "").trim();
+					if (!isValidChatId(chatId)) throw new Error("会话 ID 不合法（应为 oc_ 开头）");
+					// preview = 只生成，正文交给界面预览/编辑；direct = 生成后立刻以当前身份发出去。
+					const mode = String(body.mode ?? "").toLowerCase() === "direct" ? "direct" : "preview";
+					const identity = sendIdentity(body.as ?? body.identity ?? "user");
+					const instruction = String(body.instruction ?? "")
+						.trim()
+						.slice(0, 500);
+					// 右键选中的那条消息：只回复它，且不把更晚的消息当上下文（Feishu message id = om_...）。
+					const messageId = String(body.messageId ?? "").trim();
+					if (messageId && !/^[A-Za-z0-9_-]{1,80}$/.test(messageId)) throw new Error("消息 ID 不合法");
+					// 上下文与界面**同一个读出口**（缓存优先）：用户看到的那几条，就是模型看到的那几条。
+					// 读 60 条是为了兜住「右键的是屏幕上偏旧的一条」，提示词内部仍只取锚点前 ≤12 条。
+					const payload = await chatMessagesPayload(chatId, { limit: 60 });
+					const chatName = String(payload.label || payload.peer?.name || "").trim();
+					const generated = await chatAiReplier.generate({
+						chatId,
+						chatName,
+						rows: payload.items,
+						instruction,
+						messageId,
+					});
+					if (!generated.ok) throw new Error(generated.error || "AI 没有产出回复");
+					const text = generated.text;
+					if (mode === "preview") {
+						sendOk(res, {
+							mode,
+							chatId,
+							chatName,
+							text,
+							chars: text.length,
+							identity,
+							sent: false,
+							runId: generated.runId,
+							conversationId: generated.conversationId,
+						});
+						return;
+					}
+					// 直发：按飞书单条上限切片；多块用「同前缀 + 序号」的幂等键（重试不会发两遍）。
+					const chunks = splitReplyText(text);
+					const base =
+						String(body.uuid ?? "")
+							.trim()
+							.replace(/[^\w.-]/g, "")
+							.slice(0, 44) || `ai-${Date.now().toString(36)}`;
+					const sentItems = [];
+					for (let i = 0; i < chunks.length; i += 1) {
+						const uuid = (chunks.length > 1 ? `${base}-${i + 1}` : base).slice(0, 50);
+						try {
+							const sent = await sendChatText({ chatId, text: chunks[i], as: identity, uuid });
+							sentItems.push({ index: i + 1, messageId: String(sent?.messageId ?? "") });
+						} catch (err) {
+							// 生成成功但发送失败：**不自动重试**，把还没发出去的部分带回界面
+							// （预览面板可改后重发）。复用失败那一段的幂等键：万一它其实发出去了，
+							// 飞书按 key 去重，不会发第二遍。
+							if (sentItems.length > 0) refreshChatInBackground(chatId, { force: true });
+							const remaining = chunks.slice(sentItems.length);
+							sendOk(res, {
+								mode,
+								chatId,
+								chatName,
+								text: remaining.join("\n"),
+								uuidBase: (chunks.length > 1 ? `${base}-${sentItems.length + 1}` : base).slice(0, 50),
+								identity,
+								sent: sentItems.length > 0,
+								partial: sentItems.length > 0,
+								sentChunks: sentItems.length,
+								chunks: chunks.length,
+								sendError: String(err?.message || err),
+								hint: String(err?.hint ?? ""),
+								runId: generated.runId,
+							});
+							return;
+						}
+					}
+					// 自己发的消息立刻反映到缓存/列表（不等 5s 轮询）。
+					refreshChatInBackground(chatId, { force: true });
+					sendOk(res, {
+						mode,
+						chatId,
+						chatName,
+						text,
+						identity,
+						sent: true,
+						chunks: chunks.length,
+						chunked: chunks.length > 1,
+						messageIds: sentItems.map((item) => item.messageId).filter(Boolean),
+						runId: generated.runId,
+						conversationId: generated.conversationId,
+					});
 				},
 			],
 			[

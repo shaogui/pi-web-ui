@@ -55,6 +55,8 @@ async function call(path, { method = "GET", body, timeoutMs = 20000 } = {}) {
 			needUser: Boolean(payload?.needUser),
 			code: payload?.code ?? null,
 			detail: payload?.detail ?? null,
+			// CliError 的「下一步该做什么」在 `cli.hint`：不带出来，界面只剩一句英文权限码。
+			cli: payload?.cli ?? null,
 		});
 	}
 	return payload;

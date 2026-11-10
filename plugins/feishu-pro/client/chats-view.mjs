@@ -90,6 +90,16 @@ const STYLES = `
 .fp-cv-msgs{flex:1;min-height:0;overflow:auto;padding:10px 14px;display:flex;flex-direction:column;gap:8px;}
 .fp-cv-msg{display:flex;flex-direction:column;gap:2px;max-width:min(680px,100%);}
 .fp-cv-msg.self{align-self:flex-end;align-items:flex-end;}
+.fp-cv-msg.ctx .fp-cv-bubble{outline:2px solid var(--accent);outline-offset:1px;}
+.fp-cv-menu{position:fixed;z-index:9996;min-width:232px;max-width:min(320px,90vw);padding:4px;border-radius:10px;border:1px solid var(--border);background:var(--bg-elev);box-shadow:0 12px 36px rgba(0,0,0,.36);display:flex;flex-direction:column;gap:1px;}
+.fp-cv-menu-item{display:flex;flex-direction:column;gap:1px;width:100%;text-align:left;padding:7px 9px;border:none;border-radius:7px;background:transparent;color:var(--text);font:inherit;cursor:pointer;}
+.fp-cv-menu-item:hover,.fp-cv-menu-item:focus-visible{background:var(--accent-soft);outline:none;}
+.fp-cv-menu-item b{font-size:12px;font-weight:600;line-height:1.5;}
+.fp-cv-menu-item span{font-size:10.5px;line-height:1.5;color:var(--text-dim);}
+.fp-cv-menu-sep{height:1px;margin:2px 4px;background:var(--border-soft);}
+.fp-cv-menu-note{padding:7px 9px;font-size:10.5px;line-height:1.5;color:var(--text-faint);}
+.fp-cv-aidraft-regen[disabled]{opacity:.5;cursor:not-allowed;}
+.fp-cv-ai-tip{flex:1;min-width:0;font-size:10.5px;line-height:1.6;color:var(--text-faint);overflow-wrap:anywhere;}
 .fp-cv-meta{font-size:10.5px;color:var(--text-faint);display:flex;gap:6px;align-items:baseline;}
 .fp-cv-bubble{padding:6px 10px;border-radius:9px;border:1px solid var(--border-soft);background:var(--bg-elev);font-size:12px;line-height:1.6;overflow-wrap:anywhere;white-space:pre-wrap;}
 .fp-cv-msg.self .fp-cv-bubble{background:var(--accent-soft);border-color:var(--accent);}
@@ -105,6 +115,20 @@ const STYLES = `
 .fp-cv-compose-hint.err{color:var(--red);}
 .fp-cv-send{padding:5px 14px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:var(--accent-contrast,#fff);font:inherit;font-size:12px;font-weight:600;cursor:pointer;}
 .fp-cv-send[disabled]{opacity:.5;cursor:not-allowed;}
+.fp-cv-airow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.fp-cv-ai-tag{flex:0 0 auto;font-size:10px;font-weight:700;letter-spacing:.04em;color:var(--accent);background:var(--accent-soft);border-radius:4px;padding:1px 5px;}
+.fp-cv-ai-want{flex:1;min-width:150px;padding:5px 9px;border-radius:7px;border:1px solid var(--border);background:var(--bg);color:var(--text);font:inherit;font-size:11.5px;outline:none;}
+.fp-cv-ai-want:focus{border-color:var(--accent);}
+.fp-cv-ai-want[disabled]{opacity:.55;cursor:not-allowed;}
+.fp-cv-aidraft{display:flex;flex-direction:column;gap:6px;padding:8px 10px;border:1px solid var(--accent);border-radius:9px;background:var(--accent-soft);}
+.fp-cv-aidraft-head{display:flex;align-items:center;gap:8px;min-width:0;}
+.fp-cv-aidraft-title{flex:0 0 auto;font-size:11.5px;font-weight:600;color:var(--accent);white-space:nowrap;}
+.fp-cv-aidraft-meta{font-size:10.5px;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.fp-cv-aidraft textarea{width:100%;min-height:96px;max-height:220px;resize:vertical;padding:7px 10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font:inherit;font-size:12.5px;line-height:1.6;outline:none;}
+.fp-cv-aidraft textarea:focus{border-color:var(--accent);}
+.fp-cv-aidraft-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.fp-cv-aidraft-hint{flex:1;min-width:0;font-size:11px;line-height:1.6;color:var(--text-faint);overflow-wrap:anywhere;}
+.fp-cv-aidraft-hint.err{color:var(--red);}
 `;
 
 function injectStyles() {
@@ -120,6 +144,14 @@ const esc = (value) =>
 		/[&<>"']/g,
 		(c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] ?? c,
 	);
+
+/** 单行摘要：菜单/草稿标题只放一段，不能让换行把布局撑开。 */
+const clip = (value, max = 28) => {
+	const text = String(value ?? "")
+		.replace(/\s+/g, " ")
+		.trim();
+	return text.length > max ? `${text.slice(0, max)}…` : text;
+};
 
 const BUTTON =
 	"padding:4px 10px;border-radius:7px;border:1px solid var(--border);background:var(--bg-elev2);color:var(--text);font:inherit;font-size:11.5px;cursor:pointer;";
@@ -246,6 +278,25 @@ export function mountChatsView({ panel, call, say, onOpenSettings } = {}) {
 				</div>
 				<div class="fp-cv-msgs"><div class="fp-cv-empty">左侧选一个会话查看消息</div></div>
 				<div class="fp-cv-compose">
+					<div class="fp-cv-airow">
+						<span class="fp-cv-ai-tag" title="AI 会读这条消息之前的上下文，按当前发送身份回复">AI</span>
+						<input class="fp-cv-ai-want" aria-label="AI 回复要点" placeholder="回复要点（可选，右键消息时生效）：想让 AI 说什么、什么语气" disabled />
+						<span class="fp-cv-ai-tip">右键任意消息 → AI 直接回复 / AI 预览回复</span>
+					</div>
+					<div class="fp-cv-aidraft" style="display:none" role="group" aria-label="AI 回复预览">
+						<div class="fp-cv-aidraft-head">
+							<span class="fp-cv-aidraft-title">AI 回复预览</span>
+							<span class="fp-cv-aidraft-meta"></span>
+							<span style="flex:1"></span>
+							<button class="fp-cv-aidraft-regen" style="${BUTTON}" title="按同样的要点再生成一版">再生成</button>
+							<button class="fp-cv-aidraft-close" style="${BUTTON}">关闭</button>
+						</div>
+						<textarea class="fp-cv-aidraft-text" aria-label="AI 回复正文（可编辑）" rows="4" placeholder="AI 生成的回复会出现在这里，可以改完再发"></textarea>
+						<div class="fp-cv-aidraft-bar">
+							<button class="fp-cv-aidraft-send fp-cv-send" disabled>发送这条</button>
+							<span class="fp-cv-aidraft-hint"></span>
+						</div>
+					</div>
 					<textarea class="fp-cv-compose-input" rows="2" disabled placeholder="选一个会话后可以发消息（Ctrl/⌘ + Enter 发送）"></textarea>
 					<div class="fp-cv-compose-bar">
 						<div class="fp-cv-segs fp-cv-ident" role="group" aria-label="发送身份">
@@ -277,6 +328,16 @@ export function mountChatsView({ panel, call, say, onOpenSettings } = {}) {
 	const elSend = $(".fp-cv-send");
 	const elComposeHint = $(".fp-cv-compose-hint");
 	const elIdents = root.querySelectorAll(".fp-cv-iseg");
+	// AI 回复：右键消息触发（直接发 / 预览后发），这里是要点输入与预览面板。
+	const elAiWant = $(".fp-cv-ai-want");
+	const elAiTip = $(".fp-cv-ai-tip");
+	const elAiDraft = $(".fp-cv-aidraft");
+	const elAiDraftText = $(".fp-cv-aidraft-text");
+	const elAiDraftMeta = $(".fp-cv-aidraft-meta");
+	const elAiDraftSend = $(".fp-cv-aidraft-send");
+	const elAiDraftRegen = $(".fp-cv-aidraft-regen");
+	const elAiDraftClose = $(".fp-cv-aidraft-close");
+	const elAiDraftHint = $(".fp-cv-aidraft-hint");
 	const elWatch = $(".fp-cv-watch");
 	const elOpen = $(".fp-cv-open");
 	const elSyncText = $(".fp-cv-sync-text");
@@ -305,6 +366,20 @@ export function mountChatsView({ panel, call, say, onOpenSettings } = {}) {
 	// 初值只敢写“user”，真实可用性以 /state 的 scopes 报告为准（拿到前不拦）。
 	let sendIdentity = "user";
 	let scopeInfo = null;
+	// AI 回复：aiBusy 期间右键菜单锁死（同一会话只允许一轮，服务端也会拦）。
+	let aiBusy = false;
+	let aiMode = "";
+	// 这一轮回复的是哪条消息（右键选中的那条）：预览面板标出来，「再生成」沿用同一个锚点。
+	let aiTarget = null; // { id, label, text }
+	let activeMsgMenu = null;
+	// 预览草稿属于哪个会话：切走就丢掉，避免把 A 的回复发到 B 里。
+	let draftChatId = "";
+	let draftRunId = "";
+	// 直发失败转预览时复用服务端那次的幂等键：重发不会变成第二条。
+	let draftUuid = "";
+	// 记住生成时的原文：只有「原样重发」才复用上面那个 key；改过字就用新的 key（改动必须发出去）。
+	let draftOriginal = "";
+	let draftSending = false;
 
 	function setHint(text, err = false) {
 		hint = text || "";
@@ -326,6 +401,8 @@ export function mountChatsView({ panel, call, say, onOpenSettings } = {}) {
 	function paintIdentity() {
 		for (const btn of elIdents) btn.classList.toggle("on", btn.dataset.as === sendIdentity);
 		setComposeHint(composeHintText(), scopeInfo?.capabilities?.im_send?.ok === false);
+		// 预览里写着「以「我」身份发送」：切了身份就得跟着改，否则用户会按错的预期点发送。
+		paintDraftMeta();
 	}
 
 	/** 拉一次 /state：只为了知道「个人授权是否可用 / 缺哪些 scope」，失败不影响其它功能。 */
@@ -363,6 +440,208 @@ export function mountChatsView({ panel, call, say, onOpenSettings } = {}) {
 	function setComposeHint(text, err = false) {
 		elComposeHint.textContent = text || composeHintText();
 		elComposeHint.className = `fp-cv-compose-hint${err ? " err" : ""}`;
+	}
+
+	/* ---------------------- AI 回复（直接发 / 预览后发） ---------------------- */
+	//
+	// 为什么要有两种：直接发适合「我懒得打字，反正就是回一句收到」；预览适合
+	// 「话一旦发出去就收不回」的场合 —— 生成完先摊在输入框上方，改完点「发送这条」。
+	// 预览发送走 `/chat/send`（与手打发消息同一条路、同一套幂等键），不另造一条发送通道。
+
+	function identityLabel(as = sendIdentity) {
+		return as === "tenant" || as === "bot" ? "机器人" : "我";
+	}
+
+	function paintAiBusy() {
+		const usable = Boolean(selected) && !aiBusy;
+		elAiWant.disabled = !usable;
+		elAiDraftRegen.disabled = !usable;
+		elAiTip.textContent = aiBusy
+			? aiMode === "direct"
+				? "AI 正在生成并直接发送…"
+				: "AI 正在生成预览…"
+			: "右键任意消息 → AI 直接回复 / AI 预览回复";
+	}
+
+	function setDraftHint(text, err = false) {
+		elAiDraftHint.textContent = text || "";
+		elAiDraftHint.className = `fp-cv-aidraft-hint${err ? " err" : ""}`;
+	}
+
+	/** 预览面板的「回复谁 / 身份 / 字数」：换身份、改正文都要跟着变。 */
+	function paintDraftMeta() {
+		if (!elAiDraft || elAiDraft.style.display === "none") return;
+		const target = aiTarget ? `回复 ${aiTarget.label || "这条消息"}：${clip(aiTarget.text, 20)} · ` : "";
+		elAiDraftMeta.textContent = `${target}以「${identityLabel()}」身份发送 · ${elAiDraftText.value.length} 字 · 可编辑`;
+	}
+
+	function hideDraft() {
+		elAiDraft.style.display = "none";
+		elAiDraftText.value = "";
+		elAiDraftSend.disabled = true;
+		draftChatId = "";
+		draftRunId = "";
+		draftUuid = "";
+		draftOriginal = "";
+		setDraftHint("");
+	}
+
+	function showDraft(text, { runId = "", uuid = "", note = "", err = false } = {}) {
+		draftChatId = selected?.id || "";
+		draftRunId = String(runId || "");
+		draftUuid = String(uuid || "");
+		draftOriginal = String(text ?? "");
+		elAiDraft.style.display = "";
+		elAiDraftText.value = String(text ?? "");
+		elAiDraftSend.disabled = !elAiDraftText.value.trim();
+		setDraftHint(note || "Ctrl/⌘ + Enter 直接发送 · 内容可改", err);
+		paintDraftMeta();
+		try {
+			elAiDraftText.focus();
+			elAiDraftText.setSelectionRange(elAiDraftText.value.length, elAiDraftText.value.length);
+		} catch {
+			/* 焦点失败不影响发送 */
+		}
+	}
+
+	/** 幂等键前缀：同一次生成的重试共用一个 runId 前缀（多分片时服务端再补序号）。 */
+	function aiUuid(prefix = "ai") {
+		const key = String(draftRunId || Date.now().toString(36))
+			.replace(/[^\w.-]/g, "")
+			.slice(0, 32);
+		return `${prefix}-${key}`.slice(0, 50);
+	}
+
+	/**
+	 * 触发一轮 AI 回复（右键某条消息 → 直接发 / 先预览）。
+	 * @param {"preview"|"direct"} mode
+	 * @param {{messageId?:string,target?:{id:string,label:string,text:string}|null}} [anchor]
+	 */
+	async function runAiReply(mode, { messageId = "", target = null } = {}) {
+		if (!selected || aiBusy) return;
+		const anchorId = String(messageId || target?.id || "").trim();
+		const targetWho = String(target?.label || target?.senderLabel || "对方");
+		if (mode === "direct") {
+			const who = identityLabel();
+			const where = target ? `回复 ${targetWho} 的那条「${clip(target.text, 36)}」` : "回复这个会话的最近消息";
+			// 直发是不可撤销的对外动作：多问一句，成本远低于发错人。
+			const ok =
+				typeof window === "undefined" || typeof window.confirm !== "function"
+					? true
+					: window.confirm(`将以「${who}」身份${where}，内容不会先给你看。\n\n继续？`);
+			if (!ok) return;
+		}
+		aiBusy = true;
+		aiMode = mode;
+		aiTarget = target
+			? {
+					id: String(target.id || ""),
+					label: String(target.label || target.senderLabel || ""),
+					text: String(target.text || ""),
+				}
+			: null;
+		paintAiBusy();
+		setComposeHint(
+			mode === "preview"
+				? `AI 正在读${target ? ` ${targetWho} 的这条消息` : "最近消息"}并起草回复…`
+				: "AI 正在生成并直接发送…",
+		);
+		const chatId = selected.id;
+		const identity = sendIdentity;
+		try {
+			const payload = await call("/chat/ai-reply", {
+				method: "POST",
+				timeoutMs: 240_000,
+				body: {
+					chatId,
+					mode,
+					as: identity,
+					instruction: elAiWant.value.trim(),
+					...(anchorId ? { messageId: anchorId } : {}),
+					uuid: aiUuid("ai"),
+				},
+			});
+			if (disposed || selected?.id !== chatId) return;
+			// 生成成功、发送失败：正文不丢，放进预览让用户改完重发（服务端不自动重试）。
+			if (payload.sent === false && payload.sendError) {
+				const tail = payload.hint ? `（${payload.hint}）` : "";
+				const part = payload.partial ? `已发出 ${payload.sentChunks}/${payload.chunks} 段，` : "";
+				showDraft(payload.text, {
+					runId: payload.runId,
+					uuid: payload.uuidBase,
+					note: `直接发送失败：${payload.sendError}${tail} —— ${part}剩下的正文已放进预览，改完可以再发`,
+					err: true,
+				});
+				setComposeHint("");
+				return;
+			}
+			if (mode === "preview") {
+				showDraft(payload.text, { runId: payload.runId });
+				setComposeHint("");
+				return;
+			}
+			const who = identityLabel(payload.identity || identity);
+			const extra = payload.chunked ? `，内容较长分 ${payload.chunks} 条` : "";
+			setComposeHint(`AI 已直接回复（以${who}身份${extra}）`);
+			say?.(`AI 回复已发送（${who}）${extra}`, "ok");
+			void refreshMessages(chatId);
+		} catch (err) {
+			if (disposed) return;
+			const hint = err?.cli?.hint || err?.detail?.hint || "";
+			setComposeHint(`AI 回复失败：${err?.message || err}${hint ? ` —— ${hint}` : ""}`, true);
+			say?.(`AI 回复失败：${err?.message || err}`, "error");
+		} finally {
+			if (!disposed) {
+				aiBusy = false;
+				aiMode = "";
+				paintAiBusy();
+			}
+		}
+	}
+
+	/** 预览正文 → 真发送（可编辑；超长/为空在这里就拦住，不白跑一次服务端）。 */
+	async function sendAiDraft() {
+		if (!selected || draftSending) return;
+		if (draftChatId && draftChatId !== selected.id) {
+			hideDraft();
+			setComposeHint("会话已经切走：预览草稿已丢弃（避免把回复发错人）", true);
+			return;
+		}
+		const text = elAiDraftText.value.trim();
+		if (!text) {
+			setDraftHint("内容为空：写点东西再发", true);
+			return;
+		}
+		if (text.length > 4000) {
+			setDraftHint(`内容 ${text.length} 字，超过飞书单条 4000 字上限：删一点再发`, true);
+			return;
+		}
+		draftSending = true;
+		elAiDraftSend.disabled = true;
+		const label = elAiDraftSend.textContent;
+		elAiDraftSend.textContent = "发送中…";
+		const identity = sendIdentity;
+		const chatId = selected.id;
+		// 原样重发 → 复用失败那次的 key（防重复）；改过字 → 新 key（改动必须发出去）。
+		const uuid = draftUuid && text === draftOriginal.trim() ? draftUuid : aiUuid("draft-edit");
+		try {
+			await call("/chat/send", {
+				method: "POST",
+				body: { chatId, text, as: identity, uuid },
+			});
+			hideDraft();
+			const who = identityLabel(identity);
+			setComposeHint(`AI 回复已发送（以${who}身份）`);
+			say?.(`AI 回复已发送（${who}）`, "ok");
+			void refreshMessages(chatId);
+		} catch (err) {
+			setDraftHint(`发送失败：${err?.message || err}`, true);
+			say?.(`发送失败：${err?.message || err}`, "error");
+		} finally {
+			draftSending = false;
+			elAiDraftSend.textContent = label || "发送这条";
+			elAiDraftSend.disabled = !elAiDraftText.value.trim();
+		}
 	}
 
 	/** 分段：私聊 = p2p 明确为 true；群聊 = 明确为群；未识别的只在「全部」里出现。 */
@@ -598,6 +877,8 @@ export function mountChatsView({ panel, call, say, onOpenSettings } = {}) {
 		elInput.disabled = false;
 		elSend.disabled = false;
 		elInput.placeholder = "发一条文本消息（Ctrl/⌘ + Enter 发送）";
+		// AI 回复按钮同理：选中会话 + 没有在生成时才能点。
+		paintAiBusy();
 	}
 
 	/** 当前打开的灯箱（切换/卸载时先关掉，避免残留在 body 上）。 */
@@ -659,7 +940,7 @@ export function mountChatsView({ panel, call, say, onOpenSettings } = {}) {
 					? `<div class="fp-cv-bubble fp-cv-bubble-img"><img class="fp-cv-img" loading="lazy" alt="图片" src="${esc(mediaUrl(row))}" /></div>`
 					: richBubbleHtml(row);
 				return `
-			<div class="fp-cv-msg${row.self ? " self" : ""}">
+			<div class="fp-cv-msg${row.self ? " self" : ""}" data-mid="${esc(row.id)}">
 				<span class="fp-cv-meta"><span>${esc(row.senderLabel)}</span><span>${esc(clockOf(row.createTimeMs))}</span></span>
 				${bubble}
 			</div>`;
@@ -667,6 +948,157 @@ export function mountChatsView({ panel, call, say, onOpenSettings } = {}) {
 			.join("");
 		elMsgs.scrollTop = keepScroll ? prevTop : elMsgs.scrollHeight;
 	}
+
+	/* ---------------------- 消息右键菜单（AI 回复入口） ---------------------- */
+	//
+	// 为什么是右键而不是输入框上方的按钮：回复的对象是**某一条**消息，
+	// 「回谁」只有在消息本身上点才说得清。菜单挂在 body 上（不被滚动容器裁剪），
+	// 打开时给目标消息描边，关闭即撤掉。
+
+	function closeMsgMenu() {
+		if (!activeMsgMenu) return;
+		const opened = activeMsgMenu;
+		activeMsgMenu = null;
+		for (const off of opened.offs) {
+			try {
+				off();
+			} catch {
+				/* 监听器已随节点销毁 */
+			}
+		}
+		opened.el.remove();
+		opened.node?.classList.remove("ctx");
+	}
+
+	function addMenuItem(menu, { label, hint, onSelect }) {
+		const item = document.createElement("button");
+		item.type = "button";
+		item.className = "fp-cv-menu-item";
+		item.setAttribute("role", "menuitem");
+		const title = document.createElement("b");
+		title.textContent = label;
+		item.appendChild(title);
+		if (hint) {
+			const sub = document.createElement("span");
+			sub.textContent = hint;
+			item.appendChild(sub);
+		}
+		item.addEventListener("click", () => {
+			closeMsgMenu();
+			onSelect();
+		});
+		menu.appendChild(item);
+		return item;
+	}
+
+	async function copyMessageText(text) {
+		const raw = String(text ?? "");
+		try {
+			await navigator.clipboard.writeText(raw);
+			return true;
+		} catch {
+			/* 非安全上下文 / 没有剪贴板权限：退回 execCommand */
+		}
+		try {
+			const ta = document.createElement("textarea");
+			ta.value = raw;
+			ta.setAttribute("readonly", "");
+			ta.style.position = "fixed";
+			ta.style.opacity = "0";
+			document.body.appendChild(ta);
+			ta.select();
+			const ok = document.execCommand("copy");
+			ta.remove();
+			return ok;
+		} catch {
+			return false;
+		}
+	}
+
+	function openMsgMenu(ev, node, row) {
+		closeMsgMenu();
+		node.classList.add("ctx");
+		const menu = document.createElement("div");
+		menu.className = "fp-cv-menu";
+		menu.setAttribute("role", "menu");
+		menu.setAttribute("aria-label", "消息操作");
+		if (aiBusy) {
+			const note = document.createElement("div");
+			note.className = "fp-cv-menu-note";
+			note.textContent = "AI 正在生成这一轮回复，等它出来再试";
+			menu.appendChild(note);
+		} else {
+			const who = identityLabel();
+			addMenuItem(menu, {
+				label: "AI 直接回复这条",
+				hint: `生成后立即以「${who}」身份发出`,
+				onSelect: () => void runAiReply("direct", { messageId: row.id, target: row }),
+			});
+			addMenuItem(menu, {
+				label: "AI 预览回复这条",
+				hint: "先生成，改完再点「发送这条」",
+				onSelect: () => void runAiReply("preview", { messageId: row.id, target: row }),
+			});
+		}
+		const sep = document.createElement("div");
+		sep.className = "fp-cv-menu-sep";
+		menu.appendChild(sep);
+		addMenuItem(menu, {
+			label: "复制文字",
+			hint: clip(row.text, 36) || "（这条没有可复制的文本）",
+			onSelect: () => {
+				void copyMessageText(row.text).then((ok) => {
+					say?.(ok ? "已复制这条消息" : "复制失败：浏览器拒绝了剪贴板", ok ? "ok" : "error");
+				});
+			},
+		});
+		document.body.appendChild(menu);
+		// 先挂再量：位置按实际尺寸收进视口（右下角右键不会把菜单顶出屏幕）。
+		const box = menu.getBoundingClientRect();
+		const left = Math.max(8, Math.min(ev.clientX, window.innerWidth - box.width - 8));
+		const top = Math.max(8, Math.min(ev.clientY, window.innerHeight - box.height - 8));
+		menu.style.left = `${left}px`;
+		menu.style.top = `${top}px`;
+
+		const offDown = (e) => {
+			if (!menu.contains(e.target)) closeMsgMenu();
+		};
+		const offKey = (e) => {
+			if (e.key === "Escape") {
+				e.preventDefault();
+				closeMsgMenu();
+			}
+		};
+		const offViewport = () => closeMsgMenu();
+		document.addEventListener("pointerdown", offDown, true);
+		document.addEventListener("keydown", offKey, true);
+		window.addEventListener("scroll", offViewport, true);
+		window.addEventListener("resize", offViewport);
+		activeMsgMenu = {
+			el: menu,
+			node,
+			offs: [
+				() => document.removeEventListener("pointerdown", offDown, true),
+				() => document.removeEventListener("keydown", offKey, true),
+				() => window.removeEventListener("scroll", offViewport, true),
+				() => window.removeEventListener("resize", offViewport),
+			],
+		};
+		menu.querySelector(".fp-cv-menu-item")?.focus();
+	}
+
+	elMsgs.addEventListener("contextmenu", (ev) => {
+		const target = ev.target instanceof Element ? ev.target : null;
+		const node = target?.closest(".fp-cv-msg");
+		if (!node || !elMsgs.contains(node)) return;
+		// 选中的文字留给系统菜单（复制/搜索）；只有空白处右键才是「对这条消息做什么」。
+		const picked = String(window.getSelection?.()?.toString() || "").trim();
+		if (picked) return;
+		const row = currentRows.find((r) => String(r.id) === node.getAttribute("data-mid"));
+		if (!row) return;
+		ev.preventDefault();
+		openMsgMenu(ev, node, row);
+	});
 
 	/* ---------------------- 当前会话的自动刷新（5s） ---------------------- */
 	//
@@ -841,6 +1273,11 @@ export function mountChatsView({ panel, call, say, onOpenSettings } = {}) {
 		paintList();
 		paintReader();
 		elInput.value = "";
+		// 换了会话：上一段的 AI 要点、目标消息与预览草稿都不再适用（发错人比重生成一次贵得多）。
+		elAiWant.value = "";
+		aiTarget = null;
+		closeMsgMenu();
+		hideDraft();
 		setComposeHint("");
 		if (elCache) elCache.textContent = "读取中…";
 		// 切回去先显示上一次看到的那些（内存缓存）：一毫秒就有内容，再等网络补最新的。
@@ -1159,6 +1596,27 @@ export function mountChatsView({ panel, call, say, onOpenSettings } = {}) {
 		}
 	});
 
+	/* ---------------------------- AI 回复的事件接线 ---------------------------- */
+
+	// 「再生成」沿用同一锚点消息（回谁不变，只换措辞）；消息已被轮询刷掉时退回上次的快照。
+	elAiDraftRegen.addEventListener("click", () => {
+		const row = aiTarget ? currentRows.find((r) => String(r.id) === aiTarget.id) : null;
+		void runAiReply("preview", { messageId: aiTarget?.id || "", target: row || aiTarget });
+	});
+	elAiDraftClose.addEventListener("click", () => hideDraft());
+	elAiDraftSend.addEventListener("click", () => void sendAiDraft());
+	elAiDraftText.addEventListener("input", () => {
+		elAiDraftSend.disabled = !elAiDraftText.value.trim();
+		paintDraftMeta();
+	});
+	elAiDraftText.addEventListener("keydown", (ev) => {
+		if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey)) {
+			ev.preventDefault();
+			void sendAiDraft();
+		}
+		if (ev.key === "Escape") hideDraft();
+	});
+
 	elWatch.addEventListener("click", async () => {
 		if (!selected) return;
 		const watch = !selected.watched;
@@ -1258,6 +1716,7 @@ export function mountChatsView({ panel, call, say, onOpenSettings } = {}) {
 				findTimer = null;
 			}
 			rowCache.clear();
+			closeMsgMenu();
 			closeLightbox();
 			closeMentionCard();
 			root.remove();
