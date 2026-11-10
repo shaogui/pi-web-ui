@@ -1378,9 +1378,12 @@ export type ClientMessage =
 	| { type: "kill_background_server"; port?: number; taskId?: string }
 	| { type: "kill_background_servers" }
 	| { type: "list_bg_servers" }
+	| { type: "project_scripts"; cwd?: string }
+	| { type: "start_bg_script"; script: string; cwd?: string }
+	| { type: "restart_bg_job"; taskId: string }
 	| { type: "set_bg_keep"; port: number; keep: boolean }
 	| { type: "clean_bg_leftovers"; minutes?: number }
-	| { type: "search_files"; reqId: number; query: string }
+	| { type: "search_files"; reqId: number; query: string; scope?: string }
 	| { type: "search_sessions"; reqId: number; query: string }
 	| {
 			type: "load_earlier_messages";
@@ -1845,6 +1848,20 @@ export type ClientMessage =
 			params: RemoteSshProbeParams;
 	  }
 	| {
+			type: "remote_ssh_trust_host";
+			reqId?: string;
+			host: string;
+			port: number;
+			fingerprint: string;
+			replace?: boolean;
+	  }
+	| {
+			type: "remote_ssh_trust_host_result";
+			reqId?: string;
+			ok: boolean;
+			error?: string;
+	  }
+	| {
 			type: "remote_ssh_list_dir";
 			reqId?: string;
 			connectionId: string;
@@ -1877,6 +1894,15 @@ export interface RemoteSshProbeParams {
 	auth: RemoteSshAuth;
 	profileName?: string;
 	saveProfile?: boolean;
+}
+
+export interface RemoteSshHostTrustOffer {
+	host: string;
+	port: number;
+	algorithm: string;
+	fingerprint: string;
+	knownHostsFile: string;
+	status: "unknown" | "changed" | "revoked";
 }
 
 export interface RemoteSshSystemInfo {
@@ -2144,6 +2170,12 @@ export interface BgServer {
 	command?: string;
 	status?: string;
 	keep?: boolean;
+	/** 行来源：port（监听端口的进程）/ plugin（插件常驻任务）/ job（bash background 的后台任务） */
+	kind?: "port" | "plugin" | "job";
+	/** job 行：发起归属（对话 id），多对话并行时用来区分是谁起的 */
+	origin?: string;
+	/** job 行：日志文件路径（面板上可直接复制去 read） */
+	logPath?: string;
 }
 
 export interface SchedulerRunInfo {
@@ -2722,6 +2754,12 @@ export interface ConversationSummary {
 		messageId?: string;
 		title?: string;
 	};
+	/**
+	 * 该会话是从别的会话分叉出来的（角标用）。
+	 * `forkFrom` 只活在内存里，重启/重开后只能靠会话文件头的 `parentSession` 推出来，
+	 * 所以客户端判角标要同时看 `forkFrom || forked`。
+	 */
+	forked?: true;
 	modified?: number;
 	/**
 	 * 左栏行归属（引擎裁定，客户端不再猜）：
@@ -2734,6 +2772,7 @@ export interface ConversationSummary {
 
 export interface ElsewhereRunning {
 	independent?: boolean;
+	forked?: boolean;
 	title: string;
 	cwd: string;
 	isStreaming: boolean;
@@ -3712,6 +3751,7 @@ export type ServerMessage =
 			timeoutMs: number;
 	  }
 	| { type: "bg_servers"; servers: BgServer[] }
+	| { type: "project_scripts"; cwd: string; scripts: Record<string, string>; error?: string }
 	| { type: "scheduler_tasks"; tasks: SchedulerTaskView[] }
 	| {
 			type: "compacted_messages_result";
@@ -3737,10 +3777,17 @@ export type ServerMessage =
 			ok: boolean;
 			connectionId?: string;
 			error?: string;
+			hostTrust?: RemoteSshHostTrustOffer;
 			system?: RemoteSshSystemInfo;
 			tools?: RemoteSshToolsInfo;
 			packageManager?: string;
 			suggestedInstall?: string[];
+	  }
+	| {
+			type: "remote_ssh_trust_host_result";
+			reqId?: string;
+			ok: boolean;
+			error?: string;
 	  }
 	| {
 			type: "remote_ssh_list_dir_result";

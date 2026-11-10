@@ -165,11 +165,30 @@ HTTP MCP 卡片的 OAuth 登录通过 `mcp_oauth_start {reqId,name,scope}` 发�
 
 下载、排队和 `host.chat` 请求持有启动时的代次。重置后的迟到回执、结束事件和异步设置验证不得覆盖新会话状态；迟到的旧运行按真实 `runId` 中止。运行中不能切换的通道必须明确提示先停止，不能回报重置成功。历史记录保留，中止失败须告知用户。回归见 `tests/unit/channel-plugins.test.ts` 和各通道的行为、重置测试。
 
+### 插件目录：代码是纯缓存，状态独立存放（`plugin-paths.ts`★ / `plugin-materialize.ts`★）
+
+插件在数据目录里拆成两个互不干扰的根：
+
+| 路径                          | 内容                                                  | 可丢弃？                                        |
+| ----------------------------- | ----------------------------------------------------- | ----------------------------------------------- |
+| `<dataDir>/plugins/<id>/`     | 代码本体（manifest / index.mjs / client / 依赖）      | **可以**：随包插件可重放，`node_modules` 可重装 |
+| `<dataDir>/plugin-data/<id>/` | 状态：`storage.json`、`secrets.bin`、`schedules.json` | **不可以**：用户配置、渠道授权、定时任务进度    |
+
+- 状态路径只走 `pluginStateDir()` / `pluginStateFile()`；老布局（状态住在代码目录）在扫描/激活时由
+  `migratePluginState()` 幂等搬过去，两边都有时以状态目录为准（绝不拿旧副本覆盖新状态）。
+- 代码目录的物化由 `materializePlugin()` 负责，并留一份回执 `.pi-materialized.json`：
+  **存在 ≠ 已准备** —— 回执登记的每个文件都还在才算装好；目录在但缺回执/缺文件 = 半残，下次启动就地补齐。
+  新装走 staging + rename 原子落盘，复制后验收（`manifest.json` 在 + 文件数 > 0）失败就报错，绝不签收空目录。
+- 复制黑名单（`.git` / `node_modules` / `whisper-cache`）**只允许**在 `server/fs-copy.ts` 里按
+  **相对路径**判定。历史事故：三处各自拿 `cpSync` 的绝对路径去匹配 `node_modules`，而 npm -g 安装时
+  包目录本身就在 `…/node_modules/pi-web-ui` 下，整棵树被过滤成空副本还被当成已安装（issue #856）。
+- 卸载会同时删掉状态目录（重装不闯回旧设置）；回滚只回滚代码，状态不回滚。
+
 ### 宿主设施（plugin-facilities.ts）
 
 | 设施         | 说明                                                                 |
 | ------------ | -------------------------------------------------------------------- |
-| `storage`    | `<pluginDir>/storage.json` 原子 KV                                   |
+| `storage`    | `<dataDir>/plugin-data/<id>/storage.json` 原子 KV                    |
 | `secrets`    | AES-256-GCM 加密机密，密钥 `<dataDir>/secrets.key`，拷机 fail closed |
 | `ensureDeps` | npm 自动补装单飞                                                     |
 
@@ -358,7 +377,7 @@ App 按 chat.plugins 动态 import 各插件的 client bundle（`/* @vite-ignore
 
 `syncPluginViews(plugins, epoch)` 统一同步注册表：清单消失/被禁用即卸载视图（调 cleanup）、epoch 变化清 failed 重拉 bundle。
 
-设置面板 ⚙ 有「界面插件」开关区（`set_settings.disabledPlugins`，持久化 client-state、纯 UI 隐藏不触发 runtime reload —— 被禁用的插件不算「界面布局」里的条目，它的贡献与 `arrange` 整份丢弃）+ **每行「更新/卸载」按钮**（更新需 CLI install 记录的来源 `.pi-source.json` → `UiPluginInfo.source`；两个操作都走**服务端后台作业** `plugin_job`，见下「插件市场」，不占用户终端、不关设置面板）+「界面布局」页（内置条目与插件条目的隐藏 / 排序 / 恢复，见「UI 扩展点（slot 框架）」）+「已授权目录」段（见「目录授权与跨目录 fs」）。
+设置面板 ⚙ 有「界面插件」开关区（`set_settings.disabledPlugins`，持久化 client-state、纯 UI 隐藏不触发 runtime reload —— 被禁用的插件不算「界面布局」里的条目，它的贡献与 `arrange` 整份丢弃）+ **安装即启用**（`plugin_job` 的 `install` 作业成功后，服务端把该 id 从 `disabledPlugins` 摘掉再重推列表：出厂默认设置把一批可选插件写在禁用清单里，不同步启用就会出现「装好了但界面上找不到」；`update` / `uninstall` 不动这条状态，用户显式禁用过的插件升级后保持禁用——逻辑单源 `enablePluginAfterInstall()` @ `server/plugin-installer.ts`，写入点 `AgentService.enableInstalledPlugin()`）+ **每行「更新/卸载」按钮**（更新需 CLI install 记录的来源 `.pi-source.json` → `UiPluginInfo.source`；两个操作都走**服务端后台作业** `plugin_job`，见下「插件市场」，不占用户终端、不关设置面板）+「界面布局」页（内置条目与插件条目的隐藏 / 排序 / 恢复，见「UI 扩展点（slot 框架）」）+「已授权目录」段（见「目录授权与跨目录 fs」）。
 
 ## 常驻播放器：红果短剧
 

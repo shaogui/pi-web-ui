@@ -3058,6 +3058,7 @@ export function App() {
 								onToggleCollapse={toggleRight}
 								panelSend={panelSend}
 								files={chat.files}
+								fileSearch={chat.fileSearch}
 								fileChanged={chat.fileChanged}
 								widgets={chat.widgets}
 								onAttach={(path, name, mode, isDir) => {
@@ -3299,6 +3300,7 @@ export function App() {
 				<Suspense fallback={null}>
 					<BgTasksModal
 						servers={chat.bgServers}
+						projectScripts={chat.projectScripts}
 						plugins={chat.plugins}
 						epoch={chat.pluginsEpoch}
 						send={send}
@@ -3344,6 +3346,21 @@ export function App() {
 					}}
 					onPreviewFile={(path, name) => {
 						openFile(path, name);
+					}}
+					onOpenFolder={(path) => {
+						setGlobalSearchOpen(false);
+						setRightCollapsed((v) => {
+							if (v) {
+								try {
+									localStorage.setItem(panelCollapsedKey("right"), "0");
+								} catch {}
+							}
+							return false;
+						});
+						setDrawer(null);
+						window.setTimeout(() => {
+							window.dispatchEvent(new CustomEvent("pi:open-folder", { detail: { path } }));
+						}, 0);
 					}}
 				/>
 			</DeferredMount>

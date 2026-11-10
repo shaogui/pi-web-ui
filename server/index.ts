@@ -1337,6 +1337,9 @@ export interface DispatchSession {
 	killBackgroundServer(port?: number, taskId?: string): Promise<boolean>;
 	killAllBackgroundServers(): Promise<string[]>;
 	listBgServers(): Promise<void>;
+	listProjectScripts?(cwd?: string): void;
+	startBgScript?(script: string, cwd?: string): void;
+	restartBgJob?(taskId: string): void;
 	setBackgroundKeep(port: number, keep: boolean): boolean;
 	cleanBackgroundLeftovers(minutesOverride?: number): Promise<number[]>;
 	newChat(
@@ -1388,7 +1391,7 @@ export interface DispatchSession {
 	switchSession(path: string, sessionId?: string, independent?: boolean): Promise<void>;
 	switchConversation(id: string): Promise<void>;
 	listFiles(path?: string): Promise<void>;
-	searchFiles(query: string, reqId: number): Promise<void>;
+	searchFiles(query: string, reqId: number, scope?: string): Promise<void>;
 	searchSessions(query: string, reqId: number): Promise<void>;
 	scmQuery(
 		kind: "status" | "history" | "filediff" | "commit",
@@ -1417,6 +1420,8 @@ export interface DispatchSession {
 	checkUpdate(): Promise<void>;
 	checkUpdatesAll(force?: boolean): Promise<void>;
 	checkPluginUpdates?(manual?: boolean): Promise<void>;
+	/** 安装成功即启用：把插件从 disabledPlugins 摘掉（返回是否真的改了设置）。 */
+	enableInstalledPlugin?(pluginId: string): Promise<boolean>;
 	resolveDialog(id: number, value: string | boolean | null): void;
 	handleTuiOverlayInput?(id: number, data: string): void;
 	handleTuiOverlayResize?(id: number, cols: number, rows: number): void;
@@ -1958,6 +1963,19 @@ const service: EngineService = {
 			return targetSvc.takeOverConversation(targetId, ownerId, convId);
 		}
 		return Promise.resolve();
+	},
+	/**
+	 * 关闭对话：pi 引擎走 daemon 的跨客户端路由（左栏 elsewhere / 离线残骸行都能删）。
+	 * 其他引擎的 `dismissConversation` 是本端语义（id, withFinished, force），不能当 daemon 路由用，
+	 * 直接退回请求方自己的会话。
+	 */
+	async dismissConversation(clientId, msg) {
+		const engine = ensureEngine(resolveClientEngine(clientId));
+		if (engine instanceof AgentService) return engine.dismissConversation(clientId, msg);
+		const cs = engine.get(clientId);
+		if (!cs?.dismissConversation) return false;
+		await cs.dismissConversation(msg.id, msg.withFinishedSubagents, msg.force);
+		return true;
 	},
 	peekElsewhereQuestion(targetId, ownerId, convId) {
 		const targetSvc = ensureEngine(resolveClientEngine(targetId));

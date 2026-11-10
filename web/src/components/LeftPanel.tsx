@@ -9,6 +9,7 @@ import {
 	Fragment,
 	type ReactNode,
 } from "react";
+import { loadProjectClickSwitch } from "../project-click-settings";
 import { DeviceGroupSection } from "./DeviceGroupSection";
 import { NativeCliCreateEntry } from "./NativeCliCreateModal";
 import {
@@ -22,10 +23,12 @@ import {
 	FiFolder,
 	FiFolderPlus,
 	FiGitBranch,
+	FiHardDrive,
 	FiMessageSquare,
 	FiMoreVertical,
 	FiPlus,
 	FiSearch,
+	FiServer,
 	FiTrash2,
 	FiTerminal,
 	FiUsers,
@@ -452,6 +455,7 @@ export const LeftPanel = memo(function LeftPanel({
 	const currentCwd = cwd;
 	const conversationOrderVersion = useConversationOrderVersion();
 	const [projectPickerOpen, setProjectPickerOpen] = useState(false);
+	const [projectPickerInitialTab, setProjectPickerInitialTab] = useState<"local" | "remote" | undefined>(undefined);
 	const [confirmDel, setConfirmDel] = useState<string | null>(null);
 	const [confirmTakeover, setConfirmTakeover] = useState<string | null>(null);
 	const [renaming, setRenaming] = useState<string | null>(null);
@@ -1344,6 +1348,7 @@ export const LeftPanel = memo(function LeftPanel({
 				elsewhere: true as const,
 				pseudo: Boolean(w.pseudo),
 				independent: w.independent,
+				...(w.forked ? { forked: true as const } : {}),
 				ownerOffline: Boolean(w.ownerOffline),
 				sessionFile: w.sessionFile,
 				...(w.owner && w.convId ? { owner: w.owner, convId: w.convId } : {}),
@@ -1947,7 +1952,7 @@ export const LeftPanel = memo(function LeftPanel({
 		const { cleanTitle, categoryTag } = categorizeTitle(
 			rawTitle,
 			{
-				fork: Boolean(s.parentSessionPath || runInfo?.conv?.forkFrom),
+				fork: Boolean(s.parentSessionPath || runInfo?.conv?.forkFrom || runInfo?.conv?.forked),
 				scheduler: Boolean(runInfo?.conv?.elsewhere && runInfo.conv.owner?.startsWith("scheduler:")),
 				tui: s.source === "tui",
 			},
@@ -2179,7 +2184,7 @@ export const LeftPanel = memo(function LeftPanel({
 
 			const { cleanTitle, categoryTag } = categorizeTitle(
 				c.title,
-				{ fork: Boolean(c.forkFrom), scheduler: isScheduler },
+				{ fork: Boolean(c.forkFrom || c.forked), scheduler: isScheduler },
 				t,
 			);
 
@@ -2390,7 +2395,7 @@ export const LeftPanel = memo(function LeftPanel({
 		const { cleanTitle, categoryTag } = categorizeTitle(
 			renameOverrides[c.id] ?? c.title,
 			{
-				fork: Boolean(c.forkFrom),
+				fork: Boolean(c.forkFrom || c.forked || matchSess?.parentSessionPath),
 				scheduler: Boolean((c as RowConv).elsewhere && (c as RowConv).owner?.startsWith("scheduler:")),
 			},
 			t,
@@ -2773,11 +2778,24 @@ export const LeftPanel = memo(function LeftPanel({
 										className="lp-workspace-menu-item lp-manage-projects-btn"
 										onClick={() => {
 											setWorkspaceMenuOpen(false);
+											setProjectPickerInitialTab("local");
 											setProjectPickerOpen(true);
 										}}
 									>
-										<FiFolder style={{ fontSize: "13px" }} />
-										<span>{t("openProject")}</span>
+										<FiHardDrive style={{ fontSize: "13px" }} />
+										<span>{t("openLocalProject")}</span>
+									</button>
+									<button
+										type="button"
+										className="lp-workspace-menu-item lp-manage-projects-btn"
+										onClick={() => {
+											setWorkspaceMenuOpen(false);
+											setProjectPickerInitialTab("remote");
+											setProjectPickerOpen(true);
+										}}
+									>
+										<FiServer style={{ fontSize: "13px" }} />
+										<span>{t("openRemoteProject")}</span>
 									</button>
 									{onOpenSandboxModal && (
 										<button
@@ -2997,7 +3015,7 @@ export const LeftPanel = memo(function LeftPanel({
 														aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
 														onClick={() => {
 															if (!switching) {
-																if (!active) {
+																if (!active && loadProjectClickSwitch()) {
 																	panelSend({ type: "set_cwd", path: p.path });
 																	setExpandedProjects((prev) => {
 																		const norm = normalizeSessionPathKey(p.path);
@@ -3289,6 +3307,7 @@ export const LeftPanel = memo(function LeftPanel({
 			))}
 			<ProjectPicker
 				open={projectPickerOpen}
+				initialTab={projectPickerInitialTab}
 				currentCwd={currentCwd}
 				pathCompletions={pathCompletions ?? []}
 				workspaceRoots={workspaceRoots}

@@ -19,7 +19,7 @@ pi 编码智能体（`@earendil-works/pi-coding-agent` SDK）的 Web 聊天界�
 | 侧栏会话排序 / 用户发送置顶 / 对话↔历史行归属与身份 | `web/src/conversation-order.ts`★ · `server/conversation-rows.ts`★ · `web/src/session-identity.ts`★ · `web/src/components/LeftPanel.tsx` · `web/src/use-chat.ts` | [`architecture-core.md`](docs/architecture-core.md#侧栏历史会话加载) |
 | 安全边界（loopback/Origin/Cookie/appUrl） | `server/index.ts` · `server/auth-cookie.ts` | [`architecture-core.md`](docs/architecture-core.md) · [`agent-rules.md`](docs/agent-rules.md#一通信协议与数据安全) |
 | 随手问 / 选中文字解释 | `server/quick-ask.ts` · `web/src/quick-ask.ts` · `web/src/components/QuickAskPopover.tsx` | [`architecture-core.md`](docs/architecture-core.md#随手问独立小窗) |
-| 系统提示词组装 | `server/prompt-composer.ts` | [`architecture-system-prompt.md`](docs/architecture-system-prompt.md) |
+| 系统提示词组装 / 设置保存回执 | `server/prompt-composer.ts`★ · `web/src/settings-sync.ts`★（pending overlay + 回执） | [`architecture-system-prompt.md`](docs/architecture-system-prompt.md) |
 | 工具开关 / 工具提示词 / 内置工具覆盖 | `server/tool-manager.ts`★ · `server/tool-prompts.ts`★ · `server/tool-overrides.ts` · `server/bash-timeout.ts`（bash/powershell 默认超时单源） | [`agent-rules.md`](docs/agent-rules.md#二工具定义与提示词规范) · [`tool-context-budget.md`](docs/tool-context-budget.md) |
 | 上下文预算 / 延迟加载 / 证据外置 | `server/soft-cap.ts` · `server/request-context.ts` · `server/evidence-tool-hooks.ts` | [`tool-context-budget.md`](docs/tool-context-budget.md) |
 | 工具审批门禁与规则库 | `server/tool-approval.ts` | [`architecture-core.md`](docs/architecture-core.md#审批队列与共享展示) |
@@ -27,9 +27,10 @@ pi 编码智能体（`@earendil-works/pi-coding-agent` SDK）的 Web 聊天界�
 | 页面脚本注入（临时 / 永久，`browser_script`） | `browser/runtime/scripts.ts` · `browser/automation/scripts.ts` · `server/browser-script-tool.ts` | [`architecture-browser.md`](docs/architecture-browser.md) |
 | 手机 App / 多设备切换 / 原生通知 | `mobile/` · `web/src/mobile-runtime.ts` · `server/mobile-push.ts` · `server/device-center/hub-mobile.ts` | [`mobile.md`](docs/mobile.md) |
 | 终端 PTY / 原生 CLI / bash 接管 / SCM | `server/terminals.ts` · `server/native-cli.ts` · `server/engine-catalog.ts`★ · `server/engine-cli.ts` · `web/src/components/NativeCliPanel.tsx` | [`architecture-terminal.md`](docs/architecture-terminal.md) |
-| 命令执行防卡死 / 硬超时 / 后台托管 | `scripts/safe-exec.mjs`★ · `server/process-utils.ts`（`killPidTree` 单源） | [`development.md`](docs/development.md#命令执行防卡死) · [`agent-rules.md`](docs/agent-rules.md#七终端命令执行防卡死) |
+| 命令执行防卡死 / 硬超时 / 后台托管 | `server/job-runner.ts`★（`bash({background:true})` 进程内 job）· `scripts/safe-exec.mjs`（源码仓库 / CI 执行器）· `server/process-utils.ts`（`killPidTree` 单源） | [`development.md`](docs/development.md#命令执行防卡死) · [`agent-rules.md`](docs/agent-rules.md#七终端命令执行防卡死) |
 | 附件 / 图片预览 / OCR / 标注 / 系统截图 | `server/file-save.ts` · `web/src/components/ImageLightbox.tsx` · `plugins/image-ocr/` · `server/system-screenshot.ts` | [`architecture-attachments.md`](docs/architecture-attachments.md) |
 | 插件体系 / UI 插槽 / MCP 项目运行态 | `server/plugins.ts` · `web/src/ui-slots.ts`★ · `server/mcp-project-runtime.ts` | [`architecture-plugins.md`](docs/architecture-plugins.md) |
+| 插件物化（代码纯缓存）/ 状态目录 | `server/plugin-paths.ts`★ · `server/plugin-materialize.ts`★ · `server/fs-copy.ts`★ | [`architecture-plugins.md`](docs/architecture-plugins.md#插件目录代码是纯缓存状态独立存放plugin-pathsts--plugin-materializets) |
 | 统一 TTS / 系统语音 / 插件音色 / QQ 语音回复 | `server/tts-service.ts`★ · `server/tts-system.ts` · `server/tts-routes.ts` · `web/src/tts-client.ts` · `plugins/qq/voice.mjs` | [`architecture-tts.md`](docs/architecture-tts.md) |
 | 子代理 / 对话通信 / 工作树 / 过户 | `server/subagents.ts` · `server/conversation-identity.ts` · `#take_over_conversation` | [`architecture-core.md`](docs/architecture-core.md) · [`root-cause-boundaries.md`](docs/root-cause-boundaries.md) |
 | 目标模式 2.0 / 委派 / 计划模式 | `server/goal-service.ts` · `server/delegate-mode.ts` · `server/plan-mode.ts` | [`goal-conversation-design.md`](docs/goal-conversation-design.md) · [`agent-rules.md`](docs/agent-rules.md#四架构与运行态约束) |
@@ -71,10 +72,11 @@ pi 编码智能体（`@earendil-works/pi-coding-agent` SDK）的 Web 聊天界�
 | **前端/样式** | 叠栈浮层禁写死 z-index，一律 `useOverlayZIndex()`；输入框上带子单源 `--composer-strip`，禁把短语行改回 `absolute` | `overlay-stack` · `messages-behind-composer` |
 | **前端/状态** | 左栏「运行中对话 / 历史会话」行归属只由 `server/conversation-rows.ts`（`rowKind`）裁定、身份只走 `web/src/session-identity.ts`，禁在组件里另写临时键 | `session-identity` · `conversation-row-declared` |
 | **插件/依赖** | 宿主提供的包只进 `peerDependencies`（子进程副本进 `optionalDependencies`） | `extension-host-packages` |
+| **插件/依赖** | 复制黑名单只走 `server/fs-copy.ts` 按相对路径判定；插件代码目录可重建、状态只住 `plugin-data/<id>/` | `plugin-copy-single-source` · `plugin-bundled` |
 | **插件/依赖** | 插件市场 builtin 清单 `plugins/catalog.json` 只收本仓库 `plugins/<id>` 自带的插件；第三方插件登记到社区清单仓库 | `plugin-catalog-builtin-scope` |
 | **插件/依赖** | 改内置插件必递增 `manifest.json` 版本号并同步数据目录；插件 `arrange.label` 改名必落到渲染层 | `plugin-version-bump-guard` · `bar-item-unified` |
 | **测试规范** | 会话/守护假体一律走 `tests/helpers/fake-session.ts`（默认值从生产源码推导），禁手搓 `Object.create`（存量名单只许变短，迁移完删名单行） | `fake-session-sync` · `fake-session-adoption` |
-| **终端/执行** | 死命令走 `safe-exec`（硬超时 + 杀进程树 + 日志先落盘）；禁前台 watch/pager/等 stdin，禁手写 `timeout`/`nohup` 前缀 | `safe-exec` |
+| **终端/执行** | 长驻服务走 `bash({background:true})`（面板可停）；源码仓库/CI 死命令走 `safe-exec`（硬超时 + 杀进程树 + 日志先落盘）；禁前台 watch/pager/等 stdin，禁手写 `timeout`/`nohup` 前缀 | `safe-exec` |
 
 ## 4. 提交前三连验（CI 硬门禁）
 

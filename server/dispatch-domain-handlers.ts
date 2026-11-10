@@ -13,7 +13,7 @@ export function handleFileMessage(msg: ClientMessage, cs: DispatchSession): bool
 			void cs.listFiles(msg.path);
 			return true;
 		case "search_files":
-			void cs.searchFiles(msg.query, msg.reqId);
+			void cs.searchFiles(msg.query, msg.reqId, msg.scope);
 			return true;
 		case "read_file":
 			void cs.readFile(msg.path);
@@ -165,6 +165,15 @@ export function handleBgServerMessage(msg: ClientMessage, cs: DispatchSession): 
 			return true;
 		case "list_bg_servers":
 			void cs.listBgServers();
+			return true;
+		case "project_scripts":
+			cs.listProjectScripts?.(msg.cwd);
+			return true;
+		case "start_bg_script":
+			cs.startBgScript?.(msg.script, msg.cwd);
+			return true;
+		case "restart_bg_job":
+			cs.restartBgJob?.(msg.taskId);
 			return true;
 		case "set_bg_keep":
 			cs.setBackgroundKeep(msg.port, msg.keep);
@@ -854,8 +863,11 @@ export function handleSettingsMessage(
 		case "get_settings":
 			cs.refreshSettings();
 			return true;
-		case "set_settings":
-			void (cs as unknown as { setSettings: (p: Record<string, unknown>) => Promise<void> }).setSettings({
+		case "set_settings": {
+			// 同步抛错与 Promise 拒绝都要回告前端；实现可能是同步 mock（返回 undefined）
+			const saving = (
+				cs as unknown as { setSettings: (p: Record<string, unknown>) => Promise<void> | void }
+			).setSettings({
 				promptMode: msg.promptMode,
 				customSystemPrompt: msg.customSystemPrompt,
 				promptTemplate: (msg as { promptTemplate?: string }).promptTemplate,
@@ -937,7 +949,17 @@ export function handleSettingsMessage(
 				quickPhrasesSeeded: (msg as { quickPhrasesSeeded?: boolean }).quickPhrasesSeeded,
 				uiLayout: (msg as { uiLayout?: unknown }).uiLayout,
 			});
+			void Promise.resolve(saving).catch((error) => {
+				// 保存失败必须回告前端：否则面板只能靠超时猜，用户永远不知道改没生效
+				send?.({
+					type: "notice",
+					level: "error",
+					text: `设置保存失败，修改未生效：${error instanceof Error ? error.message : String(error)}`,
+					textEn: `Settings were not saved: ${error instanceof Error ? error.message : String(error)}`,
+				});
+			});
 			return true;
+		}
 		case "extensions_reload":
 			void cs.reloadExtensions();
 			return true;
@@ -1093,6 +1115,21 @@ export function handleRemoteSshMessage(
 				const res = await remoteSshSvc.probe(msg.params);
 				send({
 					type: "remote_ssh_probe_result",
+					reqId: msg.reqId,
+					...res,
+				});
+			})();
+			return true;
+		case "remote_ssh_trust_host":
+			void (async () => {
+				const res = await remoteSshSvc.trustHostKey({
+					host: msg.host,
+					port: msg.port,
+					fingerprint: msg.fingerprint,
+					replace: msg.replace,
+				});
+				send({
+					type: "remote_ssh_trust_host_result",
 					reqId: msg.reqId,
 					...res,
 				});
