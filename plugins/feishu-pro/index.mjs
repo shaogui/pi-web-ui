@@ -39,13 +39,13 @@ import {
  * 约定：**改这两个文件必须把下面的 `?v=` 与 manifest.version 一起 bump**
  * （`tests/unit/feishu-pro-core.test.ts` 有一条断言钉住二者一致）。
  */
-import { createDmWatcher, isValidChatId, parseChatIds } from "./lib/dm-watch.mjs?v=0.12.0";
+import { createDmWatcher, isValidChatId, parseChatIds } from "./lib/dm-watch.mjs?v=0.14.1";
 import {
 	CHAT_INFO_KEY,
 	chatCounts,
 	chatSections,
 	chatLink,
-	collectSenders,
+	decorateMessageRow,
 	inferChatMode,
 	mergeChatInfo,
 	mergeChatSources,
@@ -53,17 +53,17 @@ import {
 	normalizeSendIdentity,
 	isValidOpenId,
 	pickPeerFromMessages,
-} from "./lib/chats.mjs?v=0.12.0";
+} from "./lib/chats.mjs?v=0.14.1";
 import { normalizeOrderBy, toMs } from "./lib/docs.mjs";
 // AI 待办：本地库（纯函数）+ 服务层 + 飞书任务适配（lark-cli `api` 兜底）。
-import { createTodoService } from "./lib/todo-service.mjs?v=0.12.0";
+import { createTodoService } from "./lib/todo-service.mjs?v=0.14.1";
 import {
 	createTask as createTaskViaCli,
 	listMyTasks as listMyTasksViaCli,
 	setTaskDone as setTaskDoneViaCli,
 	updateTask as updateTaskViaCli,
-} from "./lib/cli-tasks.mjs?v=0.12.0";
-import { TODO_ADVICE_LIMIT } from "./lib/todo-store.mjs?v=0.12.0";
+} from "./lib/cli-tasks.mjs?v=0.14.1";
+import { TODO_ADVICE_LIMIT } from "./lib/todo-store.mjs?v=0.14.1";
 // lark-cli 通道：重构后的主路径（凭证与接口都交给官方 CLI；不可用时各能力回落上面的 OpenAPI 实现）。
 import { CliError, createCliRunner, discoverCli, toCliErrorPayload } from "./lib/cli-bridge.mjs";
 import {
@@ -89,14 +89,16 @@ import {
 	listDepartments as listDepartmentsViaCli,
 	searchUsers as searchUsersViaCli,
 } from "./lib/cli-contacts.mjs";
-import { createDmCliChannel } from "./lib/cli-chats.mjs?v=0.12.0";
+import { createDmCliChannel } from "./lib/cli-chats.mjs?v=0.14.1";
+// 会话消息的本地缓存：后台轮询 / 界面拉取 / AI 读消息共用一个落点，打开会话直接读缓存。
+import { CHAT_SEARCH_LIMIT, createChatCacheStore } from "./lib/chat-cache.mjs?v=0.14.1";
 import {
 	AUTO_CONFIG_KEY,
 	AUTO_DEFAULT_CONFIG,
 	createAutoReplier,
 	matchAutoReply,
 	normalizeAutoConfig,
-} from "./lib/auto-reply.mjs?v=0.12.0";
+} from "./lib/auto-reply.mjs?v=0.14.1";
 import {
 	fetchChatInfo as fetchChatInfoViaCli,
 	fetchChatMessages as fetchChatMessagesViaCli,
@@ -104,7 +106,7 @@ import {
 	fetchUserNames as fetchUserNamesViaCli,
 	resolveP2pChatId as resolveP2pChatIdViaCli,
 	sendText as sendTextViaCli,
-} from "./lib/cli-chats.mjs?v=0.12.0";
+} from "./lib/cli-chats.mjs?v=0.14.1";
 
 // 纯函数对外暴露（单测直接 import 这些，不必起插件）。
 export { DEFAULT_CONFIG, normalizeConfig, buildDocUrl } from "./lib/config.mjs";
@@ -141,7 +143,7 @@ export {
 } from "./lib/cli-status.mjs";
 export { normalizeCliUser as normalizeCliUserShape, pickUsers } from "./lib/cli-contacts.mjs";
 export { pickChats, pickPeerFromRows } from "./lib/cli-chats.mjs";
-export { isValidOpenId, normalizeSendIdentity } from "./lib/chats.mjs?v=0.12.0";
+export { isValidOpenId, normalizeSendIdentity } from "./lib/chats.mjs?v=0.14.1";
 // AI 待办：纯函数导出（单测直接 import，不必起插件）。
 export {
 	ACTION_KINDS,
@@ -159,7 +161,7 @@ export {
 	todoKeyOf,
 	todoStats,
 	upsertTodo,
-} from "./lib/todo-store.mjs?v=0.12.0";
+} from "./lib/todo-store.mjs?v=0.14.1";
 export {
 	buildAdvicePrompt,
 	buildAgentTask,
@@ -167,8 +169,8 @@ export {
 	extractJson,
 	parseAdviceReply,
 	parseExtractReply,
-} from "./lib/todo-ai.mjs?v=0.12.0";
-export { listMyTasks as listMyTasksShape, normalizeCliTask } from "./lib/cli-tasks.mjs?v=0.12.0";
+} from "./lib/todo-ai.mjs?v=0.14.1";
+export { listMyTasks as listMyTasksShape, normalizeCliTask } from "./lib/cli-tasks.mjs?v=0.14.1";
 export {
 	ANON_OWNER,
 	RECENT_LIMIT,
@@ -224,13 +226,31 @@ function sendOk(res, data = {}) {
 	sendJson(res, { ok: true, ...data });
 }
 
+/**
+ * 普通错误 → 统一载荷（与 `CliError` 的字段对齐：前端只判 `ok` / 读 `error`）。
+ * 注意：这里**不能**再抛异常 —— 它在路由的 catch 里，抛出去就是「客户端一直等不到响应」。
+ */
+function toErrorPayload(err) {
+	const message = String(err?.message || err || "请求失败");
+	return { ok: false, error: message, code: err?.code ?? null, needUser: Boolean(err?.needUser) };
+}
+
 function sendFail(res, err) {
 	// CLI 错误带「下一步该干什么」（装/配置/登录），不能被当成普通 500 抹平。
-	if (err instanceof CliError) {
-		sendJson(res, toCliErrorPayload(err));
-		return;
+	try {
+		if (err instanceof CliError) {
+			sendJson(res, toCliErrorPayload(err));
+			return;
+		}
+		sendJson(res, toErrorPayload(err));
+	} catch {
+		// 兜底：连接已断开 / 头已发送时保持静默（不制造二次崩溃）。
+		try {
+			res.end();
+		} catch {
+			/* ignore */
+		}
 	}
-	sendJson(res, toErrorPayload(err));
 }
 
 function queryOf(req) {
@@ -326,10 +346,10 @@ export default {
 						: "config";
 			const what =
 				action === "install"
-					? "没找到 lark-cli：到「设置 → lark-cli」点「复制安装命令」，装完点「重新检测」"
+					? "没找到 lark-cli：到「设置 → lark-cli 与身份」点第 1 步的「复制安装命令」，装完点「重新检测」"
 					: action === "config"
-						? "lark-cli 还没配置应用：到「设置 → lark-cli」点「配置应用」（浏览器里走官方设备码）"
-						: "lark-cli 还没登录个人账号：到「设置 → lark-cli」点「登录账号」";
+						? "lark-cli 还没配置应用：到「设置 → lark-cli 与身份」点第 2 步的「配置应用」（浏览器里走官方设备码）"
+						: "lark-cli 还没登录个人账号：到「设置 → lark-cli 与身份」点第 3 步的「登录账号」";
 			return new CliError(what, {
 				type: "setup",
 				subtype: "cli_not_ready",
@@ -446,6 +466,39 @@ export default {
 			};
 		}
 
+		/* --------------------- 会话消息本地缓存（打开会话秒开） --------------------- */
+		//
+		// 用户提的三件事，其实就是三句话：
+		//   1. 选中会话时不要现拉 —— 后台预热过就用后台那份；
+		//   2. 不要在「界面拉一遍 / 后台再拉一遍」重复取数 —— 只留**一个落点**；
+		//   3. 拉回来的内容要能二次检索加工 —— 读出口统一，才可能被搜。
+		//
+		// 实现取舍（全部写在这里，免得以后又长出一条「顺手再拉一次」的路）：
+		//   - 写入：dm-watch 的 `onFetched`（后台轮询每一页）、`refreshChatMessages`（界面/AI）、
+		//     三处都只调 `chatCache.put()`；
+		//   - 读取：`chatMessagesPayload()` 是唯一出口（路由 / AI 工具 / 自动问答预览共用），
+		//     有缓存先回（带 `refreshing` 标记），没缓存才等这一次 CLI；
+		//   - 增量：界面刷新只拉「比缓存最新一条更新」的消息（CLI `--start`），通常 1–3 条；
+		//   - 单飞：同一 chatId 同时只允许一条 CLI 请求（前端 5s 轮询 + 后台轮询 + 用户点击会同时来）。
+		// 落盘防抖 5s：运行时读的都是内存，落盘只为「重启后还在」；storage 是同步整文件写，别抢主线程。
+		const chatCache = createChatCacheStore({ storage: host.storage, log, persistDelayMs: 5_000 });
+		/** chatId → 在飞的拉取（命中直接复用，不重复 spawn）。 */
+		const chatFetchInflight = new Map();
+		/** chatId → 上次真正 spawn CLI 的时间（最小间隔）。 */
+		const chatFetchAt = new Map();
+		/** 一次拉取的条数（= 界面一屏；缓存内部保留 3 屏）。 */
+		const CHAT_FETCH_LIMIT = 40;
+		/** 同一会话两次 CLI 拉取的最小间隔：前端 5s 轮询下最多也就这个频率。 */
+		const CHAT_FETCH_MIN_MS = 3_000;
+		/**
+		 * 缓存多久之内算「新鲜」：超过就后台补一次（不会阻塞这次响应）。
+		 * 界面每 5s 轮询一次，取 10s 的话「读着看」基本不会触发刷新（半个轮询周期打一次 CLI），
+		 * 新消息最多 10s 内自己冒出来 —— 比每轮都 spawn 一次 CLI 划算得多。
+		 */
+		const CHAT_FRESH_MS = 10_000;
+		// 激活即读盘：首屏打开会话时直接就有数据（不阻塞激活）。
+		void chatCache.load().catch(() => {});
+
 		async function setupPayload() {
 			return {
 				setup: cliSetup
@@ -460,12 +513,16 @@ export default {
 			};
 		}
 
-		/* ---------------------------- 私聊提醒（轮询） ---------------------------- */
+		/* ---------------------------- 消息同步 / 私聊提醒（轮询） ---------------------------- */
 		//
 		// 飞书事件订阅 `im.message.receive_v1` 只推「机器人收到的消息」，人类账号的私聊
 		// 没有事件；也没有「我的会话列表 / 未读数」这类个人身份接口。所以只能按间隔
 		// 拉 `im/v1/messages` 增量。首次只建基线不通知、水位严格大于、自己发的不报 ——
-		// 这些取舍都写在 lib/dm-watch.mjs 文件头，单测见 tests/unit/feishu-pro-dm-watch.test.ts。
+		// 这些取舍都写在 lib/dm-watch.mjs 文件头。
+		//
+		// 0.14.0 起同一个引擎同时负责**群消息同步**（`syncGroups`）：单聊与群聊同一轮拉、
+		// 同一份水位、同一份缓存；差别只在通知（群默认静默）。所以控制面统一在 `/sync/*`，
+		// 不要再另起一个「消息同步定时器」—— 两份定时器 = 同一批消息拉两遍 = 配额白花。
 		/** 自动回复引擎（在下面「会话消息读写」之后创建；onNew 闭包先把它声明住）。 */
 		let autoReplier = null;
 		const dmWatcher = createDmWatcher({
@@ -479,6 +536,26 @@ export default {
 			// 注意自激回环：以 user 身份回包时 dm-watch 会因 selfOpenId 自己滤掉，不会自己答自己。
 			onNew: (list) => {
 				void autoReplier?.onMessages(list);
+			},
+			// 后台轮询拉到的每一页都进本地会话缓存：界面打开会话时直接读，
+			// 不再为同一批消息另走一次 CLI（这正是「选中会话要等一会」的根因）。
+			onFetched: ({ chatId, rows, identity, backfill }) => {
+				// 只把**个人身份**拉到的消息写进缓存：界面 / AI 读消息都走个人身份，
+				// 混入机器人视角的会话内容会让同一条消息“一会有一会没有”。
+				if (identity && identity !== "user") return;
+				chatCache.put(chatId, {
+					rows,
+					source: "poll",
+					selfOpenId: currentOpenId || "",
+					// 这一页是「不带 `--start` 的最新一页」⇒ 缓存里从这一刻起有了一屏，之后才能走增量。
+					...(backfill ? { full: true } : {}),
+				});
+			},
+			// 缓存里还没一整屏 ⇒ 这一轮改拉最新一页（不带 `--start`）。
+			// 不补屏的话，水位比缓存活得久的会话会永远是「缓存里只有 1 条」（见 lib/chat-cache.mjs 顶部约束 1）。
+			needsBackfill: async (chatId) => {
+				await chatCache.load();
+				return chatCache.needsBackfill(chatId);
 			},
 			// 取数通道：只有 lark-cli 一条（CLI 不可用时 dm-watch 报 no-channel）。
 			cli: createDmCliChannel({
@@ -567,6 +644,9 @@ export default {
 
 		/** CLI 当前登录用户的 open_id（判定"自己发的消息"、私聊对端）。 */
 		async function selfOpenId() {
+			// 先用激活/首屏已经拿到的身份（cliStatus 缓存 15s），避免每次读消息都等一轮 CLI 状态；
+			// 未登录/刚登出时回落到真实查询。
+			if (currentOpenId) return currentOpenId;
 			const status = await cliStatus().catch(() => null);
 			return String(status?.users?.[0]?.openId ?? "");
 		}
@@ -595,6 +675,317 @@ export default {
 			return { ...doc, plain, via: "lark-cli" };
 		}
 
+		/* ------------------------ 会话消息：缓存优先 + 后台增量 ------------------------ */
+		//
+		// 只有 `refreshChatMessages` 会 spawn CLI（读消息的唯一取数点）；其余函数都是读缓存。
+		// 为什么这么切：以前选中会话 → 拉一页消息 + 再拉一次发言人姓名 = 2 次 CLI 子进程，
+		// 切回同一会话又得重来；现在第一屏有缓存就直接出，后台只补增量。
+
+		/** 补发言人姓名：CLI 一般已给 `sender.name`，只对**缺名字**的发查一次，并记 7 天。 */
+		async function enrichSenderNames(rows, { self, initialNames = {} }) {
+			const ids = [];
+			for (const row of Array.isArray(rows) ? rows : []) {
+				const id = String(row?.senderId || "");
+				if (!id || id === self) continue;
+				if (String(row?.senderName || "")) continue;
+				if (initialNames[id]) continue;
+				if (!ids.includes(id)) ids.push(id);
+				if (ids.length >= 20) break;
+			}
+			if (ids.length === 0) return { names: initialNames, error: "" };
+			const known = chatCache.namesFor(ids);
+			const missing = chatCache.missingNames(ids);
+			if (missing.length === 0) return { names: { ...initialNames, ...known }, error: "" };
+			try {
+				const result = await fetchUserNamesViaCli((args, opts) => cliRunner.run(args, opts), missing, { as: "user" });
+				chatCache.putNames(result.names || {});
+				return { names: { ...initialNames, ...known, ...chatCache.namesFor(ids) }, error: result.error || "" };
+			} catch (err) {
+				// 姓名是装饰：查不到就退化成 open_id 尾巴，不能让整页报错。
+				return { names: { ...initialNames, ...known }, error: String(err?.message || err) };
+			}
+		}
+
+		/**
+		 * 拉一个会话的消息（**全插件唯一**会为“读消息” spawn CLI 的地方）。
+		 * 取数口径分两种：
+		 *   - **补屏**（这个会话还没整页拉过，`meta.full` 为假）→ 拉最新一整页；
+		 *   - **增量**（已经补过一屏）→ 只要比缓存里最新一条更新的（CLI `--start`）。
+		 * 翻旧页 / 强制刷新取整页。为什么必须分这两种：增量补不进缓存里没有的历史，
+		 * 一律走增量就会出现「缓存里永远只有 1 条」（见 `lib/chat-cache.mjs` 顶部约束 1）。
+		 */
+		async function fetchChatIntoCache(chatId, { limit = CHAT_FETCH_LIMIT, pageToken = "", force = false } = {}) {
+			const id = String(chatId ?? "").trim();
+			if (!isValidChatId(id)) throw new Error("会话 ID 不合法（应为 oc_ 开头）");
+			await chatCache.load();
+			const cachedMeta = chatCache.meta(id);
+			// 增量（`--start <缓存最新一条>`）只对「已经整页拉过」的会话成立：
+			// 缓存里没有的历史，增量永远补不进来 —— 真机症状是「同步一直跑，
+			// 缓存里每个会话却永远只有 1 条，打开会话只看得到一条」。
+			const canIncremental = !force && !pageToken && Boolean(cachedMeta?.full);
+			const newestMs = canIncremental ? Number(cachedMeta?.newestMs) || 0 : 0;
+			const self = await selfOpenId();
+			const result = await fetchChatMessagesViaCli((args, opts) => cliRunner.run(args, opts), id, {
+				as: "user",
+				pageSize: limit,
+				pageToken,
+				selfOpenId: self,
+				// 增量：CLI 的 `--start` 向下取整到秒，边界重复由 message_id 去重（同一个 id 只存一份）。
+				startMs: newestMs,
+			});
+			const named = await enrichSenderNames(result.items, { self });
+			const rows = result.items
+				.map((row) => decorateMessageRow(row, { selfOpenId: self, names: named.names }))
+				.filter(Boolean);
+			// 只有「整页取数」才更新「还有更早的 / 翻页游标」：增量那几条不能把历史状态改掉。
+			const patch = { rows, source: "ui", selfOpenId: self };
+			if (!newestMs) {
+				patch.hasMore = result.hasMore;
+				patch.pageToken = result.pageToken;
+				// 只有「最新那一页」能证明缓存里有一屏（`pageToken` 翻的是更早的历史，不算）。
+				if (!pageToken) patch.full = true;
+			}
+			chatCache.put(id, patch);
+			chatFetchAt.set(id, Date.now());
+			return {
+				chatId: id,
+				rows,
+				self,
+				namesError: named.error,
+				count: rows.length,
+				incremental: Boolean(newestMs),
+				hasMore: result.hasMore,
+				pageToken: result.pageToken,
+			};
+		}
+
+		/**
+		 * 单飞闸门：同一 chatId 同时只允许一条 CLI 请求，且 3s 内不重复 spawn。
+		 * 命中在飞请求直接复用（前端 5s 轮询 + 后台轮询 + 用户点击会同时打进来）。
+		 * 返回 `null` = 「刚拉过，用缓存即可」。
+		 */
+		function refreshChatMessages(chatId, opts = {}) {
+			const id = String(chatId ?? "").trim();
+			if (!isValidChatId(id)) return Promise.reject(new Error("会话 ID 不合法（应为 oc_ 开头）"));
+			const running = chatFetchInflight.get(id);
+			if (running) return running;
+			const last = Number(chatFetchAt.get(id)) || 0;
+			if (!opts.force && Date.now() - last < CHAT_FETCH_MIN_MS) return Promise.resolve(null);
+			const task = fetchChatIntoCache(id, opts).finally(() => chatFetchInflight.delete(id));
+			chatFetchInflight.set(id, task);
+			return task;
+		}
+
+		/** 本进程内已尝试预热过的会话（失败也不重复试：CLI 挂了不该每次刷列表都再 spawn 一遍）。 */
+		const chatWarmTried = new Set();
+		/**
+		 * 列表加载时顺手预热「最可能被点」的几个会话。
+		 *
+		 * 为什么要**后台**预热：后台轮询只覆盖监听名单 + 自动发现的单聊，群聊第一次点开
+		 * 仍然要等一次 CLI。列表里最上面那几个就是最可能被点的，先补掉它们，
+		 * 用户点下去时通常已经在缓存里了。上限 2 个 / 每个进程一次 —— 预热不能变成新的浪费。
+		 */
+		function warmLikelyChats(chats, { limit = 2 } = {}) {
+			let started = 0;
+			for (const chat of Array.isArray(chats) ? chats : []) {
+				if (started >= limit) break;
+				const id = String(chat?.id || "");
+				if (!isValidChatId(id)) continue;
+				if (chatCache.meta(id) || chatFetchInflight.has(id) || chatWarmTried.has(id)) continue;
+				chatWarmTried.add(id);
+				started += 1;
+				refreshChatInBackground(id, { limit: CHAT_FETCH_LIMIT });
+			}
+			return started;
+		}
+
+		/** 后台补一次（不阻塞响应）：失败只记日志，不影响这次读到的缓存内容。 */
+		function refreshChatInBackground(chatId, opts = {}) {
+			void refreshChatMessages(chatId, opts).catch((err) => {
+				log("warn", `feishu-pro 会话缓存后台刷新失败（${chatId}）：${String(err?.message || err)}`);
+			});
+		}
+
+		/** 会话类型/对端名缓存（不把“读消息”变成“再打一次 chats/:id”）。 */
+		async function rememberChatMeta(chatId, items, { self, names, inferred }) {
+			try {
+				const known = (await host.storage?.get?.(CHAT_INFO_KEY)) || {};
+				const prev = known[chatId];
+				const peerId = pickPeerFromMessages(items, self);
+				const peerName = names[peerId] || items.find((row) => row.senderId === peerId)?.senderName || "";
+				if ((!prev || prev.mode === "unknown" || prev.inferred) && inferred.mode !== "unknown") {
+					await host.storage?.set?.(CHAT_INFO_KEY, {
+						...known,
+						[chatId]: {
+							...(prev || {}),
+							id: chatId,
+							name: prev?.name || peerName || "",
+							mode: inferred.mode,
+							p2p: inferred.mode === "p2p",
+							inferred: true,
+							inferReason: inferred.reason,
+							fetchedAt: Date.now(),
+						},
+					});
+				}
+				return {
+					peer: { openId: peerId, name: peerName },
+					label: peerName ? `与 ${peerName} 的私聊` : "",
+				};
+			} catch {
+				// 写缓存失败不影响读消息（下次还会重算）。
+				const peerId = pickPeerFromMessages(items, self);
+				const peerName = names[peerId] || items.find((row) => row.senderId === peerId)?.senderName || "";
+				return { peer: { openId: peerId, name: peerName }, label: peerName ? `与 ${peerName} 的私聊` : "" };
+			}
+		}
+
+		/** 组装一份「读会话消息」的返回体（缓存路径 / 翻旧页路径共用，避免两套字段漂移）。 */
+		async function chatPayloadOf({ id, items, hasMore, pageToken, self, cache, refreshing, refreshError, paging }) {
+			let inferred = { mode: "unknown", reason: "" };
+			try {
+				inferred = inferChatMode(items, { selfOpenId: self });
+			} catch {
+				/* 反推失败不影响读消息 */
+			}
+			const senderIds = [];
+			for (const row of items) {
+				if (row?.senderId && !senderIds.includes(row.senderId)) senderIds.push(row.senderId);
+				if (senderIds.length >= 20) break;
+			}
+			const names = chatCache.namesFor(senderIds);
+			const meta = await rememberChatMeta(id, items, { self, names, inferred });
+			return {
+				chatId: id,
+				items,
+				hasMore: Boolean(hasMore),
+				pageToken: String(pageToken || ""),
+				identity: "user",
+				peer: meta.peer,
+				label: meta.label,
+				remembered: true,
+				inferredMode: inferred,
+				namesError: "",
+				link: chatLink(id),
+				// 这份内容是从哪儿来的：cache = 从本地缓存读的（可能刚刚才被后台刷新过）。
+				via: cache ? "cache" : "lark-cli",
+				// 翻旧页时说明「这几条不是最新一屏」，别让调用方把 page token 当成最新游标。
+				paging: Boolean(paging),
+				cached: Boolean(cache),
+				refreshing: Boolean(refreshing),
+				// 缓存自述：界面据此显示「本地缓存 · Ns 前」，并在 `refreshing` 时快速补一次请求。
+				cache: {
+					rows: Number(cache?.rows) || 0,
+					updatedAt: Number(cache?.updatedAt) || 0,
+					ageMs: Number(cache?.ageMs) || 0,
+					fetchedAt: Number(cache?.fetchedAt) || 0,
+					source: String(cache?.source || ""),
+					refreshing: Boolean(refreshing),
+					error: String(refreshError || ""),
+				},
+			};
+		}
+
+		/**
+		 * 读会话消息（**唯一出口**：路由 / AI 工具 / 自动问答预览都走这里）。
+		 * cache-first：有缓存立刻回（stale-while-revalidate）；没缓存（第一次打开）才等这一次 CLI。
+		 *
+		 * @param {{limit?:number, pageToken?:string, refresh?:boolean, cacheOnly?:boolean}} [opts]
+		 *   `cacheOnly` = 只读本地缓存（后台提取这类「扫很多会话」的调用用：一条都没缓存就回空，绝不 spawn CLI）。
+		 */
+		async function chatMessagesPayload(
+			chatId,
+			{ limit = CHAT_FETCH_LIMIT, pageToken = "", refresh = false, cacheOnly = false } = {},
+		) {
+			const id = String(chatId ?? "").trim();
+			if (!isValidChatId(id)) throw new Error("会话 ID 不合法（应为 oc_ 开头）");
+			await chatCache.load();
+
+			// 翻旧页：缓存里只有「最近一段」，再往前的历史必须真的去拉一页 —— 而且回的是**这一页**，
+			// 不是缓存里那屏最新的（否则调用方拿着 page_token 会一直拿到最前面几条）。
+			if (pageToken) {
+				const page = await fetchChatIntoCache(id, { limit, pageToken, force: true });
+				return chatPayloadOf({
+					id,
+					items: page.rows,
+					hasMore: page.hasMore,
+					pageToken: page.pageToken,
+					self: page.self,
+					cache: chatCache.meta(id),
+					refreshing: false,
+					refreshError: page.namesError,
+					paging: true,
+				});
+			}
+
+			const before = chatCache.chat(id, { limit });
+			const lastUpdate = Number(before.entry?.updatedAt) || 0;
+			// 缓存里还没一整屏（`full`）：这时的「新不新」不重要 —— 只有一条也算新，
+			// 不补一屏就永远只有那一条。所以它比「过期」优先级还高（后台补，不阻塞首帧）。
+			const unfilled = !before.entry?.full;
+			let refreshing = false;
+			let refreshError = "";
+			if (cacheOnly) {
+				// 只读本地：没有缓存就是空的（调用方自己决定要不要回源），也不起后台刷新。
+				if (!before.entry) {
+					return chatPayloadOf({
+						id,
+						items: [],
+						hasMore: false,
+						pageToken: "",
+						self: "",
+						cache: null,
+						refreshing: false,
+						refreshError: "",
+						paging: false,
+					});
+				}
+			} else if (refresh || !before.entry) {
+				// 冷启动 / 手动刷新：这两种必须等一次 CLI（其余都在后台补）。
+				try {
+					await refreshChatMessages(id, { limit, force: Boolean(refresh) });
+				} catch (err) {
+					// 已经看过这个会话（有缓存）就别因为刷新失败把内容清空。
+					if (!before.entry) throw err;
+					refreshError = String(err?.message || err);
+				}
+			} else if (
+				(unfilled || Date.now() - lastUpdate > CHAT_FRESH_MS) &&
+				// 真有可发的请求才算「刷新中」：被单飞/最小间隔挡住时不要骗界面（它 800ms 后会来问）。
+				!chatFetchInflight.has(id) &&
+				Date.now() - (Number(chatFetchAt.get(id)) || 0) >= CHAT_FETCH_MIN_MS
+			) {
+				// stale-while-revalidate：先回缓存，后台补增量（前端收到 `refreshing` 会马上再问一次）。
+				// 「还没一屏」时这一拉会变成**整页**（`fetchChatIntoCache` 看 `full` 决定），
+				// 800ms 后前端再问一次就能拿到整屏。
+				refreshing = true;
+				refreshChatInBackground(id, { limit });
+			}
+
+			const self = await selfOpenId();
+			const after = chatCache.chat(id, { limit });
+			const senderIds = [];
+			for (const row of after.rows) {
+				if (row?.senderId && !senderIds.includes(row.senderId)) senderIds.push(row.senderId);
+				if (senderIds.length >= 20) break;
+			}
+			const names = chatCache.namesFor(senderIds);
+			const items = after.rows.map((row) => decorateMessageRow(row, { selfOpenId: self, names })).filter(Boolean);
+			const meta = chatCache.meta(id);
+			// 新鲜度按**这次响应**算（刚刷新完就是「刚刚」），不然界面永远显示刷新前的年龄。
+			const ageMs = meta?.updatedAt ? Math.max(0, Date.now() - meta.updatedAt) : 0;
+			return chatPayloadOf({
+				id,
+				items,
+				hasMore: meta?.hasMore,
+				pageToken: meta?.pageToken,
+				self,
+				cache: { ...meta, ageMs },
+				refreshing,
+				refreshError,
+			});
+		}
+
 		/* ---------------------- 会话消息读写（工具 / 路由共用） ---------------------- */
 		//
 		// 「读最近消息」「发文本」原本只有 HTTP 路由（给界面点按钮用），AI 工具拿不到 ——
@@ -614,7 +1005,7 @@ export default {
 			const msg = String(err?.message || err);
 			if (/missing required scope/i.test(msg)) {
 				return new CliError(
-					"发消息缺权限：到「设置 → lark-cli」点「登录账号」重新授权一次（这次会带上 im:message.send_as_user）",
+					"发消息缺权限：到「设置 → lark-cli 与身份」点「登录账号」重新授权一次（这次会带上 im:message.send_as_user）",
 					{ type: "auth", subtype: "missing_scope", action: "login", hint: msg },
 				);
 			}
@@ -719,42 +1110,49 @@ export default {
 			return text.length > cap ? `${text.slice(0, cap)}…` : text;
 		}
 
+		/** 单行预览（列表/检索结果用）：去掉换行与多余空白，避免把强撑出三行。 */
+		function clipPreview(value, cap) {
+			const text = String(value ?? "")
+				.replace(/\s+/g, " ")
+				.trim();
+			return text.length > cap ? `${text.slice(0, cap)}…` : text;
+		}
+
 		/**
 		 * 读会话消息 → 模型友好的窄行（时间升序）。
-		 * 姓名只是装饰：查不到就退化成 open_id 尾巴，不影响正文。
+		 *
+		 * 与界面**同一条路**（`chatMessagesPayload`）：先读本地缓存，缓存里没有才 spawn CLI。
+		 * 好处不只是快：agent 看完的内容与用户看到的是同一份，而且顺手把它落进缓存，
+		 * 之后 `im_search` 能直接在本地二次检索（不必为「刚才那句是谁说的」再拉一遍）。
 		 */
-		async function readChatMessages({ chatId = "", openId = "", limit = 20, pageToken = "", since = "" } = {}) {
+		async function readChatMessages({
+			chatId = "",
+			openId = "",
+			limit = 20,
+			pageToken = "",
+			since = "",
+			refresh = false,
+			cacheOnly = false,
+		} = {}) {
 			const target = await resolveChatTarget({ chatId, openId });
 			if (!target.chatId) throw new Error("这个 open_id 解析不出单聊：群聊请直接给 chat_id（oc_ 开头）");
-			const self = await selfOpenId();
-			const result = await fetchChatMessagesViaCli((args, opts) => cliRunner.run(args, opts), target.chatId, {
-				as: "user",
-				pageSize: limit,
+			// 多取一屏：模型这边还要按 `since` 过滤与预算裁剪，缓存里留点余量。
+			const payload = await chatMessagesPayload(target.chatId, {
+				limit: Math.max(Number(limit) || 20, CHAT_FETCH_LIMIT),
 				pageToken,
-				selfOpenId: self,
+				refresh: Boolean(refresh),
+				cacheOnly: Boolean(cacheOnly),
 			});
-			let names = {};
-			try {
-				names =
-					(
-						await fetchUserNamesViaCli(
-							(args, opts) => cliRunner.run(args, opts),
-							collectSenders(result.items, { selfOpenId: self }),
-							{ as: "user" },
-						)
-					).names || {};
-			} catch {
-				names = {};
-			}
+			const self = await selfOpenId();
 			const sinceMs = parseSince(since);
-			const rows = result.items
+			const rows = payload.items
 				.filter((row) => !sinceMs || (Number(row.createTimeMs) || 0) >= sinceMs)
 				.map((row) => ({
 					id: row.id,
 					at: isoOf(row.createTimeMs),
 					from: row.self
 						? "我"
-						: names[row.senderId] || row.senderName || (row.senderId ? `…${String(row.senderId).slice(-6)}` : "未知"),
+						: row.senderLabel || row.senderName || (row.senderId ? `…${String(row.senderId).slice(-6)}` : "未知"),
 					self: Boolean(row.self),
 					type: row.msgType,
 					text: clipText(row.text, MESSAGE_TEXT_CAP),
@@ -773,21 +1171,26 @@ export default {
 			let info = {};
 			try {
 				const known = (await host.storage?.get?.(CHAT_INFO_KEY)) || {};
-				info = known[result.chatId] || {};
+				info = known[target.chatId] || {};
 			} catch {
 				info = {};
 			}
+			const cached = Number(payload.cache?.rows) || 0;
 			return {
-				via: "lark-cli",
-				chatId: result.chatId,
+				// `via` 说明这份内容是从哪来的：cache = 没打飞书接口（本地缓存够新）。
+				via: payload.cached ? "cache" : "lark-cli",
+				chatId: target.chatId,
 				self,
-				mode: String(info.mode || "unknown"),
-				name: String(info.name || (target.openId ? names[target.openId] : "") || ""),
-				identity: result.identity,
+				mode: String(info.mode || payload.inferredMode?.mode || "unknown"),
+				name: String(info.name || payload.peer?.name || ""),
+				identity: payload.identity || "user",
 				count: kept.length,
 				omitted: rows.length - kept.length,
-				hasMore: result.hasMore,
-				pageToken: result.pageToken,
+				hasMore: Boolean(payload.hasMore),
+				pageToken: String(payload.pageToken || ""),
+				cache: payload.cache
+					? { rows: cached, ageMs: payload.cache.ageMs, refreshing: payload.cache.refreshing }
+					: null,
 				items: kept,
 			};
 		}
@@ -855,16 +1258,56 @@ export default {
 				update: (guid, fields = {}) =>
 					viaCli("task-update", (run) => updateTaskViaCli(run, guid, fields, { as: "user" })),
 			},
-			// 提取待办的来源：用户主动监听的会话（飞书不给「我的全部聊天」，所以只能从监听的里找）。
+			// 提取待办的来源：**全局** —— 本地消息缓存里有消息的会话（打开过的私聊 / 群聊 /
+			// 后台轮询写进来的都在里面）加监听名单（可能还没缓存过），按最后一条消息新到旧。
+			// 飞书不给「我的全部聊天」，「我看过什么」就是「能提取什么」；缓存读是本地操作，
+			// 所以多扫几个会话不花网络与配额（真正回源 CLI 的量由服务层封顶）。
 			listSources: async () => {
-				const watched = parseChatIds(dmWatcher.status()?.config?.chatIds);
+				await chatCache.load();
 				const known = (await host.storage?.get?.(CHAT_INFO_KEY)) || {};
-				return watched.map((chatId) => ({
-					chatId,
-					name: String(known?.[chatId]?.name || known?.[chatId]?.label || ""),
-				}));
+				const dm = dmWatcher.status();
+				/** @type {Map<string, {chatId:string,name:string,cached:number,newestMs:number,watched:boolean}>} */
+				const byId = new Map();
+				const touch = (chatId) => {
+					const id = String(chatId ?? "").trim();
+					if (!isValidChatId(id)) return null;
+					let row = byId.get(id);
+					if (!row) {
+						row = { chatId: id, name: "", cached: 0, newestMs: 0, watched: false };
+						byId.set(id, row);
+					}
+					return row;
+				};
+				// ① 监听名单（含自动发现的单聊）：还没被打开过的会话只有这条路能进候选。
+				for (const chat of Array.isArray(dm?.chats) ? dm.chats : []) {
+					const row = touch(chat?.id);
+					if (!row) continue;
+					row.watched = true;
+					row.name = row.name || String(chat?.name || "");
+					row.newestMs = Math.max(row.newestMs, Number(chat?.watermarkMs) || 0);
+				}
+				for (const chatId of parseChatIds(dm?.config?.chatIds)) {
+					const row = touch(chatId);
+					if (row) row.watched = true;
+				}
+				// ② 本地缓存：所有看过的会话（也是真正的消息来源）。
+				for (const chatId of chatCache.chatIds()) {
+					const row = touch(chatId);
+					if (!row) continue;
+					const meta = chatCache.meta(chatId);
+					row.cached = Number(meta?.rows) || 0;
+					row.newestMs = Math.max(row.newestMs, Number(meta?.newestMs) || 0);
+				}
+				return [...byId.values()]
+					.map((row) => ({
+						...row,
+						name: row.name || String(known?.[row.chatId]?.name || known?.[row.chatId]?.label || ""),
+					}))
+					.sort((a, b) => b.newestMs - a.newestMs);
 			},
-			readMessages: ({ chatId, limit }) => readChatMessages({ chatId, limit }),
+			// `cacheOnly` = 只读本地缓存（提取扫多个会话时用：不该为了「找待办」spawn 一串 CLI）。
+			readMessages: ({ chatId, limit, cacheOnly }) =>
+				readChatMessages({ chatId, limit, cacheOnly: Boolean(cacheOnly) }),
 			notify: (level, content) => host.notify?.(level, content),
 			log,
 		});
@@ -939,6 +1382,32 @@ export default {
 				pluginId: PLUGIN_ID,
 				cli,
 				user: user ? { authorized: true, name: user.name || "", openId: user.openId || "" } : { authorized: false },
+			};
+		}
+
+		/* --------------------------- 消息同步（控制面） --------------------------- */
+		//
+		// 「消息同步」与「私聊提醒」是**同一个轮询引擎的两个面**（`lib/dm-watch.mjs`）：
+		// 同一个定时器、同一份水位、同一份缓存，区别只在「要不要弹通知」。
+		// `/dm/*` 保留为引擎原有入口（兼容旧界面 / 单测）;/sync/* 是给人用的控制面：
+		// 它把**引擎状态 + 本地缓存自述**合成一份，界面只看这一份就不会出现
+		// 「轮询在跑但缓存里没东西 / 缓存很脏却没人管」这种信息割裂。
+		//
+		// 为什么缓存统计不塞进 `/dm/state`：那个路由被会话页每 15s 轮一次，
+		// 而 `chatCacheStats()` 要遍历整份缓存（还要算字节数）—— 「看未读」这种高频请求别干重活。
+		async function syncStatePayload(extra = {}) {
+			await chatCache.load();
+			const status = dmWatcher.status();
+			return {
+				...status,
+				// 每个候选会话「本地已经存了多少条」：一眼看出「同步在跑但不落东西」与「缓存被裁了」。
+				// 只是遍历候选（≤50 个）查内存，与整份缓存的字节数无关。
+				chats: status.chats.map((chat) => ({
+					...chat,
+					cachedRows: Number(chatCache.meta(chat.id)?.rows) || 0,
+				})),
+				cache: chatCache.stats(),
+				...(extra || {}),
 			};
 		}
 
@@ -1167,7 +1636,13 @@ export default {
 				"/dm/poll",
 				async (req, res) => {
 					const result = await dmWatcher.pollOnce({ force: true });
-					sendOk(res, { ...dmWatcher.status(), polled: result.messages.length, skipped: result.skipped ?? "" });
+					sendOk(res, {
+						...dmWatcher.status(),
+						polled: result.messages.length,
+						chats: result.chats ?? 0,
+						rows: result.rows ?? 0,
+						skipped: result.skipped ?? "",
+					});
 				},
 			],
 			[
@@ -1178,24 +1653,117 @@ export default {
 					sendOk(res, { ...dmWatcher.status(), diagnostics: found.diagnostics });
 				},
 			],
+			/* ------------------------ 消息同步（私聊 + 群，控制面） ------------------------ */
+			[
+				"GET",
+				"/sync/state",
+				async (req, res) => {
+					sendOk(res, await syncStatePayload());
+				},
+			],
+			[
+				"POST",
+				"/sync/config",
+				async (req, res) => {
+					// 与 `/dm/config` 是**同一个配置对象**（同一个引擎），这里只少一层 `config` 包裹。
+					// 只允许改白名单字段（normalizeDmConfig 会丢掉多余的键）。
+					const incoming = bodyOf(req);
+					await dmWatcher.updateConfig(incoming.config ?? incoming);
+					sendOk(res, await syncStatePayload());
+				},
+			],
+			[
+				"POST",
+				"/sync/run",
+				async (req, res) => {
+					// 手动同步一轮：和定时轮询**同一条路径**（force 无视 enabled），
+					// 所以不会出现「手动拉一次就带歪水位」的并发问题（内建 polling 闸门）。
+					//
+					// 闸门是「跳过」而不是「排队」：刚勾上「启用后台同步」就点「立即同步」时，
+					// 很容易撞上刚起的那一轮。所以这里先**有限等待**在飞的这一轮（实测 45 个会话 ≈ 40s，
+					// 所以等到 60s：既能让手动同步拿到真实数字，也不会把浏览器请求挂太久）。
+					//   - 等到了 → 直接用那一轮的结果（**不再白拉一遂**：一轮 50 个会话 ≈ 50 次 spawn）；
+					//   - 等不到（会话多 / CLI 慢）→ 如实回 skipped=busy，界面说「正在同步中」。
+					const busyAtStart = dmWatcher.status().busy;
+					const deadline = Date.now() + 60_000;
+					while (dmWatcher.status().busy && Date.now() < deadline) {
+						await new Promise((resolve) => setTimeout(resolve, 250));
+					}
+					const after = dmWatcher.status();
+					let synced;
+					if (busyAtStart && !after.busy) {
+						// 刚等到一轮跑完：数字就是它，不重复拉。
+						synced = {
+							chats: after.lastPoll?.chats ?? 0,
+							rows: after.lastPoll?.rows ?? 0,
+							fresh: after.lastPoll?.fresh ?? 0,
+							skipped: "",
+							waited: true,
+						};
+					} else if (after.busy) {
+						synced = { chats: 0, rows: 0, fresh: 0, skipped: "busy" };
+					} else {
+						const result = await dmWatcher.pollOnce({ force: true });
+						synced = {
+							chats: result.chats ?? 0,
+							rows: result.rows ?? 0,
+							fresh: result.messages?.length ?? 0,
+							skipped: result.skipped ?? "",
+						};
+					}
+					sendOk(res, await syncStatePayload({ synced }));
+				},
+			],
+			[
+				"POST",
+				"/sync/clear",
+				async (req, res) => {
+					// 只清**缓存内容**，不动水位与配置：清完下一轮增量会把最近的消息重新填回来，
+					// 不会因为「清了缓存」就把整段历史当新消息弹一遍。
+					await chatCache.clear();
+					sendOk(res, await syncStatePayload());
+				},
+			],
 			[
 				"GET",
 				"/chats",
 				async (req, res) => {
-					const q = queryOf(req);
 					if (!(await cliReady())) throw await cliSetupError();
 					const listed = await fetchChatsViaCli((args, opts) => cliRunner.run(args, opts), { as: "user" });
 					const watched = new Set(parseChatIds(dmWatcher.status().config?.chatIds));
 					const known = (await host.storage?.get?.(CHAT_INFO_KEY)) || {};
 					// CLI 已经按 active_time 排好序，不再逐会话预热"最后一条消息"（那是旧实现的最大成本）。
 					const merged = mergeChatSources(listed.chats, [...watched], known);
-					const decorated = merged.map((chat) => ({
-						...chat,
-						watched: watched.has(chat.id),
-						link: chatLink(chat.id),
-					}));
+					await chatCache.load();
+					const self = await selfOpenId();
+					// 列表上的「最后一条」来自本地缓存（后台轮询 / 打开过的会话都写进来）：
+					// 不额外 spawn 一次 CLI，也不会因为「没预热过」就整列显示 chat_id。
+					const decorated = merged.map((chat) => {
+						const last = chatCache.lastMessage(chat.id);
+						const meta = chatCache.meta(chat.id);
+						const lastSelf = Boolean(self) && Boolean(last?.senderId) && last.senderId === self;
+						const lastSender = last
+							? lastSelf
+								? "我"
+								: chatCache.namesFor([last.senderId])[last.senderId] || last.senderName || ""
+							: "";
+						return {
+							...chat,
+							watched: watched.has(chat.id),
+							link: chatLink(chat.id),
+							lastMessageAt: Number(last?.createTimeMs) || 0,
+							lastPreview: clipPreview(last?.text || last?.richText || "", 60),
+							lastSender,
+							lastMessageSelf: lastSelf,
+							// 「本地已缓存 N 条」：告诉用户「点开就有」，而不是又一个加载中的转圈。
+							cachedRows: Number(meta?.rows) || 0,
+							cachedAt: Number(meta?.updatedAt) || 0,
+						};
+					});
 					const sections = chatSections(decorated);
 					const p2pCount = decorated.filter((c) => c.p2p).length;
+					// 顺手预热最上面三个（后台跑，不占这次响应）：点下去时多半已经在缓存里。
+					const warming = warmLikelyChats(decorated, { limit: 3 });
 					// 未读数来自私聊提醒的轮询（本地累计）；打开会话时前端会调 /dm/read 清零。
 					const unread = dmWatcher.status().unread ?? {};
 					sendOk(res, {
@@ -1210,6 +1778,8 @@ export default {
 						needUser: false,
 						watchedCount: watched.size,
 						unread,
+						// 本次顺手预热了几个会话（0 表示都有了，或已经试过）。
+						warming,
 						discovery: {
 							ownPages: 1,
 							ownHasMore: listed.hasMore,
@@ -1230,74 +1800,80 @@ export default {
 				"GET",
 				"/chat/messages",
 				async (req, res) => {
+					// 缓存优先：有缓存立刻回（`cache.refreshing` 表示后台正在补增量），
+					// 只有「第一次打开 / 手动刷新 / 翻旧页」才等 CLI。见 `chatMessagesPayload`。
 					const q = queryOf(req);
-					const chatId = firstParam(q.chatId) || firstParam(q.id);
-					const self = await selfOpenId();
-					const result = await fetchChatMessagesViaCli((args, opts) => cliRunner.run(args, opts), chatId, {
-						as: "user",
-						pageSize: Number(firstParam(q.limit)) || undefined,
+					const payload = await chatMessagesPayload(firstParam(q.chatId) || firstParam(q.id), {
+						limit: Number(firstParam(q.limit)) || CHAT_FETCH_LIMIT,
 						pageToken: firstParam(q.pageToken),
-						selfOpenId: self,
+						refresh:
+							["1", "true", "yes"].includes(firstParam(q.refresh).toLowerCase()) ||
+							["1", "true", "yes"].includes(firstParam(q.wait).toLowerCase()),
 					});
-					// 姓名是装饰：查不到就退化成 open_id 尾巴，不能让整页报错。
-					let named = { names: {}, error: "" };
-					try {
-						named = await fetchUserNamesViaCli(
-							(args, opts) => cliRunner.run(args, opts),
-							collectSenders(result.items, { selfOpenId: self }),
-							{ as: "user" },
-						);
-					} catch (err) {
-						named = { names: {}, error: String(err?.message || err) };
-					}
-					const items = result.items.map((row) => ({
-						...row,
-						senderLabel: row.self ? "我" : named.names[row.senderId] || row.senderLabel,
-					}));
-					const peerId = pickPeerFromMessages(items, self);
-					const peerName = named.names[peerId] || "";
-					let inferred = { mode: "unknown", reason: "" };
-					try {
-						inferred = inferChatMode(items, { selfOpenId: self });
-					} catch {
-						/* 反推失败不影响读消息 */
-					}
-					// 会话类型兜底：chats_info 里不知道是单聊还是群时，用消息反推（权威来源仍是 chats/:id）。
-					try {
-						const known = (await host.storage?.get?.(CHAT_INFO_KEY)) || {};
-						const prev = known[result.chatId];
-						if ((!prev || prev.mode === "unknown" || prev.inferred) && inferred.mode !== "unknown") {
-							await host.storage?.set?.(CHAT_INFO_KEY, {
-								...known,
-								[result.chatId]: {
-									...(prev || {}),
-									id: result.chatId,
-									name: prev?.name || peerName || "",
-									mode: inferred.mode,
-									p2p: inferred.mode === "p2p",
-									inferred: true,
-									inferReason: inferred.reason,
-									fetchedAt: Date.now(),
-								},
-							});
+					sendOk(res, payload);
+				},
+			],
+			[
+				"GET",
+				"/chat/search",
+				async (req, res) => {
+					// 二次检索：只读本地缓存（后台轮询 + 打开过 + AI 读过的会话都在里面），不打飞书接口。
+					const q = queryOf(req);
+					const query = firstParam(q.q) || firstParam(q.query);
+					await chatCache.load();
+					const result = chatCache.search({
+						query,
+						chatIds: parseChatIds(firstParam(q.chatIds) || firstParam(q.chatId)),
+						limit: Number(firstParam(q.limit)) || CHAT_SEARCH_LIMIT,
+						sinceMs: parseSince(firstParam(q.since)),
+					});
+					const self = await selfOpenId();
+					const known = (await host.storage?.get?.(CHAT_INFO_KEY)) || {};
+					const chatNames = {};
+					for (const row of result.hits) {
+						if (!chatNames[row.chatId]) {
+							const cached = chatCache.meta(row.chatId);
+							chatNames[row.chatId] =
+								String(known[row.chatId]?.name || "").trim() ||
+								`…${String(row.chatId).slice(-6)}` + (cached?.rows ? "" : "");
 						}
-					} catch {
-						/* 反推写缓存失败不影响读消息 */
 					}
 					sendOk(res, {
-						chatId: result.chatId,
-						items,
-						hasMore: result.hasMore,
-						pageToken: result.pageToken,
-						identity: result.identity,
-						peer: { openId: peerId, name: peerName },
-						label: peerName ? `与 ${peerName} 的私聊` : "",
-						remembered: Boolean(chatId),
-						inferredMode: inferred,
-						namesError: named.error || "",
-						link: chatLink(result.chatId),
-						via: "lark-cli",
+						query,
+						tooShort: Boolean(result.tooShort),
+						scanned: result.scanned,
+						count: result.hits.length,
+						items: result.hits.map((row) => ({
+							chatId: row.chatId,
+							chatName: chatNames[row.chatId] || "",
+							id: row.id,
+							at: Number(row.createTimeMs) || 0,
+							from:
+								row.senderId === self ? "我" : chatCache.namesFor([row.senderId])[row.senderId] || row.senderName || "",
+							self: Boolean(self) && row.senderId === self,
+							type: row.msgType,
+							text: clipPreview(row.text || row.richText || "", 200),
+							snippet: row.snippet,
+						})),
+						note: result.tooShort ? "关键词至少两个字" : "",
 					});
+				},
+			],
+			[
+				"GET",
+				"/chat/cache",
+				async (req, res) => {
+					// 缓存自述：多少会话 / 多少条 / 多新 / 占多大（排错与「要不要清」都靠它）。
+					await chatCache.load();
+					sendOk(res, { ...chatCache.stats(), chats: chatCache.chatIds() });
+				},
+			],
+			[
+				"POST",
+				"/chat/cache/clear",
+				async (req, res) => {
+					await chatCache.clear();
+					sendOk(res, { ...chatCache.stats() });
 				},
 			],
 			[
@@ -1375,6 +1951,9 @@ export default {
 						as: body.as ?? body.identity,
 						uuid: String(body.uuid ?? "").trim(),
 					});
+					// 发完立刻后台补一次增量：新消息几百毫秒内就进缓存，界面下一次轮询直接看到它，
+					// 而不是等 5s 轮询把整页重拉一遂（也就不会“发了却买不到”）。
+					if (sent?.chatId && isValidChatId(sent.chatId)) refreshChatInBackground(sent.chatId, { force: true });
 					sendOk(res, sent);
 				},
 			],
@@ -1514,7 +2093,8 @@ export default {
 			[
 				"POST",
 				"/todos/extract",
-				async (req, res) => sendOk(res, await todoService.extract({ limit: Number(bodyOf(req).limit) || 3 })),
+				// 不传 limit = 用服务层默认（默认扫本地缓存里的多个会话；缓存读不花网络）。
+				async (req, res) => sendOk(res, await todoService.extract({ limit: Number(bodyOf(req).limit) || 0 })),
 			],
 			[
 				"POST",
@@ -1565,14 +2145,17 @@ export default {
 			name: "feishu_pro",
 			label: "飞书 Pro",
 			description:
-				"Work with Feishu (Lark) through the official lark-cli: search contacts and cloud docs, read documents as markdown, browse wiki spaces, list chats, read recent chat messages, send a text message, and check which identity layer is ready.",
+				"Work with Feishu (Lark) through the official lark-cli: search contacts and cloud docs, read documents as markdown, browse wiki spaces, list chats, read recent chat messages (served from a local cache when that chat was already fetched), search those cached messages offline, send a text message, and check which identity layer is ready.",
 			promptSnippet: "find a Feishu chat, read it, and send a message",
 			promptGuidelines: [
 				"Every call runs through lark-cli; failure means the CLI is missing, logged out, or lacks a scope — read `hint` before retrying",
 				"Use action=doc_read before summarizing a document, and cite the returned url instead of pasting long text",
 				"Ask the user before repeating phone numbers, emails, or other personal data returned by contacts",
 				"Use action=im_chats first when you do not know a chat id; a p2p chat only shows up when it is watched or discovered, so fall back to open_id from contacts",
+				"action=im_messages reads the local cache first (via=cache) and only pulls from Feishu when that chat was never fetched; pass refresh=true only when the user needs truly current content",
+				"action=im_search looks through the locally cached messages without calling Feishu — prefer it over re-reading a chat to find an earlier line",
 				"action=im_send posts as the signed-in person unless as=bot: confirm recipient and wording with the user, and reuse the same uuid when retrying so nothing is sent twice",
+				"action=status reports the background sync engine (DMs and groups share one poller): check it before claiming no new messages arrived",
 			],
 			parameters: {
 				type: "object",
@@ -1590,6 +2173,7 @@ export default {
 							"wiki_nodes",
 							"im_chats",
 							"im_messages",
+							"im_search",
 							"im_send",
 							"probe",
 						],
@@ -1597,7 +2181,8 @@ export default {
 					},
 					query: {
 						type: "string",
-						description: "contacts/doc_search: keyword (person name or doc title). im_chats: filter by chat name.",
+						description:
+							"contacts/doc_search: keyword (person name or doc title). im_chats: filter by chat name. im_search: text to look up in the locally cached messages.",
 					},
 					limit: { type: "number", description: "Maximum items to return (default 20, max 50)." },
 					department_id: {
@@ -1615,7 +2200,8 @@ export default {
 					},
 					chat_id: {
 						type: "string",
-						description: "im_messages/im_send: target chat id (oc_…), group or p2p. Omit when using open_id.",
+						description:
+							"im_messages/im_send: target chat id (oc_…), group or p2p. Omit when using open_id. im_search: optional chat filter (comma separated).",
 					},
 					chat_types: {
 						type: "string",
@@ -1639,7 +2225,11 @@ export default {
 					},
 					since: {
 						type: "string",
-						description: "im_messages: ISO time or epoch seconds/milliseconds; only messages at or after it.",
+						description: "im_messages/im_search: ISO time or epoch seconds/milliseconds; only messages at or after it.",
+					},
+					refresh: {
+						type: "boolean",
+						description: "im_messages: force a fresh pull from Feishu instead of the local cache.",
 					},
 					page_token: {
 						type: "string",
@@ -1680,6 +2270,31 @@ export default {
 											action: cli.action || "",
 										}
 									: null,
+								// 后台消息同步引擎（私聊 + 群共用一个轮询）的自述：agent 判断
+								// 「到底有没有在同步 / 为什么没新消息 / 是不是该让用户去开同步」全靠它。
+								// 只给计数与开关，不给会话清单（那是几 KB 噪音，要清单用 im_chats）。
+								sync: (() => {
+									const dm = dmWatcher.status();
+									const cand = dm.candidates || {};
+									const unreadTotal = Object.values(dm.unread || {}).reduce((acc, n) => acc + (Number(n) || 0), 0);
+									return {
+										running: Boolean(dm.running),
+										intervalSec: Number(dm.config?.intervalSec) || 0,
+										scope: {
+											dm: Boolean(dm.config?.autoDiscover),
+											groups: Boolean(dm.config?.syncGroups),
+											pinned: Number(cand.explicit) || 0,
+										},
+										candidates: {
+											total: Number(cand.total) || 0,
+											p2p: Number(cand.p2p) || 0,
+											groups: Number(cand.groups) || 0,
+										},
+										lastPoll: dm.lastPoll ?? null,
+										unreadTotal,
+										error: dm.lastError || "",
+									};
+								})(),
 								hint: cli?.loggedIn
 									? "lark-cli ready: every action goes through the CLI"
 									: "lark-cli not ready: finish install → config init → auth login in the plugin settings",
@@ -1854,17 +2469,62 @@ export default {
 						);
 					}
 					case "im_messages": {
-						// 读消息 / 发消息是**写与读的分界**：只有 CLI 一条路（与 /chat/send 同口径），
-						// 不提供换通道重试 —— 发两遍的代价比报错大得多。
-						if (!(await cliReady())) throw await cliSetupError();
+						// 缓存优先：与界面同一条路（`chatMessagesPayload`）。缓存里有这条会话就直接给，
+						// 不再 spawn 一次 CLI；只有「从没拉过 / 显式 refresh」才真去打飞书。
+						// 发消息仍然只有 CLI 一条路（见 im_send）。
+						if (!args.chat_id && !args.open_id) throw new Error("im_messages 需要 chat_id 或 open_id");
+						if (args.open_id && !args.chat_id && !(await cliReady())) throw await cliSetupError();
 						const data = await readChatMessages({
 							chatId: args.chat_id,
 							openId: args.open_id,
 							limit,
 							pageToken: String(args.page_token || ""),
 							since: args.since,
+							refresh: Boolean(args.refresh),
 						});
 						return JSON.stringify(data, null, 2);
+					}
+					case "im_search": {
+						// 二次检索：只翻本地缓存（后台轮询 + 打开过的会话 + 之前 im_messages 拉过的），
+						// 不打飞书接口、不花配额，适合「刚才那句是谁说的 / 找一下那条链接」。
+						await chatCache.load();
+						const keyword = String(args.query || "").trim();
+						const chatIds = parseChatIds(args.chat_id || "");
+						const result = chatCache.search({
+							query: keyword,
+							chatIds,
+							limit,
+							sinceMs: parseSince(args.since),
+						});
+						const self = await selfOpenId();
+						const known = (await host.storage?.get?.(CHAT_INFO_KEY)) || {};
+						const items = result.hits.map((hit) => ({
+							chatId: hit.chatId,
+							chatName: String(known[hit.chatId]?.name || chatCache.namesFor([hit.senderId])[hit.senderId] || ""),
+							at: isoOf(hit.createTimeMs),
+							from:
+								hit.senderId === self ? "我" : chatCache.namesFor([hit.senderId])[hit.senderId] || hit.senderName || "",
+							self: Boolean(self) && hit.senderId === self,
+							type: hit.msgType,
+							text: clipText(hit.text || hit.richText || "", MESSAGE_TEXT_CAP),
+							snippet: hit.snippet,
+						}));
+						return JSON.stringify(
+							{
+								via: "cache",
+								query: keyword,
+								scanned: result.scanned,
+								count: items.length,
+								items,
+								...(items.length === 0
+									? {
+											note: "本地缓存没有命中：先用 action=im_messages 打开相关会话（会拉一批并缓存），或等后台轮询预热；im_search 不查飞书服务端",
+										}
+									: {}),
+							},
+							null,
+							2,
+						);
 					}
 					case "im_send": {
 						if (!(await cliReady())) throw await cliSetupError();
@@ -1953,7 +2613,8 @@ export default {
 					auto_sync: { type: "boolean", description: "config: periodically pull Feishu tasks in the background." },
 					auto_extract: {
 						type: "boolean",
-						description: "config: periodically extract to-do candidates from the watched chats (spends model quota).",
+						description:
+							"config: periodically extract to-do candidates from locally cached chat messages (spends model quota).",
 					},
 					interval_min: { type: "number", description: "config: auto interval in minutes (15–360, default 30)." },
 				},
@@ -2095,6 +2756,8 @@ export default {
 		void dmWatcher.start();
 
 		return () => {
+			// 卸载/重载前把缓存写下去：否则最后 5s 的增量会白丢（下次打开会话得重新拉）。
+			void chatCache.flush().catch(() => {});
 			dmWatcher.stop();
 			autoReplier?.stop();
 			bgTask?.unregister?.();

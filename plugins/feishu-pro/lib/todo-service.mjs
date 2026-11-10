@@ -16,7 +16,7 @@
  *   - 新建：只有用户**显式勾了「同步飞书」**（`toFeishu`）才在飞书建任务，guid 落进 `ref`；
  *   - 编辑：`ref.kind === "task"` 的条目改标题/描述/截止/完成态 → PATCH 回飞书；
  *   - 失败一律"本地已改 + writeBack.warning"，并把 warning 记进历史（绝不假装同步成功）；
- *   - `autoRun()` 定时拉飞书任务 + 从监听会话提取候选 —— **调度器在 index.mjs**，
+ *   - `autoRun()` 定时拉飞书任务 + 从本地缓存的会话消息提取候选 —— **调度器在 index.mjs**，
  *     本文件不起定时器（保持"纯服务 + 注入依赖"，单测能一行跑一遍）。
  */
 import {
@@ -57,10 +57,18 @@ import {
 
 /** 待办触发的无头运行走独立账号：与「私聊自动问答」的会话互不覆盖。 */
 export const TODO_ACCOUNT_ID = "feishu-pro:todo";
-/** 一次提取最多读几个会话、每个会话读多少条消息。 */
-const EXTRACT_CHATS = 3;
+/**
+ * 一次提取最多读几个会话、每个会话读多少条消息。
+ *
+ * 会话数比「能读多少」更宽：来源是**本地消息缓存**（见 `lib/chat-cache.mjs`），
+ * 读缓存是本地操作、零成本；真正贵的是「本地没有缓存 → 回源 CLI」，那部分由
+ * `EXTRACT_CLI_FETCHES` 单独封顶。
+ */
+const EXTRACT_CHATS = 8;
 const EXTRACT_PER_CHAT = 20;
 const EXTRACT_MESSAGE_CAP = 60;
+/** 一轮提取最多为几个「本地没缓存」的会话真的回源一次（CLI 1–3s/个）。 */
+const EXTRACT_CLI_FETCHES = 2;
 /** 同时在跑的 agent 上限（模型额度与机器资源都有限）。 */
 const MAX_PENDING_RUNS = 4;
 
@@ -77,8 +85,10 @@ const str = (value, cap = 0) => {
  * @param {(req: object) => Promise<any>} [deps.chat]  host.chat（无头 agent）
  * @param {(args: object) => Promise<any>} [deps.send] 飞书发文本（{chatId,text,uuid}）
  * @param {{list?: Function, setDone?: Function, create?: Function, update?: Function}} [deps.tasks] 飞书任务适配
- * @param {() => Promise<Array<{chatId:string,name:string}>>} [deps.listSources] 提取来源
- * @param {(args: object) => Promise<object>} [deps.readMessages] 读某个会话的最近消息
+ * @param {() => Promise<Array<{chatId:string,name:string,cached?:number,newestMs?:number}>>} [deps.listSources]
+ *                                                        提取来源（本地所有有消息的会话，按最后一条消息新到旧）
+ * @param {(args: {chatId:string,limit?:number,cacheOnly?:boolean}) => Promise<object>} [deps.readMessages]
+ *                                                        读某个会话的最近消息（`cacheOnly` = 只读本地缓存，不回源）
  * @param {(level: string, text: string) => void} [deps.notify]
  * @param {(level: string, text: string) => void} [deps.log]
  * @param {() => number} [deps.now]
@@ -586,19 +596,32 @@ export function createTodoService(deps = {}) {
 		return "";
 	}
 
-	/** 从最近的消息里找待办（返回候选，同时落盘到 `store.candidates` 等“记下”）。 */
+	/**
+	 * 从会话消息里找待办（返回候选，同时落盘到 `store.candidates` 等“记下”）。
+	 *
+	 * 来源是**全局**的：`listSources()` 给的是「本地有过消息的会话」（打开过的私聊/群聊 +
+	 * 后台轮询写进缓存的会话），不是只看监听名单 —— 用户在哪聊过，就在哪找。
+	 * 读的时候分层：已经缓存过的只读本地（零成本）；本地一条都没有的才允许回源 CLI，
+	 * 且一轮最多回源 `EXTRACT_CLI_FETCHES` 个（否则 8 个会话就是 8 次 1–3s 的等待）。
+	 */
 	async function extract({ limit = EXTRACT_CHATS } = {}) {
 		await load();
 		if (!llm || typeof llm.complete !== "function") throw new Error("宿主没有提供 llm 补全：无法提取待办");
 		if (!listSources || !readMessages) throw new Error("没有可读的飞书会话通道");
-		const sources = (await listSources()) || [];
+		const sources = ((await listSources()) || []).filter((source) => str(source?.chatId));
 		if (!sources.length) {
-			throw new Error("还没有可读的会话：先到「会话」页监听一个私聊（或群），再回来提取");
+			throw new Error("本地还没有任何会话消息：先在「会话」页打开（或监听）一个会话，再回来提取");
 		}
+		const picked = sources.slice(0, Math.max(1, Math.min(Number(limit) || EXTRACT_CHATS, 24)));
 		const rows = [];
-		for (const source of sources.slice(0, Math.max(1, limit))) {
+		let cliFetches = 0;
+		for (const source of picked) {
+			// 有缓存就只读缓存（提取不需要最新那条，要的是「最近发生了什么」）；
+			// 没缓存才回源，并且总量封顶 —— 别让一次点击变成一串 CLI 子进程。
+			const cacheOnly = Number(source.cached) > 0 || cliFetches >= EXTRACT_CLI_FETCHES;
+			if (!cacheOnly) cliFetches += 1;
 			try {
-				const read = await readMessages({ chatId: source.chatId, limit: EXTRACT_PER_CHAT });
+				const read = await readMessages({ chatId: source.chatId, limit: EXTRACT_PER_CHAT, cacheOnly });
 				for (const message of read?.items || []) {
 					rows.push({
 						at: message.at || "",
@@ -612,7 +635,9 @@ export function createTodoService(deps = {}) {
 				warn(`读取会话 ${source.chatId} 失败：${str(err?.message || err, 160)}`);
 			}
 		}
-		if (!rows.length) throw new Error("这些会话里没有读到消息（可能是刚监听的，等有新消息后再试）");
+		if (!rows.length) {
+			throw new Error("本地缓存的会话里没有读到消息：新监听的会话要先有一条新消息，或先在「会话」页打开它");
+		}
 		rows.sort((a, b) => String(a.at).localeCompare(String(b.at)));
 		const trimmed = rows.slice(-EXTRACT_MESSAGE_CAP);
 		const result = await llm.complete({
@@ -633,8 +658,10 @@ export function createTodoService(deps = {}) {
 		}
 		return {
 			candidates: fresh,
-			chats: sources.slice(0, Math.max(1, limit)).length,
+			chats: picked.length,
 			messages: trimmed.length,
+			// 这一轮回源了几次 CLI（0 = 全部命中本地缓存，没花网络与配额）。
+			cliFetches,
 			model: result.model || "",
 			added: merged.added,
 			stored: merged.total,
@@ -700,7 +727,7 @@ export function createTodoService(deps = {}) {
 	}
 
 	/**
-	 * 定时跑一轮：拉飞书任务（`autoSync`）+ 从监听会话提取候选（`autoExtract`）。
+	 * 定时跑一轮：拉飞书任务（`autoSync`）+ 从会话消息提取候选（`autoExtract`）。
 	 * 失败只记 `lastError`/历史，不抛给调用方（后台任务不能因为一次网络抖动就死）。
 	 */
 	async function autoRun({ reason = "timer" } = {}) {
@@ -718,7 +745,7 @@ export function createTodoService(deps = {}) {
 			}
 			if (autoConfig.autoExtract) {
 				if (!llm || typeof llm.complete !== "function" || !listSources || !readMessages) {
-					out.warnings.push("没有可读会话或模型补全：自动提取未执行");
+					out.warnings.push("没有可读的会话消息或模型补全：自动提取未执行");
 				} else {
 					try {
 						const found = await extract({ limit: EXTRACT_CHATS });

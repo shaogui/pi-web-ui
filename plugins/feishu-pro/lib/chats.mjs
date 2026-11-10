@@ -26,7 +26,7 @@ import {
 	messagePreview,
 	normalizeChatItem,
 	normalizeMessageItem,
-} from "./dm-watch.mjs?v=0.12.0";
+} from "./dm-watch.mjs?v=0.14.1";
 
 const text = (value) => (typeof value === "string" ? value.trim() : "");
 
@@ -78,27 +78,46 @@ export function chatCounts(chats) {
 	return { total: list.length, p2p, groups: list.length - p2p };
 }
 
-/** 消息条目：补 `self`（自己发的）与展示名。 */
+/**
+ * 已归一化的消息行 → 界面行：补 `self`（自己发的）、展示名与预览。
+ *
+ * 单独抽出来是因为本地缓存（`lib/chat-cache.mjs`）里存的就是**已归一化**的行：
+ * 读缓存时不能把它们再喂一次 `normalizeMessageItem`（那份会重新解析 raw 形状），
+ * 但 `self` / 姓名 / 预览又必须按**当前**登录身份与最新的姓名缓存重算 —— 两处共用这一个函数。
+ */
+export function decorateMessageRow(row, { selfOpenId = "", names = {} } = {}) {
+	if (!row || typeof row !== "object") return null;
+	const senderId = text(row.senderId);
+	const self = Boolean(selfOpenId) && Boolean(senderId) && senderId === selfOpenId;
+	const given = text(names[senderId]);
+	const senderName = text(row.senderName);
+	const msgType = text(row.msgType) || "unknown";
+	const senderType = text(row.senderType);
+	// 没有名字时的兜底：系统消息没有 sender、机器人没有 open_id，都不能退化成"未知"。
+	const fallback =
+		msgType === "system" ? "系统" : senderType === "app" ? "机器人" : senderId ? `…${senderId.slice(-6)}` : "未知";
+	const body = text(row.text);
+	return {
+		...row,
+		id: text(row.id),
+		chatId: text(row.chatId),
+		senderId,
+		senderType,
+		senderName,
+		msgType,
+		text: body,
+		createTimeMs: Number(row.createTimeMs) || 0,
+		self,
+		senderLabel: self ? "我" : given || senderName || fallback,
+		preview: body,
+	};
+}
+
+/** 消息条目（CLI / 飞书 raw 形状）→ 界面行：归一化 + 装饰，一次做完。 */
 export function normalizeMessageRow(item, { selfOpenId = "", names = {} } = {}) {
 	const base = normalizeMessageItem(item);
 	if (!base) return null;
-	const self = Boolean(selfOpenId) && base.senderId === selfOpenId;
-	const given = text(names[base.senderId]);
-	// 没有名字时的兜底：系统消息没有 sender、机器人没有 open_id，都不能退化成"未知"。
-	const fallback =
-		base.msgType === "system"
-			? "系统"
-			: base.senderType === "app"
-				? "机器人"
-				: base.senderId
-					? `…${base.senderId.slice(-6)}`
-					: "未知";
-	return {
-		...base,
-		self,
-		senderLabel: self ? "我" : given || base.senderName || fallback,
-		preview: base.text,
-	};
+	return decorateMessageRow(base, { selfOpenId, names });
 }
 
 /** 从消息里推断单聊的对方：最近一条**不是自己发的**消息的发送人。 */

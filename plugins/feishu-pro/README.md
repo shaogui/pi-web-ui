@@ -7,19 +7,19 @@
 
 > 架构与迁移进度见 [`docs/lark-cli.md`](docs/lark-cli.md)。一句话：**凭证与接口交给官方 lark-cli，文档正文走 markdown 富文本渲染**。
 
-| 项         | 说明                                                                                                        |
-| ---------- | ----------------------------------------------------------------------------------------------------------- |
-| 二进制     | 自动发现：`PI_WEB_LARK_CLI_BIN` → 插件依赖 → `PATH` → **Trae 内置** → npx 缓存（`lark-cli --version` 探测） |
-| 凭证       | `lark-cli config init --new`（应用设备码）+ `lark-cli auth login --recommend`（个人设备码），存 OS keychain |
-| 文档阅读   | `docs +fetch --doc-format markdown` → 前端 markdown 渲染器（表格/标题/列表/代码块/待办/引用）               |
-| 其它云文档 | `docs +search` / `drive files list` / `wiki +space-list` / `wiki +node-list`                                |
-| 通讯录     | `contact +search-user`（搜人 + 批量回填姓名）/ `+get-user` / `api contact/v3/*`（部门与成员）               |
-| 会话       | `im +chat-list --types p2p,group`（**一次拿到群 + 单聊**）/ `im +chat-messages-list` / `im +messages-send`  |
-| 私聊定位   | `contact +search-user --user-ids` 返回的 `p2p_chat_id`（0 副作用，不发试探消息）                            |
-| AI 工具    | `feishu_pro` 十二个 action 全部 CLI 优先；`doc_read` 给模型 markdown（12k 截断），返回体带 `via` 标记       |
-| 唯一通道   | 只有 lark-cli：CLI 不可用就报可执行错误（装 / 配 / 登录），**没有 OpenAPI 回落**                            |
-| 排障开关   | `PI_WEB_LARK_CLI_DISABLE=1` 模拟「没装 CLI」（不探测、不起子进程）；打开后所有能力都会报 CLI 不可用         |
-| 设置页     | 新增「lark-cli」卡片：未安装 → 复制安装命令；未配置 → 配置应用；未登录 → 登录账号；就绪 → 显示版本与身份    |
+| 项         | 说明                                                                                                              |
+| ---------- | ----------------------------------------------------------------------------------------------------------------- |
+| 二进制     | 自动发现：`PI_WEB_LARK_CLI_BIN` → 插件依赖 → `PATH` → **Trae 内置** → npx 缓存（`lark-cli --version` 探测）       |
+| 凭证       | `lark-cli config init --new`（应用设备码）+ `lark-cli auth login --recommend`（个人设备码），存 OS keychain       |
+| 文档阅读   | `docs +fetch --doc-format markdown` → 前端 markdown 渲染器（表格/标题/列表/代码块/待办/引用）                     |
+| 其它云文档 | `docs +search` / `drive files list` / `wiki +space-list` / `wiki +node-list`                                      |
+| 通讯录     | `contact +search-user`（搜人 + 批量回填姓名）/ `+get-user` / `api contact/v3/*`（部门与成员）                     |
+| 会话       | `im +chat-list --types p2p,group`（**一次拿到群 + 单聊**）/ `im +chat-messages-list` / `im +messages-send`        |
+| 私聊定位   | `contact +search-user --user-ids` 返回的 `p2p_chat_id`（0 副作用，不发试探消息）                                  |
+| AI 工具    | `feishu_pro` 十二个 action 全部 CLI 优先；`doc_read` 给模型 markdown（12k 截断），返回体带 `via` 标记             |
+| 唯一通道   | 只有 lark-cli：CLI 不可用就报可执行错误（装 / 配 / 登录），**没有 OpenAPI 回落**                                  |
+| 排障开关   | `PI_WEB_LARK_CLI_DISABLE=1` 模拟「没装 CLI」（不探测、不起子进程）；打开后所有能力都会报 CLI 不可用               |
+| 设置页     | 「① lark-cli 与身份」三格状态：未安装 → 复制安装命令；未配置 → 配置应用；未登录 → 登录账号；就绪 → 显示版本与身份 |
 
 安装/配置三步（也可在设置页点按钮）：
 
@@ -31,23 +31,23 @@ lark-cli auth login --recommend       # 3. 登录个人账号（浏览器完成�
 
 ## 1. 它做什么
 
-| 能力                           | 用什么身份      | 说明                                                                                                                                                                                                            |
-| ------------------------------ | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 会话列表（**页签 1**）         | 个人 → 应用兜底 | `im/v1/chats` + `im/v1/messages`；左列表右消息，可发文本、可一键加入监听（见 §10）                                                                                                                              |
-| 通讯录 · 按关键词搜同事        | **个人授权**    | `search/v1/user`，可搜企业内任意同事（跨应用可见范围）                                                                                                                                                          |
-| 通讯录 · 行内「发消息」        | 应用身份        | 按 `open_id` 直发（`receive_id_type=open_id`），响应里的 `chat_id` 顺手登记为单聊                                                                                                                               |
-| 通讯录 · 行内「打开飞书」      | —               | applink `chat/open?openId=`，直接跳到与这个人的单聊（不依赖 chat_id）                                                                                                                                           |
-| 通讯录 · 可见范围 / 按部门浏览 | 应用身份        | 受应用「通讯录数据权限范围」限制；没配好时自动回落到个人身份，再不行就给可执行说明（不报红字）                                                                                                                  |
-| 云文档 · 搜索我的文档          | **个人授权**    | `suite/docs-api/search/object`，搜的是"我有权限的文档"                                                                                                                                                          |
-| 云文档 · 我的空间文件          | **个人授权**    | `drive/v1/files`（应用身份没有"我的空间"这个概念）                                                                                                                                                              |
-| 云文档 · 知识库目录            | 应用身份        | `wiki/v2/spaces` + 节点树，受知识库成员策略约束                                                                                                                                                                 |
-| 云文档 · 正文纯文本            | 有权限的那一方  | `docx/v1/documents/:id/raw_content`（只支持 docx）                                                                                                                                                              |
-| 权限探针                       | 两种身份各一组  | 一个接口一行，把 `code/msg` 原样带回来                                                                                                                                                                          |
-| `@` 提及补全                   | 同上            | 输入框里 `@` →「飞书文档」/「飞书通讯录」子菜单，选中后把引用写进光标处                                                                                                                                         |
-| 私聊提醒（**轮询**）           | **个人授权**    | `im/v1/messages` 增量拉取；首次只建基线不通知（飞书无「人类账号私聊」事件）                                                                                                                                     |
-| AI 工具 `feishu_pro`           | 同上            | `status/contacts/departments/doc_search/doc_list/doc_read/wikis/wiki_nodes/im_chats/im_messages/im_send/probe`                                                                                                  |
-| 待办（**页签 2**，0.12.0）     | 本地库 + 个人   | 本地待办库 + 飞书任务**双向**同步（新建可选同步飞书 / 编辑即 PATCH 回写）+ **后台定时自动同步与自动提取**（默认关）+ AI 逐条建议 + 一键处理；发送类动作先看草稿（见 §11、[`docs/todo-ai.md`](docs/todo-ai.md)） |
-| AI 工具 `feishu_todo`          | —               | `list/add/update/advise/handle/mute/sync/config`：让 AI 自己也能读写这份待办（`add` 可带 `to_feishu`）                                                                                                          |
+| 能力                            | 用什么身份      | 说明                                                                                                                                                                                                            |
+| ------------------------------- | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 会话列表（**页签 1**）          | 个人 → 应用兜底 | `im +chat-list` + `im +chat-messages-list`；左列表右消息，可发文本、可一键加入监听、可在本地检索（见 §10 / [`docs/chat-cache.md`](docs/chat-cache.md)）                                                         |
+| 通讯录 · 按关键词搜同事         | **个人授权**    | `search/v1/user`，可搜企业内任意同事（跨应用可见范围）                                                                                                                                                          |
+| 通讯录 · 行内「发消息」         | 应用身份        | 按 `open_id` 直发（`receive_id_type=open_id`），响应里的 `chat_id` 顺手登记为单聊                                                                                                                               |
+| 通讯录 · 行内「打开飞书」       | —               | applink `chat/open?openId=`，直接跳到与这个人的单聊（不依赖 chat_id）                                                                                                                                           |
+| 通讯录 · 可见范围 / 按部门浏览  | 应用身份        | 受应用「通讯录数据权限范围」限制；没配好时自动回落到个人身份，再不行就给可执行说明（不报红字）                                                                                                                  |
+| 云文档 · 搜索我的文档           | **个人授权**    | `suite/docs-api/search/object`，搜的是"我有权限的文档"                                                                                                                                                          |
+| 云文档 · 我的空间文件           | **个人授权**    | `drive/v1/files`（应用身份没有"我的空间"这个概念）                                                                                                                                                              |
+| 云文档 · 知识库目录             | 应用身份        | `wiki/v2/spaces` + 节点树，受知识库成员策略约束                                                                                                                                                                 |
+| 云文档 · 正文纯文本             | 有权限的那一方  | `docx/v1/documents/:id/raw_content`（只支持 docx）                                                                                                                                                              |
+| 权限探针                        | 两种身份各一组  | 一个接口一行，把 `code/msg` 原样带回来                                                                                                                                                                          |
+| `@` 提及补全                    | 同上            | 输入框里 `@` →「飞书文档」/「飞书通讯录」子菜单，选中后把引用写进光标处                                                                                                                                         |
+| 消息同步 / 私聊提醒（**轮询**） | **个人授权**    | 同一个轮询引擎拉单聊 + 群聊增量并落本地缓存；首次只建基线不通知，群消息默认只同步不打扰（见 §9、[`docs/message-sync.md`](docs/message-sync.md)）                                                                |
+| AI 工具 `feishu_pro`            | 同上            | `status/contacts/departments/doc_search/doc_list/doc_read/wikis/wiki_nodes/im_chats/im_messages/im_send/probe`                                                                                                  |
+| 待办（**页签 2**，0.12.0）      | 本地库 + 个人   | 本地待办库 + 飞书任务**双向**同步（新建可选同步飞书 / 编辑即 PATCH 回写）+ **后台定时自动同步与自动提取**（默认关）+ AI 逐条建议 + 一键处理；发送类动作先看草稿（见 §11、[`docs/todo-ai.md`](docs/todo-ai.md)） |
+| AI 工具 `feishu_todo`           | —               | `list/add/update/advise/handle/mute/sync/config`：让 AI 自己也能读写这份待办（`add` 可带 `to_feishu`）                                                                                                          |
 
 **明确不做**（留给原插件或干脆不做）：机器人长连接（事件订阅）、Webhook 卡片。
 
@@ -79,7 +79,7 @@ lark-cli auth login --recommend       # 3. 登录个人账号（浏览器完成�
 ## 3. 接入：交给 lark-cli 三步
 
 0.10.0 起插件不再自己建应用 / 拿 token / 起 OAuth 回调服务 —— 全部交给官方 `lark-cli`，
-插件只负责「发现二进制 → 跑命令 → 渲染结果」。设置页「lark-cli」卡片按三态给按钮：
+插件只负责「发现二进制 → 跑命令 → 渲染结果」。设置页「① lark-cli 与身份」按三态给按钮（只有“下一步”那一格出按钮）：
 
 | 状态   | 按钮         | 等价命令                                       |
 | ------ | ------------ | ---------------------------------------------- |
@@ -110,8 +110,15 @@ cp -r plugins/feishu-pro ~/.pi-web/plugins/
 
 装完后顶栏出现「🪶 飞书 Pro」。
 
-> 迭代提示：宿主 reload 只给 `index.mjs` 加 `?e=<epoch>` 缓存击穿，**`lib/*.mjs` 会被 Node ESM 缓存**。
-> 改了 `lib/` 下的文件要**重启服务**，只改 `index.mjs` / `client/entry.mjs` 用插件重载即可。
+> 迭代提示（踩过两次，务必按顺序）：
+>
+> 1. **运行时读的是数据目录那份**：插件从 `~/.pi-web/plugins/feishu-pro` 加载，不是仓库里的 `plugins/feishu-pro`。
+>    改完仓库代码要同步过去（`rsync -a --delete --exclude node_modules --exclude storage.json plugins/feishu-pro/ ~/.pi-web/plugins/feishu-pro/`
+>    （**务必带上 `--exclude storage.json`**：插件的持久状态——私聊提醒配置/水位/未读、`chats_info`、待办——都存在插件目录下的这个文件里，
+>    `--delete` 会连它一起删掉。真删过的，备份在 `~/.pi-web/plugin-backups/`。）），
+>    再在「插件」面板点「重新加载」；只重启服务不会带上仓库的改动。
+> 2. **`lib/*.mjs` 会被 Node ESM 缓存**：宿主 reload 只给 `index.mjs` 加 `?e=<epoch>`，`lib/` 的 `?v=` 是本插件自己写的。
+>    改了 `lib/` 必须把 `?v=` 与 `manifest.version` 一起 bump（否则新代码根本不会加载），或直接重启服务。
 
 ## 5. AI 工具 `feishu_pro`
 
@@ -126,7 +133,8 @@ action=doc_read        token + doc_type 读正文（docx 纯文本，超 2 万�
 action=wikis           知识库列表
 action=wiki_nodes      space_id + parent_node 列知识库节点
 action=im_chats        query/chat_types/limit/page_token 列会话（带 chatId、p2p|group、是否监听、未读数）
-action=im_messages     chat_id 或 open_id + limit/page_token/since 读最近消息（时间升序，自带发送者名）
+action=im_messages     chat_id 或 open_id + limit/page_token/since/refresh 读最近消息（默认走本地缓存，via=cache 表示没打飞书）
+action=im_search       query [+chat_id/since/limit] 在本地缓存的消息里检索（不打飞书，适合「刚才那句在哪」）
 action=im_send         chat_id 或 open_id + text [as=user|bot] [uuid] [dry_run] 发文本
 action=probe           跑两组探针，回报每个接口的真实可用性
 ```
@@ -138,14 +146,16 @@ action=probe           跑两组探针，回报每个接口的真实可用性
 上面这些 action 大多是「读」。要让 AI 真正**动手**（自动问答、定时提醒、定时推送；聚合类任务交给画布/DAG，不写进插件），需要两个写/读入口，
 它们与界面上的按钮**共用同一套服务端封装**（`sendChatText` / `readChatMessages`），口径不会两边漂：
 
-| 场景               | 调用                                                                                        |
-| ------------------ | ------------------------------------------------------------------------------------------- |
-| 先找到会话 id      | `{action:"im_chats", query:"产品", chat_types:"group"}` → `items[].chatId`                  |
-| 看某人最近说了什么 | `{action:"im_messages", open_id:"ou_…", limit:20}` → `items[]` 按时间升序，`self:true` 是我 |
-| 只看新的（增量）   | 加 `since:"2026-11-06T00:00:00Z"`（也接受秒/毫秒时间戳），或 `page_token` 往回翻页          |
-| 以我本人身份回一句 | `{action:"im_send", chat_id:"oc_…", text:"…", uuid:"reply-2026-11-06"}`                     |
-| 以机器人身份发     | 同上 + `as:"bot"`（机器人必须在会话里，否则 CLI 报错并被翻译成可执行提示）                  |
-| 上线前先看会发什么 | 同上 + `dry_run:true`（只校验 + 回执，不调用 CLI）                                          |
+| 场景               | 调用                                                                                                   |
+| ------------------ | ------------------------------------------------------------------------------------------------------ |
+| 先找到会话 id      | `{action:"im_chats", query:"产品", chat_types:"group"}` → `items[].chatId`                             |
+| 看某人最近说了什么 | `{action:"im_messages", open_id:"ou_…", limit:20}` → `items[]` 按时间升序，`self:true` 是我            |
+| 只看新的（增量）   | 加 `since:"2026-11-06T00:00:00Z"`（也接受秒/毫秒时间戳），或 `page_token` 往回翻页                     |
+| 找「刚才那句」     | `{action:"im_search", query:"链接"}` → 只翻本地缓存（后台轮询过的会话都在里面）                        |
+| 要最新而非缓存     | `im_messages` 加 `refresh:true`（默认缓存够新就直接给，见 [`docs/chat-cache.md`](docs/chat-cache.md)） |
+| 以我本人身份回一句 | `{action:"im_send", chat_id:"oc_…", text:"…", uuid:"reply-2026-11-06"}`                                |
+| 以机器人身份发     | 同上 + `as:"bot"`（机器人必须在会话里，否则 CLI 报错并被翻译成可执行提示）                             |
+| 上线前先看会发什么 | 同上 + `dry_run:true`（只校验 + 回执，不调用 CLI）                                                     |
 
 约定：
 
@@ -216,42 +226,46 @@ action=probe           跑两组探针，回报每个接口的真实可用性
 npx vitest run tests/unit/feishu-pro-*.test.ts
 ```
 
-| 文件                                                                            | 锁什么                                                                                                                                        |
-| ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `feishu-pro-core.test.ts`                                                       | 配置归一化幂等/白名单、文档链接拼装、`/state` 只给 cli + user、路由表（没有 `/config` `/oauth/*` `/probe`）                                   |
-| `feishu-pro-cli.test.ts`                                                        | CLI 发现/信封/错误分类/状态机/markdown 适配                                                                                                   |
-| `feishu-pro-cli-im.test.ts`                                                     | `im` 子命令的参数与解析、身份分界                                                                                                             |
-| `feishu-pro-cli-only.test.ts`                                                   | CLI 不可用时的可执行错误（install/config/login）、`/state` 无空壳字段、dm-watch 报 `no-channel`                                               |
-| `feishu-pro-tool-cli.test.ts`                                                   | `feishu_pro` 工具的 action 契约与 `via` 标记                                                                                                  |
-| `feishu-pro-dm-watch.test.ts`                                                   | 私聊提醒七条：首轮只建基线且落在最新一页、同一分钟不漏、seen 挤出后不重复计未读、积压只报最近几页并对齐水位、自己发的不报、单会话失败只落自己 |
-| `feishu-pro-dm-panel.test.ts`                                                   | 面板与 `/dm/state` · `/dm/config` · `/dm/poll` 的字段契约（jsdom 真 DOM）                                                                     |
-| `feishu-pro-chats.test.ts` / `-chats-view.test.ts` / `-contact-actions.test.ts` | 会话与联系人归一化、发送身份、列表/详情渲染                                                                                                   |
-| `feishu-pro-auto-reply.test.ts`                                                 | 自动问答的白名单/冷却/限频/空跑                                                                                                               |
-| `feishu-pro-settings-view.test.ts`                                              | 设置页三态按钮、旧卡片确实不在 DOM、无 CLI-only 勾选框                                                                                        |
-| `feishu-pro-todo.test.ts`                                                       | 待办归一幂等、来源去重、合并飞书任务不覆盖建议、动作白名单/无收件人不发/`ranAt` 存活、建议缓存与执行幂等、run 回收、提取去重                  |
-| `feishu-pro-todo-view.test.ts`                                                  | 待办页签：草稿二次确认、agent 的 confirm、打勾/回车/采纳候选、同步 warning、失败不清空列表                                                    |
+| 文件                                                                            | 锁什么                                                                                                                                                                 |
+| ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `feishu-pro-core.test.ts`                                                       | 配置归一化幂等/白名单、文档链接拼装、`/state` 只给 cli + user、路由表（没有 `/config` `/oauth/*` `/probe`）                                                            |
+| `feishu-pro-cli.test.ts`                                                        | CLI 发现/信封/错误分类/状态机/markdown 适配                                                                                                                            |
+| `feishu-pro-cli-im.test.ts`                                                     | `im` 子命令的参数与解析、身份分界                                                                                                                                      |
+| `feishu-pro-cli-only.test.ts`                                                   | CLI 不可用时的可执行错误（install/config/login）、`/state` 无空壳字段、dm-watch 报 `no-channel`                                                                        |
+| `feishu-pro-tool-cli.test.ts`                                                   | `feishu_pro` 工具的 action 契约与 `via` 标记                                                                                                                           |
+| `feishu-pro-dm-watch.test.ts`                                                   | 私聊提醒七条：首轮只建基线且落在最新一页、同一分钟不漏、seen 挤出后不重复计未读、积压只报最近几页并对齐水位、自己发的不报、单会话失败只落自己                          |
+| `feishu-pro-dm-panel.test.ts`                                                   | 面板与 `/dm/state` · `/dm/config` · `/dm/poll` 的字段契约（jsdom 真 DOM）                                                                                              |
+| `feishu-pro-chats.test.ts` / `-chats-view.test.ts` / `-contact-actions.test.ts` | 会话与联系人归一化、发送身份、列表/详情渲染                                                                                                                            |
+| `feishu-pro-auto-reply.test.ts`                                                 | 自动问答的白名单/冷却/限频/空跑                                                                                                                                        |
+| `feishu-pro-settings-view.test.ts`                                              | 设置页分区骨架（5 区 + 导航锚点）、① 三态只给下一步按钮、②③ 只渲染表单体（无嵌套卡）、卡底动作条（脏标记 / 撤销 / 保存）、④ 指标来自 `/sync/state`、清空缓存要二次确认 |
+| `feishu-pro-todo.test.ts`                                                       | 待办归一幂等、来源去重、合并飞书任务不覆盖建议、动作白名单/无收件人不发/`ranAt` 存活、建议缓存与执行幂等、run 回收、提取去重                                           |
+| `feishu-pro-todo-extract.test.ts`                                               | 提取来源**全局化**（缓存里有消息的会话都算，不再只看监听名单）、缓存分层读取（已缓存只读本地 / 一轮最多回源 2 个）、默认扫 8 个会话                                    |
+| `feishu-pro-todo-view.test.ts`                                                  | 待办页签：草稿二次确认、agent 的 confirm、打勾/回车/采纳候选、同步 warning、失败不清空列表                                                                             |
 
-## 9. 私聊提醒（轮询）
+## 9. 消息同步 / 私聊提醒（轮询）
 
-需求是「有人私聊我，插件要能知道」。飞书这条路是封的，先把边界说清：
+需求有两层：「有人私聊我，插件要能知道」，以及「群里的消息也要进本地缓存（列表预览、未读、离线检索、待办提取都靠它）」。
+飞书这条路是封的，先把边界说清：
 
 - 事件订阅 `im.message.receive_v1` **只推机器人收到的消息**，人类账号的私聊没有事件；
 - 没有「我的会话列表」「我的未读数」这类个人身份接口；
 - 所以唯一可行路径是：`user_access_token` 按间隔拉 `im/v1/messages` 增量（实现：`lib/dm-watch.mjs`）。
 
-| 项       | 取值 / 行为                                                                                            |
-| -------- | ------------------------------------------------------------------------------------------------------ |
-| 入口     | 设置页「3 · 私聊提醒」（`client/dm-panel.mjs`，独立模块）                                              |
-| 路由     | `GET /dm/state` · `POST /dm/config` · `POST /dm/poll` · `POST /dm/discover` · `POST /dm/read`          |
-| 间隔     | 30–900 秒（默认 60）；每轮最多 30 个会话，≈0.9 QPS                                                     |
-| 会话来源 | 手填 `oc_…`（逗号/换行分隔）+ 自动发现（`im +chat-list`，取 `chat_mode=p2p`）                          |
-| 取数方向 | **永远降序（`ByCreateTimeDesc` / `--order desc`），从最新往回翻**；单会话最多 3 页 × 50 条             |
-| 首次轮询 | **只建基线**：降序拿到的是最新一页 → 基线落在「现在」，不通知（否则一启用就刷屏）                      |
-| 积压     | 超过 3 页就当积压：只报最近 150 条，**水位直接对齐到最新**（宁可漏报旧历史，也不让提醒永远追着历史跑） |
-| 水位     | 毫秒存储 `{ ms, ids }`、`start_time` 传秒；不旧于水位即算候选（`<` 才丢）                              |
-| 边界去重 | `ids` = **该毫秒上已处理过的 message_id**，跟着水位一起落盘（每会话 200 条上限）                       |
-| 去重     | 另加全局 `seen`（600 条、跨会话滑动窗口）与基线页 id；自己发的不报                                     |
-| 失败隔离 | 单会话错误只记在 `/dm/state` 的该会话 `lastError` 上，不影响其它会话与下一轮                           |
+| 项       | 取值 / 行为                                                                                                                                                                                                               |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 入口     | 设置页「② 消息同步与提醒」（表单体 `client/sync-panel.mjs`，缓存/诊断数据在「④ 诊断与数据」= `client/diagnostics-panel.mjs`）＋ **会话页顶部状态条**（状态 + 立即同步 / 同步设置）                                        |
+| 路由     | 控制面 `/sync/state` · `/sync/config` · `/sync/run` · `/sync/clear`；引擎原口径 `GET /dm/state` · `POST /dm/{config,poll,discover,read}`                                                                                  |
+| 间隔     | 30–900 秒（默认 60）；每轮最多 30 个单聊 + 20 个群（**各自预算**），≈1.7 QPS                                                                                                                                              |
+| 会话来源 | 手填 `oc_…`（逗号/换行分隔）→ 自动发现单聊（`autoDiscover`）→ 自动发现群聊（`syncGroups`，**默认开**：群消息也要自动进缓存）                                                                                              |
+| 通知分线 | 手填会话一律弹；自动发现单聊看 `notify`；自动发现群看 `notify && notifyGroups`（默认静默，只同步）                                                                                                                        |
+| 取数方向 | **永远降序（`ByCreateTimeDesc` / `--order desc`），从最新往回翻**；单会话最多 3 页 × 50 条                                                                                                                                |
+| 首次轮询 | **只建基线**：降序拿到的是最新一页 → 基线落在「现在」，不通知（否则一启用就刷屏）                                                                                                                                         |
+| 积压     | 超过 3 页就当积压：只报最近 150 条，**水位直接对齐到最新**（宁可漏报旧历史，也不让提醒永远追着历史跑）                                                                                                                    |
+| 水位     | 毫秒存储 `{ ms, ids }`、`start_time` 传秒；不旧于水位即算候选（`<` 才丢）                                                                                                                                                 |
+| 边界去重 | `ids` = **该毫秒上已处理过的 message_id**，跟着水位一起落盘（每会话 200 条上限）                                                                                                                                          |
+| 去重     | 另加全局 `seen`（600 条、跨会话滑动窗口）与基线页 id；自己发的不报                                                                                                                                                        |
+| 失败隔离 | 单会话错误只记在 `/dm/state` 的该会话 `lastError` 上，不影响其它会话与下一轮                                                                                                                                              |
+| 内容落盘 | 每轮**每个**会话（私聊 + 群）拉到的消息都写进 `chats_msg_cache`，界面打开会话时直接读（见 [`docs/chat-cache.md`](docs/chat-cache.md)）；容量 = 60 会话 / 整份 1.25MB（必须 ≥ 一轮候选数，否则群会被裁掉）；内容没变不落盘 |
 
 > **0.10.21 修的两条真 bug**（症状：新消息提示与未读数对不上、「拉的不是最近一段」）：
 >
@@ -269,6 +283,8 @@ npx vitest run tests/unit/feishu-pro-*.test.ts
 > 提示重复弹。现在水位是 `{ ms, ids }`：**边界去重按会话、跟水位一起落盘**，
 > 全局 `seen` 只当第二道防线（重启 / 老数据迁移用）。实测：清空 `seen` 再轮询，边界消息不再复现。
 
+设计细节（候选优先级 / 预算 / 通知分线 / 控制面 / 排错）见 [`docs/message-sync.md`](docs/message-sync.md)。
+
 **已实测（2026-11，个人身份，企业自建应用）**：`im/v1/chats` 返回 **100 个群、0 个单聊** ——
 即使用 `user_access_token` 也**拿不到 p2p 会话**。所以「有人私聊我」这条路只能手填 `chat_id`
 （或让机器人参与该会话），面板/页签会直接这样提示，不再让人以为是权限没开够。
@@ -280,7 +296,7 @@ npx vitest run tests/unit/feishu-pro-*.test.ts
 
 | 项       | 取值 / 行为                                                                                                     |
 | -------- | --------------------------------------------------------------------------------------------------------------- |
-| 入口     | 设置页「私聊自动问答」卡片（紧跟在私聊提醒后面）                                                                |
+| 入口     | 设置页「③ 私聊自动问答」（导航里紧跟「消息同步与提醒」；表单体在 `client/auto-reply-panel.mjs`）                |
 | 路由     | `GET /auto/state` · `POST /auto/config` · `POST /auto/preview`                                                  |
 | 权限     | 新增 `chat` 能力（`host.chat` 无头投递）；能力清单变更会弹一次确认提示                                          |
 | 触发     | `dm-watch` 的 `onNew` → 引擎；**每轮只回每个会话的最后一条**（连发 3 条回 3 次是刷屏）                          |
@@ -299,17 +315,22 @@ npx vitest run tests/unit/feishu-pro-*.test.ts
 
 「会话」页签（`client/chats-view.mjs` + `lib/chats.mjs`）：左边会话、右边只读消息。
 
-| 项       | 取值 / 行为                                                                                                           |
-| -------- | --------------------------------------------------------------------------------------------------------------------- |
-| 路由     | `GET /chats` · `GET /chat/messages?chatId=` · `POST /chat/watch` · `POST /chat/p2p-resolve`（open_id → 私聊 chat_id） |
-| 身份     | 已登录个人身份 → `user_access_token`（能看到自己的会话）；未登录 → 应用身份兜底（只看群）                             |
-| 展示名   | 飞书单聊的 `name` 常为空 → 用「单聊 · `oc_` 尾巴」兜底；读到消息后升级成「与 X 的私聊」                               |
-| 消息     | `sort_type=ByCreateTimeDesc` 拉 40 条，界面展示时转成时间正序；自己的靠右                                             |
-| 姓名     | `contact/v3/users/batch` 补齐；失败只降级成 `…open_id尾巴`，不影响正文（`namesError`）                                |
-| 监听开关 | 直接改写 dm-watch 的 `chatIds`，所以列表里看到的就是轮询实际在看的会话                                                |
-| 分类     | 页签内分 **私聊 / 群聊 / 未识别**：`chat_mode` 已知的按它分；手填但查不到元信息的进「未识别」                         |
-| 排序     | **按最后一条消息时间倒序**（`im/v1/chats` 不给这个字段，只能逐会话拉 1 条，见下）                                     |
-| 发消息   | `POST /chat/send`，纯文本；**发送身份可切**（`as=user｜tenant`，见下）                                                |
+| 项       | 取值 / 行为                                                                                                                             |
+| -------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| 路由     | `GET /chats` · `GET /chat/messages?chatId=` · `GET /chat/search?q=` · `GET /chat/cache` · `POST /chat/watch` · `POST /chat/p2p-resolve` |
+| 身份     | 已登录个人身份 → `user_access_token`（能看到自己的会话）；未登录 → 应用身份兜底（只看群）                                               |
+| 展示名   | 飞书单聊的 `name` 常为空 → 用「单聊 · `oc_` 尾巴」兜底；读到消息后升级成「与 X 的私聊」                                                 |
+| 消息     | **缓存优先**：先出本地缓存（切回来 0 等待），后台按 `--start` 只补增量；首次打开才等一次 CLI                                            |
+| 姓名     | CLI 已给 `sender.name`；缺的才 `contact +search-user --user-ids` 查一次并记 7 天（`chats_names_cache`）；失败只降级成 `…open_id尾巴`    |
+| 监听开关 | 直接改写 dm-watch 的 `chatIds`，所以列表里看到的就是轮询实际在看的会话                                                                  |
+| 分类     | 页签内分 **私聊 / 群聊 / 未识别**：`chat_mode` 已知的按它分；手填但查不到元信息的进「未识别」                                           |
+| 排序     | 按 `im +chat-list --sort active_time`（CLI 已排好；不再逐会话拉 1 条预热）                                                              |
+| 列表预览 | 每行的「最后一条」来自本地缓存（后台轮询 / 打开过 / AI 读过的都算），不额外 spawn CLI                                                   |
+| 本地检索 | 顶部输入框 ≥2 字即查 `GET /chat/search`（**只翻缓存、不打飞书**）；AI 侧对应 `feishu_pro` 的 `im_search`                                |
+| 发消息   | `POST /chat/send`，纯文本；**发送身份可切**（`as=user｜tenant`，见下）；发完后台补一次增量，几百毫秒内可见                              |
+
+> 缓存机制（为什么选中会话不再等一会、为什么后台轮询与界面不再各拉一遍）：见
+> [`docs/chat-cache.md`](docs/chat-cache.md)。
 
 ### 发消息：两种身份（M1 已落地）
 
@@ -412,13 +433,15 @@ npx vitest run tests/unit/feishu-pro-*.test.ts
   写（**新建时勾「飞书」**才建远程任务并把 guid 记进 `ref`；之后改标题/描述/截止、勾完成/重开都 PATCH 回写）。
   回写只动**真改过的字段**，失败只降级（本地已改 + 历史留 warning），CLI 不可用时面板照常可用。
 - **自动获取**：面板上「⏱ 自动」+ 间隔（15/30/60/120 分钟，默认**关**）——
-  后台定时拉飞书任务，并从监听的会话提取候选（候选落盘，回来点「记下」才入库）。
+  后台定时拉飞书任务，并从**本地缓存的会话消息**提取候选（候选落盘，回来点「记下」才入库）。
   顶栏「后台任务」里能看到下次时间，一键停止就是真停。
 - **建议**：`host.llm.complete`，一次一条，6 小时内不重复算；打开页签自动算最该看的 3 条。
   回包解析不假设干净（围栏/纯文本都能降级），动作类型是白名单。
 - **一键处理**：`reply`（先摊草稿再确认，幂等键防重发）/ `agent`（先 confirm，派一轮无头运行）/
   `insert`（插进对话输入框）/ `open`（打开链接）。
-- **提取**：从「会话」页监听的会话里读最近消息，让 AI 找「需要我做的事」，点「记下」才入库。
+- **提取**：来源是**全局**的，不是只看监听名单 —— 本地消息缓存里有过消息的会话（打开过的私聊 / 群聊 /
+  后台轮询写进来的）都算，按最后一条消息新到旧取前 8 个，让 AI 找「需要我做的事」。
+  已缓存的会话只读本地（零网络），没缓存的才回源一次 CLI（一轮最多 2 个）。点「记下」才入库。
 - **AI 工具 `feishu_todo`**：让 agent 自己也能记账、查账、推进（`handle kind=agent` 是真跑一轮；
   `config` 开关自动获取，`add` 带 `to_feishu` 才建远程任务）。
 

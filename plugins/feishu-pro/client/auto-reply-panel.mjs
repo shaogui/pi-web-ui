@@ -1,63 +1,52 @@
 /**
  * plugins/feishu-pro/client/auto-reply-panel.mjs
- * 「私聊自动问答」设置卡片：独立模块，与 dm-panel 同款骨架（.fp-card / .fp-* 变量）。
+ * 「私聊自动问答」的**表单体**（不含卡片外壳 —— 外壳由设置页 ③ 区提供）。
  *
  * 为什么要有这块 UI：自动回复是**唯一会以你本人名义自动开口**的能力。
  * 默认关闭、白名单为空则谁都不回 —— 打开它必须是人手动点的一次决定，
  * 所以面板上把「谁会被回 / 频率多少 / 会说什么」三件事都摊开给用户看。
+ *
+ * 0.15.0 改版：外壳（卡头、状态胶囊、卡底动作条）交给 `settings-view.mjs`，
+ * 这里只留控件 + 脏标记 + 保存；低频内容（预览、回复历史）收进折叠区。
  */
 
-import { apiBase } from "@pi-web-ui/plugin-sdk/client";
+import { apiBase, esc } from "@pi-web-ui/plugin-sdk/client";
 
 const BASE = apiBase("feishu-pro");
 const STYLE_ID = "fp-auto-styles";
 
 const STYLES = `
 .fp-auto{display:flex;flex-direction:column;gap:12px;}
-.fp-auto-badge{flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;margin-top:1px;border-radius:50%;font-size:11px;font-weight:700;color:var(--accent);background:var(--accent-soft);border:1px solid var(--accent);}
-.fp-auto-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12.5px;}
-.fp-auto-row > label{display:inline-flex;align-items:center;gap:6px;color:var(--text-dim);}
-.fp-auto-num{width:84px;padding:4px 8px;border-radius:7px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:12.5px;}
-.fp-auto-ids{width:100%;min-height:56px;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-family:var(--mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:12px;line-height:1.6;resize:vertical;word-break:break-all;}
-.fp-auto-sig{flex:1;min-width:160px;padding:5px 9px;border-radius:7px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:12.5px;}
-.fp-auto-state{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-dim);word-break:break-word;}
-.fp-auto-dot{width:8px;height:8px;border-radius:50%;background:var(--text-faint);flex:0 0 auto;}
-.fp-auto-dot.on{background:var(--accent);}
-.fp-auto-dot.err{background:var(--danger,#d0453a);}
-.fp-auto-msg{font-size:11.5px;color:var(--text-faint);line-height:1.7;word-break:break-word;}
-.fp-auto-msg.err{color:var(--danger,#d0453a);}
+.fp-auto .fp-auto-num{width:78px;text-align:center;}
+.fp-auto .fp-auto-ids{width:100%;min-height:58px;line-height:1.6;resize:vertical;word-break:break-all;}
+.fp-auto-state{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-dim);word-break:break-word;overflow-wrap:anywhere;}
+.fp-auto-dot{flex:0 0 auto;width:8px;height:8px;border-radius:50%;background:var(--text-faint);}
+.fp-auto-dot.on{background:var(--green);}
+.fp-auto-dot.err{background:var(--red);}
+.fp-auto-msg{font-size:11.5px;line-height:1.7;color:var(--text-faint);word-break:break-word;overflow-wrap:anywhere;}
+.fp-auto-msg.err{color:var(--red);}
+.fp-auto-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
 .fp-auto-list{display:flex;flex-direction:column;gap:6px;max-height:240px;overflow:auto;}
 .fp-auto-item{display:flex;flex-direction:column;gap:3px;padding:7px 9px;border-radius:8px;background:var(--bg);border:1px solid var(--border-soft);min-width:0;}
 .fp-auto-head{display:flex;gap:8px;align-items:baseline;font-size:11px;color:var(--text-faint);}
 .fp-auto-who{font-size:12px;font-weight:600;color:var(--text);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.fp-auto-ask,.fp-auto-reply{font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-word;}
+.fp-auto-ask,.fp-auto-reply{font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;}
 .fp-auto-ask{color:var(--text-dim);}
 .fp-auto-reply{color:var(--text);}
 .fp-auto-dry{color:var(--text-faint);font-style:italic;}
-.fp-auto-preview{width:100%;min-height:120px;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text-dim);font-family:var(--mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:11.5px;line-height:1.6;resize:vertical;}
+.fp-auto-preview{width:100%;min-height:130px;line-height:1.6;resize:vertical;}
 `;
 
-const BUTTON =
-	"padding:6px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-elev);color:var(--text);font-size:12.5px;cursor:pointer;";
-const BUTTON_PRIMARY =
-	"padding:6px 12px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:var(--accent-contrast,#fff);font-size:12.5px;font-weight:600;cursor:pointer;";
-
 function injectStyles() {
-	if (typeof document === "undefined") return;
-	if (document.getElementById(STYLE_ID)) return;
-	const style = document.createElement("style");
-	style.id = STYLE_ID;
-	style.textContent = STYLES;
-	document.head.appendChild(style);
+	if (typeof document === "undefined" || document.getElementById(STYLE_ID)) return;
+	const el = document.createElement("style");
+	el.id = STYLE_ID;
+	el.textContent = STYLES;
+	document.head.appendChild(el);
 }
 
-const esc = (value) =>
-	String(value ?? "").replace(
-		/[&<>"']/g,
-		(c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] ?? c,
-	);
-
-async function call(path, { method = "GET", body, timeoutMs = 30000 } = {}) {
+/** 兜底传输层：见 sync-panel.mjs 同名字段的注释（设置页会注入自己的 `call`）。 */
+async function localCall(path, { method = "GET", body, timeoutMs = 30_000 } = {}) {
 	const init = { method, credentials: "same-origin", signal: AbortSignal.timeout(timeoutMs) };
 	if (method !== "GET" && body !== undefined) {
 		init.headers = { "Content-Type": "application/json" };
@@ -84,56 +73,77 @@ function ago(ms) {
 }
 
 /**
- * 挂载面板。
+ * 挂载表单体。
+ *
  * @param {HTMLElement} container
+ * @param {object} [opts]
+ * @param {(path: string, init?: object) => Promise<any>} [opts.call] 传输层（不传就用自己的 fetch 封装）
+ * @param {(dirty: boolean) => void} [opts.onDirty] 脏标记变化（设置页据此显示卡底动作条）
+ * @returns {{ apply: (state: any) => void, refresh: () => Promise<any>, save: () => Promise<void>, revert: () => void, isDirty: () => boolean, destroy: () => void }}
  */
-export function mountAutoReplyPanel(container) {
-	if (!container || typeof container.appendChild !== "function") {
-		return { refresh: async () => {}, destroy: () => {} };
-	}
+export function mountAutoReplyPanel(container, opts = {}) {
+	const noop = {
+		apply: () => {},
+		refresh: async () => null,
+		save: async () => {},
+		revert: () => {},
+		isDirty: () => false,
+		destroy: () => {},
+	};
+	if (!container || typeof container.appendChild !== "function") return noop;
 	injectStyles();
+	const call = typeof opts.call === "function" ? opts.call : localCall;
 
-	const wrap = document.createElement("section");
-	wrap.className = "fp-card";
+	const wrap = document.createElement("div");
+	wrap.className = "fp-auto";
 	wrap.innerHTML = `
-		<div class="fp-card-head">
-			<span class="fp-auto-badge">AI</span>
-			<div class="fp-card-titles">
-				<span class="fp-card-title">私聊自动问答</span>
-				<span class="fp-card-desc">轮询到白名单会话里的新消息 → 跑一轮 agent → 以「我 / 机器人」身份回包。默认关闭；白名单为空则谁都不回。</span>
+		<div class="fp-form">
+			<div class="fp-field">
+				<div class="fp-field-label">开关</div>
+				<label class="fp-check"><input type="checkbox" class="fp-auto-enabled" /> 启用自动回复</label>
+				<label class="fp-check"><input type="checkbox" class="fp-auto-dry" /> 空跑（只记录不发）</label>
+			</div>
+			<div class="fp-field">
+				<div class="fp-field-label">回包身份</div>
+				<select class="fp-input fp-auto-as">
+					<option value="user">我（本人）</option>
+					<option value="bot">机器人</option>
+				</select>
+				<div class="fp-field-hint">以你本人身份回包时，对方看到的是你。</div>
+			</div>
+			<div class="fp-field">
+				<div class="fp-field-label">频率</div>
+				<label class="fp-check">冷却 <input type="number" class="fp-input fp-auto-num fp-auto-cooldown" min="0" max="3600" step="5" aria-label="冷却秒数" /> 秒</label>
+				<label class="fp-check">每小时上限 <input type="number" class="fp-input fp-auto-num fp-auto-cap" min="0" max="1000" step="1" aria-label="每小时上限" /></label>
 			</div>
 		</div>
-		<div class="fp-card-body fp-auto">
-			<div class="fp-auto-row">
-				<label><input type="checkbox" class="fp-auto-enabled" /> 启用自动回复</label>
-				<label><input type="checkbox" class="fp-auto-dry" /> 空跑（只记录不发）</label>
-				<label
-					>身份
-					<select class="fp-auto-num fp-auto-as">
-						<option value="user">我（本人）</option>
-						<option value="bot">机器人</option>
-					</select>
-				</label>
-				<label>冷却 <input type="number" class="fp-auto-num fp-auto-cooldown" min="0" max="3600" step="5" /> 秒</label>
-				<label>每小时上限 <input type="number" class="fp-auto-num fp-auto-cap" min="0" max="1000" step="1" /></label>
-			</div>
-			<div>
-				<div class="fp-auto-msg">允许自动回复的会话 ID（<code>oc_…</code>，逗号或换行分隔）。<b>空 = 一条都不回</b>。建议先用「空跑」跑一天，确认话术没问题再关掉。</div>
-				<textarea class="fp-auto-ids" spellcheck="false" placeholder="oc_0123456789abcdef0123456789abcdef"></textarea>
-			</div>
-			<div class="fp-auto-row">
-				<label style="flex:1;min-width:200px;">签名 <input class="fp-auto-sig fp-auto-signature" placeholder="（留空则不加，如：—— 由 AI 助理代回）" /></label>
-			</div>
-			<div class="fp-auto-row">
-				<button class="fp-auto-save" style="${BUTTON_PRIMARY}">保存并生效</button>
-				<button class="fp-auto-preview-btn" style="${BUTTON}">预览会发什么</button>
-				<span class="fp-auto-state"><span class="fp-auto-dot"></span><span class="fp-auto-state-text">读取中…</span></span>
-			</div>
-			<div class="fp-auto-msg fp-auto-hint"></div>
-			<textarea class="fp-auto-preview" readonly placeholder="点「预览会发什么」，选白名单里第一个会话拉最近一条消息，看看模型会收到什么提示词。"></textarea>
-			<div class="fp-auto-msg">最近自动回复</div>
-			<div class="fp-auto-list"><div class="fp-auto-msg">还没有记录</div></div>
+		<div class="fp-field">
+			<div class="fp-field-label">允许自动回复的会话</div>
+			<div class="fp-field-hint"><code>oc_…</code>，逗号或换行分隔。<b>空 = 一条都不回</b>。建议先用「空跑」跑一天，确认话术没问题再关掉。</div>
+			<textarea class="fp-input fp-mono fp-auto-ids" spellcheck="false" placeholder="oc_0123456789abcdef0123456789abcdef"></textarea>
+			<div class="fp-field-hint fp-auto-count"></div>
 		</div>
+		<div class="fp-field">
+			<div class="fp-field-label">签名</div>
+			<input class="fp-input fp-auto-signature" placeholder="（留空则不加，如：—— 由 AI 助理代回）" />
+		</div>
+		<details class="fp-fold">
+			<summary>预览会发什么</summary>
+			<div class="fp-fold-body">
+				<div class="fp-auto-row">
+					<button class="fp-btn fp-btn-sm fp-auto-preview-btn" type="button">预览白名单第一个会话</button>
+				</div>
+				<textarea class="fp-input fp-mono fp-auto-preview" readonly placeholder="点上面的按钮：选白名单里第一个会话拉最近一条消息，看看模型会收到什么提示词。"></textarea>
+			</div>
+		</details>
+		<div class="fp-auto-state"><span class="fp-auto-dot"></span><span class="fp-auto-state-text">读取中…</span></div>
+		<div class="fp-auto-msg fp-auto-hint"></div>
+		<details class="fp-fold">
+			<summary>最近自动回复</summary>
+			<div class="fp-fold-body">
+				<div class="fp-auto-list"><div class="fp-auto-msg">还没有记录</div></div>
+			</div>
+		</details>
 	`;
 	container.appendChild(wrap);
 
@@ -144,29 +154,50 @@ export function mountAutoReplyPanel(container) {
 	const elCooldown = $(".fp-auto-cooldown");
 	const elCap = $(".fp-auto-cap");
 	const elIds = $(".fp-auto-ids");
+	const elCount = $(".fp-auto-count");
 	const elSig = $(".fp-auto-signature");
 	const elStateText = $(".fp-auto-state-text");
 	const elDot = $(".fp-auto-dot");
 	const elHint = $(".fp-auto-hint");
 	const elPreview = $(".fp-auto-preview");
 	const elList = $(".fp-auto-list");
-	const btnSave = $(".fp-auto-save");
 	const btnPreview = $(".fp-auto-preview-btn");
 
 	let busy = false;
 	let disposed = false;
 	let state = null;
+	let dirty = false;
+
+	function markDirty(next) {
+		if (dirty === next) return;
+		dirty = next;
+		opts.onDirty?.(dirty);
+	}
+
+	/** 白名单里到底有几个 oc_：省得用户自己数（空 = 谁都不回，最危险的那种"看起来配好了"）。 */
+	function paintCount(value) {
+		const ids = String(value || "")
+			.split(/[\s,;]+/)
+			.map((s) => s.trim())
+			.filter((s) => s.startsWith("oc_"));
+		elCount.textContent = ids.length ? `已识别 ${ids.length} 个会话` : "还没有填会话 → 谁都不会被自动回复";
+		elCount.className = `fp-field-hint fp-auto-count${ids.length ? "" : " err"}`;
+		return ids;
+	}
 
 	function paint() {
 		if (!state) return;
 		const cfg = state.config || {};
-		elEnabled.checked = Boolean(cfg.enabled);
-		elDry.checked = Boolean(cfg.dryRun);
-		elAs.value = cfg.as === "bot" ? "bot" : "user";
-		elCooldown.value = String(cfg.cooldownSec ?? 20);
-		elCap.value = String(cfg.maxPerHour ?? 20);
-		elIds.value = String(cfg.chatIds ?? "");
-		elSig.value = String(cfg.signature ?? "");
+		if (!dirty) {
+			elEnabled.checked = Boolean(cfg.enabled);
+			elDry.checked = Boolean(cfg.dryRun);
+			elAs.value = cfg.as === "bot" ? "bot" : "user";
+			elCooldown.value = String(cfg.cooldownSec ?? 20);
+			elCap.value = String(cfg.maxPerHour ?? 20);
+			elIds.value = String(cfg.chatIds ?? "");
+			elSig.value = String(cfg.signature ?? "");
+		}
+		paintCount(elIds.value);
 
 		const error = state.lastError || "";
 		elDot.className = `fp-auto-dot${error ? " err" : cfg.enabled ? " on" : ""}`;
@@ -196,7 +227,7 @@ export function mountAutoReplyPanel(container) {
 							<div class="fp-auto-head"><span>${esc(ago(r.at))}</span><span class="fp-auto-who">${esc(
 								r.from || r.chatName || r.chatId,
 							)}</span>${r.dryRun ? '<span class="fp-auto-dry">空跑</span>' : ""}${
-								r.error ? `<span class="fp-auto-dry" style="color:var(--danger,#d0453a)">${esc(r.error)}</span>` : ""
+								r.error ? `<span class="fp-auto-dry" style="color:var(--red)">${esc(r.error)}</span>` : ""
 							}</div>
 							<div class="fp-auto-ask">← ${esc(r.ask)}</div>
 							<div class="fp-auto-reply">→ ${esc(r.reply || "（未发送）")}</div>
@@ -206,14 +237,22 @@ export function mountAutoReplyPanel(container) {
 			: `<div class="fp-auto-msg">还没有记录</div>`;
 	}
 
+	function apply(next) {
+		if (!next) return;
+		state = next;
+		paint();
+	}
+
 	async function refresh() {
-		if (disposed) return;
+		if (disposed) return null;
 		try {
-			state = await call("/auto/state");
-			paint();
+			const payload = await call("/auto/state");
+			apply(payload);
+			return payload;
 		} catch (err) {
 			elHint.textContent = `读取失败：${err?.message || err}`;
 			elHint.className = "fp-auto-msg fp-auto-hint err";
+			return null;
 		}
 	}
 
@@ -230,7 +269,7 @@ export function mountAutoReplyPanel(container) {
 	}
 
 	async function withBusy(fn) {
-		if (busy) return;
+		if (busy || disposed) return;
 		busy = true;
 		try {
 			await fn();
@@ -242,19 +281,25 @@ export function mountAutoReplyPanel(container) {
 		}
 	}
 
-	btnSave?.addEventListener("click", () =>
-		withBusy(async () => {
-			state = await call("/auto/config", { method: "POST", body: patch() });
-			paint();
-		}),
-	);
+	/** 保存并生效：由设置页的卡底动作条调用。 */
+	async function save() {
+		await withBusy(async () => {
+			const payload = await call("/auto/config", { method: "POST", body: patch() });
+			markDirty(false);
+			apply(payload);
+			elHint.textContent = payload.config?.enabled ? "已保存并生效" : "已保存（当前是关闭状态）";
+			elHint.className = "fp-auto-msg fp-auto-hint";
+		});
+	}
+
+	function revert() {
+		markDirty(false);
+		paint();
+	}
 
 	btnPreview?.addEventListener("click", () =>
 		withBusy(async () => {
-			const ids = String(elIds.value || "")
-				.split(/[\s,;]+/)
-				.map((s) => s.trim())
-				.filter((s) => s.startsWith("oc_"));
+			const ids = paintCount(elIds.value);
 			if (!ids.length) {
 				elHint.textContent = "先在白名单里填一个 oc_ 会话 ID，预览才知道要看哪个会话。";
 				elHint.className = "fp-auto-msg fp-auto-hint err";
@@ -267,10 +312,25 @@ export function mountAutoReplyPanel(container) {
 		}),
 	);
 
+	for (const el of [elEnabled, elDry, elAs, elCooldown, elCap, elIds, elSig]) {
+		el?.addEventListener("input", () => {
+			markDirty(true);
+			if (el === elIds) paintCount(elIds.value);
+		});
+		el?.addEventListener("change", () => {
+			markDirty(true);
+			if (el === elIds) paintCount(elIds.value);
+		});
+	}
+
 	void refresh();
 
 	return {
+		apply,
 		refresh,
+		save,
+		revert,
+		isDirty: () => dirty,
 		destroy() {
 			disposed = true;
 			wrap.remove();

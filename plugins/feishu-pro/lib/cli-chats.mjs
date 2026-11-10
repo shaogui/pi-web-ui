@@ -8,8 +8,8 @@
  * 发送是唯一不做"失败回落"的写操作：回落等于可能发两遍（血泪教训见 lib/chats.mjs 注释）。
  */
 
-import { MAX_PAGES_PER_CHAT, POLL_PAGE_SIZE, isValidChatId } from "./dm-watch.mjs?v=0.12.0";
-import { normalizeChatEntries, normalizeMessageRow } from "./chats.mjs?v=0.12.0";
+import { MAX_PAGES_PER_CHAT, POLL_PAGE_SIZE, isValidChatId } from "./dm-watch.mjs?v=0.14.1";
+import { normalizeChatEntries, normalizeMessageRow } from "./chats.mjs?v=0.14.1";
 import { getUsersByIds, normalizeCliUser } from "./cli-contacts.mjs";
 
 /** CLI 身份取值：`--as user|bot`；插件内部仍用 user/tenant 口径。 */
@@ -65,7 +65,7 @@ export async function fetchChats(run, { as = "user", pageSize = 100, pageToken =
 export async function fetchChatMessages(
 	run,
 	chatId,
-	{ as = "user", pageSize = 30, pageToken = "", selfOpenId = "" } = {},
+	{ as = "user", pageSize = 30, pageToken = "", selfOpenId = "", startMs = 0 } = {},
 ) {
 	const id = String(chatId ?? "").trim();
 	if (!isValidChatId(id)) throw new Error("会话 ID 不合法（应为 oc_ 开头）");
@@ -83,6 +83,10 @@ export async function fetchChatMessages(
 		"--no-reactions",
 	];
 	if (pageToken) args.push("--page-token", String(pageToken));
+	// 增量刷新：只取比本地缓存最新一条更新的消息（默认路径就是「打开会话 → 后台补几条」，
+	// 不必每次把整页 40 条重新搬一遍）。时间口径与 dm-watch 一致：向下取整到秒，边界靠 id 去重。
+	const since = watermarkToIso(startMs);
+	if (since) args.push("--start", since);
 	const out = await run(args, { timeoutMs: 40_000 });
 	const data = out?.data ?? {};
 	// 快捷命令返回的是 `data.messages`（不是原生 API 的 `data.items`）。
@@ -97,6 +101,8 @@ export async function fetchChatMessages(
 		hasMore: Boolean(data.has_more),
 		pageToken: String(data.page_token ?? ""),
 		identity: internalIdentity(as),
+		// 调用方据此知道「这次是整页取数还是增量」：增量不该覆盖翻页游标/是否还有更早。
+		since: since || "",
 	};
 }
 

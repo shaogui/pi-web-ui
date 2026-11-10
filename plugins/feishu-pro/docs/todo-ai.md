@@ -124,10 +124,21 @@
 
 ## 5. 从消息里提取待办
 
-来源 = 「会话」页里**主动监听的会话**（飞书不给"我的全部私聊"，见 `docs/dm-watch-lark-cli-eval.md`）。
-每个会话读 20 条、最多 3 个会话、总消息 60 条（超了从最早的丢：最近的对话才会产生新待办）。
+来源是**全局**的：`listSources()` 给的是「本地消息缓存里有消息的会话」——打开过的私聊、群聊、
+后台轮询写进缓存的会话都算，再并上监听名单里还没被缓存的会话，按**最后一条消息新到旧**排。
+「我看过什么」就是「能提取什么」（飞书不给「我的全部聊天」，见 `docs/dm-watch-lark-cli-eval.md`）。
 
-回包是候选列表（不落库）：`{items:[{title, detail, dueAt, priority, reason}]}`。
+分层读是这一块的关键（缓存见 `docs/chat-cache.md`）：
+
+| 会话状态     | 读取方式                                            | 成本                                  |
+| ------------ | --------------------------------------------------- | ------------------------------------- |
+| 本地已有缓存 | `readMessages({cacheOnly:true})`，只读 `chat-cache` | 本地，零网络                          |
+| 本地没有缓存 | 回源一次 CLI（1–3s）                                | 一轮最多 `EXTRACT_CLI_FETCHES = 2` 个 |
+
+默认一次最多看 8 个会话（`EXTRACT_CHATS`）、每个会话 20 条、总消息 60 条
+（超了从最早的丢：最近的对话才会产生新待办）。
+
+同包是候选列表（不落库）：`{items:[{title, detail, dueAt, priority, reason}]}`。
 界面上点「记下」才 `POST /todos/create`（`source: "extract"`），已在库里的同名标题会被服务端过滤掉。
 
 ## 6. 飞书任务：双向同步（`lib/cli-tasks.mjs`）
@@ -165,7 +176,7 @@ PATCH /open-apis/task/v2/tasks/:task_guid   → { task: {...}, update_fields: [.
 
 - 配置存 `todos.config`，默认 `{autoSync:false, autoExtract:false}`。「⏱ 自动」一开关同时管两件事，
   间隔可选 **15 / 30 / 60 / 120 分钟**（`normalizeTodoConfig` 夹在 15–360）；
-- 一轮 = `sync()`（拉飞书任务）+ `extract()`（从监听会话提候选），候选落盘并 `notify` 一句；
+- 一轮 = `sync()`（拉飞书任务）+ `extract()`（从本地缓存的会话消息提候选），候选落盘并 `notify` 一句；
 - 时间口径是**纯函数** `autoNextAt()`：没跑过 → 立刻；过点（服务停了一晚）→ 立刻补一轮；否则 `lastRunAt + interval`；
 - `lastRunAt` 失败也写 —— 否则过点后每个 tick 都会重跑，变成热循环；
 - 定时器 `unref()`（不阻滞进程退出），插件卸载/重载时 `clearTimeout`；重复点击不会并发（服务层 `autoRunning` 门禁）；
@@ -185,7 +196,7 @@ PATCH /open-apis/task/v2/tasks/:task_guid   → { task: {...}, update_fields: [.
 | `POST /todos/advise`           | `{ids?, force?, limit≤3}` 生成建议                                            |
 | `POST /todos/mute`             | 清掉这条建议并静音                                                            |
 | `POST /todos/execute`          | `{id, actionId}` 执行动作                                                     |
-| `POST /todos/extract`          | 从监听会话提取候选（同时落盘；回包带 `pending` 供前端直接渲染）               |
+| `POST /todos/extract`          | 从本地缓存的会话消息提取候选（同时落盘；回包带 `pending` 供前端直接渲染）     |
 | `POST /todos/adopt`            | `{id}` 采纳一条候选（正文取服务端存过的那份）                                 |
 | `POST /todos/candidates-clear` | 收起全部候选（不建待办）                                                      |
 

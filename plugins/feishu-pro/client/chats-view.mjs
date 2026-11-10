@@ -22,7 +22,20 @@ const STYLES = `
 .fp-cv-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--border);}
 .fp-cv-q{flex:1;min-width:160px;padding:6px 10px;border-radius:7px;border:1px solid var(--border);background:var(--bg);color:var(--text);font:inherit;font-size:12px;outline:none;}
 .fp-cv-q:focus{border-color:var(--accent);}
+.fp-cv-find{flex:0 1 220px;min-width:120px;padding:6px 10px;border-radius:7px;border:1px solid var(--border);background:var(--bg);color:var(--text);font:inherit;font-size:12px;outline:none;}
+.fp-cv-find:focus{border-color:var(--accent);}
+.fp-cv-cache{font-size:10.5px;color:var(--text-faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:240px;}
+.fp-cv-hit{display:flex;flex-direction:column;gap:2px;padding:7px 9px;border-radius:8px;cursor:pointer;min-width:0;}
+.fp-cv-hit:hover{background:var(--bg-elev2);}
+.fp-cv-hit-head{display:flex;align-items:baseline;gap:6px;min-width:0;font-size:11px;color:var(--text-faint);}
+.fp-cv-hit-chat{color:var(--accent);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.fp-cv-hit-body{font-size:12px;line-height:1.55;color:var(--text);overflow-wrap:anywhere;}
+.fp-cv-hit mark{background:var(--accent-soft);color:var(--accent);border-radius:3px;padding:0 1px;}
 .fp-cv-count{font-size:11.5px;color:var(--text-dim);white-space:nowrap;}
+.fp-cv-sync{display:inline-flex;align-items:center;gap:6px;min-width:0;font-size:11px;color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:min(340px,40%);}
+.fp-cv-sync-dot{width:7px;height:7px;border-radius:50%;background:var(--text-faint);flex:0 0 auto;}
+.fp-cv-sync-dot.on{background:var(--accent);}
+.fp-cv-sync-dot.err{background:var(--danger,#d0453a);}
 .fp-cv-img{max-width:240px;max-height:240px;border-radius:8px;display:block;cursor:zoom-in;background:var(--bg-elev2);}
 .fp-cv-cardpop{position:fixed;inset:0;z-index:9998;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(0,0,0,.55);}
 .fp-cv-cardpop-box{width:320px;max-width:100%;border-radius:12px;border:1px solid var(--border);background:var(--bg-elev);box-shadow:0 16px 48px rgba(0,0,0,.45);overflow:hidden;}
@@ -127,6 +140,7 @@ function clockOf(ms) {
  * @param {HTMLElement} deps.panel  页签容器（`[data-panel="chats"]`）
  * @param {(path: string, init?: object) => Promise<any>} deps.call entry.mjs 的传输层
  * @param {(text: string, tone?: string) => void} [deps.say] 状态栏输出（entry 的 status.show）
+ * @param {() => void} [deps.onOpenSettings] 切到设置页（同步开关在那里，状态条只做入口）
  */
 /** 图片代理地址：任取一个 image key（富文本里的 `![Image](img_xxx)` 也走这里）。 */
 function mediaKeyUrl(row, key) {
@@ -190,7 +204,7 @@ export function richBubbleHtml(row) {
 	return `<div class="fp-cv-bubble">${esc(row.preview || row.text || "")}</div>`;
 }
 
-export function mountChatsView({ panel, call, say } = {}) {
+export function mountChatsView({ panel, call, say, onOpenSettings } = {}) {
 	if (!panel || typeof panel.appendChild !== "function" || typeof call !== "function") {
 		return { refresh: async () => {}, destroy: () => {} };
 	}
@@ -206,7 +220,15 @@ export function mountChatsView({ panel, call, say } = {}) {
 				<button class="fp-cv-seg" data-seg="group">群聊</button>
 			</div>
 			<input class="fp-cv-q" placeholder="筛选会话（名称 / oc_ 开头 ID）…" />
+			<input class="fp-cv-find" placeholder="搜索本地消息（回车 / 停一下自动搜）…" />
 			<button class="fp-cv-refresh" style="${BUTTON}">刷新列表</button>
+			<!-- 消息同步：状态 + 一键触发。开关在「设置 → 消息同步与提醒」（同一个引擎，不重复配置） -->
+			<span class="fp-cv-sync" title="后台消息同步（私聊 + 群）">
+				<span class="fp-cv-sync-dot"></span>
+				<span class="fp-cv-sync-text">同步状态读取中…</span>
+			</span>
+			<button class="fp-cv-sync-run" style="${BUTTON}" title="不等下一轮，现在就把候选会话拉一遍增量">立即同步</button>
+			<button class="fp-cv-sync-cfg" style="${BUTTON}" title="同步范围 / 间隔 / 提醒开关">同步设置</button>
 			<span class="fp-cv-count">未加载</span>
 		</div>
 		<div class="fp-cv-note fp-cv-hint" style="display:none"></div>
@@ -216,8 +238,10 @@ export function mountChatsView({ panel, call, say } = {}) {
 				<div class="fp-cv-rhead" style="display:none">
 					<span class="fp-cv-rtitle"></span>
 					<span class="fp-cv-rid"></span>
+					<span class="fp-cv-cache"></span>
 					<span style="flex:1"></span>
-					<button class="fp-cv-watch" style="${BUTTON}">监听</button>
+					<button class="fp-cv-reload" style="${BUTTON}" title="向飞书要最新的（不等后台轮询）">刷新</button>
+					<button class="fp-cv-watch" style="${BUTTON}" title="加入后台同步名单：这个会话的新消息会同步进本地缓存并弹提醒">加入同步</button>
 					<button class="fp-cv-open" style="${BUTTON}">在飞书中打开</button>
 				</div>
 				<div class="fp-cv-msgs"><div class="fp-cv-empty">左侧选一个会话查看消息</div></div>
@@ -239,11 +263,13 @@ export function mountChatsView({ panel, call, say } = {}) {
 
 	const $ = (sel) => root.querySelector(sel);
 	const elQ = $(".fp-cv-q");
+	const elFind = $(".fp-cv-find");
 	const elList = $(".fp-cv-list");
 	const elCount = $(".fp-cv-count");
 	const elSegs = root.querySelectorAll(".fp-cv-seg");
 	const elHint = $(".fp-cv-hint");
 	const elReaderHead = $(".fp-cv-rhead");
+	const elCache = $(".fp-cv-cache");
 	const elTitle = $(".fp-cv-rtitle");
 	const elRid = $(".fp-cv-rid");
 	const elMsgs = $(".fp-cv-msgs");
@@ -253,8 +279,17 @@ export function mountChatsView({ panel, call, say } = {}) {
 	const elIdents = root.querySelectorAll(".fp-cv-iseg");
 	const elWatch = $(".fp-cv-watch");
 	const elOpen = $(".fp-cv-open");
+	const elSyncText = $(".fp-cv-sync-text");
+	const elSyncDot = $(".fp-cv-sync-dot");
+	const elSyncRun = $(".fp-cv-sync-run");
+	const elSyncCfg = $(".fp-cv-sync-cfg");
 
 	let chats = [];
+	// 本地消息检索（`/chat/search`，只翻缓存）：`hits = null` 表示没在搜索态。
+	let hits = null;
+	let hitsQuery = "";
+	let hitsBusy = false;
+	let findTimer = null;
 	let counts = { total: 0, p2p: 0, groups: 0 };
 	let sections = { total: 0, p2p: 0, groups: 0, unknown: 0 };
 	let seg = "all"; // all | p2p | group
@@ -304,7 +339,7 @@ export function mountChatsView({ panel, call, say } = {}) {
 				btn.disabled = !authorized;
 				btn.title = authorized
 					? "以你本人的名义发送（需要 im:message + im:message.send_as_user）"
-					: "未完成个人授权：到「设置 → 个人授权」登录后可用；现在只能以机器人身份发";
+					: "未完成个人授权：到「设置 → lark-cli 与身份 → 登录账号」登录后可用；现在只能以机器人身份发";
 			}
 			if (!authorized && sendIdentity === "user") sendIdentity = "tenant";
 			paintIdentity();
@@ -385,12 +420,54 @@ export function mountChatsView({ panel, call, say } = {}) {
 					<span class="fp-cv-tag${chat.p2p ? " p2p" : ""}" title="${
 						chat.inferred ? `按消息推断（${esc(chat.inferReason || "证据不足")}）` : "来自会话信息接口"
 					}">${chat.p2p ? "私聊" : chat.mode === "group" ? "群" : "未识别"}${chat.inferred ? "~" : ""}</span>
-					${chat.watched ? `<span class="fp-cv-tag watch">监听中</span>` : ""}
+					${chat.watched ? `<span class="fp-cv-tag watch" title="在后台同步名单里">同步中</span>` : ""}
 				</div>
 			</div>`;
 	}
 
+	/** 检索命中行的渲染：会话名 + 谁说的 + 时间 + 高亮片段；点一下就跳到那个会话。 */
+	function hitHtml(hit) {
+		const needle = hitsQuery.trim();
+		const raw = String(hit.snippet || hit.text || "");
+		// 高亮只做「纯文本切分 + 转义」，不拼用户的原始字符串到 HTML 里。
+		let body = esc(raw);
+		if (needle) {
+			const safe = esc(needle);
+			body = body
+				.split(new RegExp(`(${safe.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "gi"))
+				.map((part, i) => (i % 2 === 1 ? `<mark>${part}</mark>` : part))
+				.join("");
+		}
+		return `
+			<div class="fp-cv-hit" data-chat="${esc(hit.chatId)}">
+				<div class="fp-cv-hit-head">
+					<span class="fp-cv-hit-chat">${esc(hit.chatName || hit.chatId)}</span>
+					<span>${esc(hit.from || "")}</span>
+					<span style="flex:1"></span>
+					<span class="fp-cv-time">${esc(clockOf(hit.at))}</span>
+				</div>
+				<div class="fp-cv-hit-body">${body || "（无正文）"}</div>
+			</div>`;
+	}
+
+	/** 检索态的画法：结果列表 + 「命中 N 条 / 搜了 M 条」；清空输入即回到会话列表。 */
+	function paintHits() {
+		const items = Array.isArray(hits) ? hits : [];
+		elCount.textContent = hitsBusy ? "检索本地缓存…" : `命中 ${items.length} 条 · 搜了本地缓存`;
+		if (items.length === 0) {
+			elList.innerHTML = `<div class="fp-cv-empty">${
+				hitsBusy ? "检索中…" : "本地缓存里没有命中：先打开相关会话（会拉一批并缓存），或等后台轮询预热"
+			}</div>`;
+			return;
+		}
+		elList.innerHTML = items.map(hitHtml).join("");
+	}
+
 	function paintList() {
+		if (hits !== null) {
+			paintHits();
+			return;
+		}
 		const items = visibleChats();
 		// 0.10.27：CLI 已按 active_time 排好序，旧的"预热最后消息 / 机器人分页发现"两个进度提示已删除。
 		elCount.textContent = `会话 ${sections.total}（私聊 ${sections.p2p} / 群 ${sections.groups}${
@@ -448,15 +525,18 @@ export function mountChatsView({ panel, call, say } = {}) {
 	}
 
 	/**
-	 * 未读徽标刷新：只拉 `/dm/state` 的 `unread` 表，不重扫会话列表。
+	 * 轮询引擎状态的刷新：**一次请求两个用途** —— 未读徽标 + 顶部同步状态条。
 	 * 为什么需要它：`/chats` 只在挂载 / 手动刷新时拉，别人的新消息（轮询累计）以前永远不冒出来，
 	 * 「未读数看着不对」有一半是这里 —— 数字是对的，只是**没刷新**。
+	 * 既然已经为此每 15s 问一次 `/dm/state`，就把「同步开没开 / 同步了几个会话」一并画上，
+	 * 否则用户在 webui 里只能看到「未读」，看不到引擎本身（这正是 0.14.0 要修的那个缺口）。
 	 */
-	async function refreshUnread() {
+	async function refreshPoller() {
 		if (disposed) return;
 		if (typeof document !== "undefined" && document.hidden) return;
 		try {
 			const payload = await call("/dm/state");
+			paintSyncState(payload);
 			const map = payload?.unread && typeof payload.unread === "object" ? payload.unread : {};
 			for (const chat of chats) {
 				const next = Number(map[chat.id]) || 0;
@@ -467,8 +547,38 @@ export function mountChatsView({ panel, call, say } = {}) {
 			// 正在看的会话又来了消息 → 用户就在屏幕前，立刻按已读处理
 			if (selected?.id && Number(map[selected.id]) > 0) markChatRead(selected.id);
 		} catch {
-			/* 未读刷新失败静默：下次再试，别为几个数字打断阅读 */
+			/* 未读/状态刷新失败静默：下次再试，别为几个数字打断阅读 */
 		}
+	}
+
+	/** 顶部同步状态条：开关 / 间隔 / 候选会话数 / 上轮结果（全部来自 /dm/state 的 candidates+lastPoll）。 */
+	function paintSyncState(state) {
+		if (!state) return;
+		const cfg = state.config || {};
+		const cand = state.candidates || {};
+		const last = state.lastPoll || {};
+		const err = state.lastError || "";
+		elSyncDot.className = `fp-cv-sync-dot${err ? " err" : state.running ? " on" : ""}`;
+		// 「立即同步」始终可用：它是 `/sync/run`（force），"不开定时同步、只想手动拉一把" 是正当用法。
+		if (!cfg.enabled) {
+			elSyncText.textContent = "同步未启用（可手动同步一次）";
+			elSyncText.title = "到「设置 → 消息同步与提醒」勾上「启用后台同步」";
+			return;
+		}
+		const parts = [`同步 ${cfg.intervalSec}s`];
+		if (cand.total) {
+			const bits = [];
+			if (cand.p2p) bits.push(`${cand.p2p} 私聊`);
+			if (cand.groups) bits.push(`${cand.groups} 群`);
+			parts.push(bits.join(" / ") || `${cand.total} 会话`);
+		} else {
+			parts.push("0 会话");
+		}
+		if (last.at) parts.push(`上轮 ${last.rows} 条 / 新增 ${last.fresh}`);
+		else if (state.lastPollAt) parts.push(`上次 ${ageLabel(state.lastPollAt)}`);
+		if (err) parts.push("异常");
+		elSyncText.textContent = parts.join(" · ");
+		elSyncText.title = err || "";
 	}
 
 	function paintReader() {
@@ -479,7 +589,10 @@ export function mountChatsView({ panel, call, say } = {}) {
 		elReaderHead.style.display = "";
 		elTitle.textContent = selected.label;
 		elRid.textContent = selected.id;
-		elWatch.textContent = selected.watched ? "停止监听" : "监听此人";
+		elWatch.textContent = selected.watched ? "移出同步" : "加入同步";
+		elWatch.title = selected.watched
+			? "移出同步名单（不再后台拉取 + 不再弹提醒）"
+			: "加入同步名单：这个会话的新消息会同步进本地缓存并弹提醒";
 		elWatch.setAttribute("style", selected.watched ? BUTTON_ON : BUTTON);
 		// 发消息：只有选中会话才解锁（能不能真发出去由服务端/飞书决定）
 		elInput.disabled = false;
@@ -559,17 +672,39 @@ export function mountChatsView({ panel, call, say } = {}) {
 	//
 	// 会话页没有推送通道，靠轮询当前会话做到「有新消息就自己冒出来」；
 	// 只在 tab 可见 + 会话没换 时才拉，且**没有新消息就不重绘**（避免滚动位置被打断）。
+	//
+	// 服务端已经把这些请求变成「读缓存 + 后台补增量」（`GET /chat/messages` 返回 `cache.refreshing`
+	// 表示它正在后台拉），所以这里的 5s 轮询几乎不产生 CLI 子进程；真正的体验瓶颈变成了
+	// 「切换会话那一下」—— 由下面的内存 `rowCache` 解决。
 
 	let refreshTimer = null;
 	// 未读徽标单独一条定时器：15s 只拉 unread 表，跟消息轮询（5s）解耦。
 	let unreadTimer = null;
+	// 服务端说「后台正在补增量」时的一次性快速重试（不是定时器，拿到就走）。
+	let followUpTimer = null;
 	let lastTopId = "";
+	// 会话 → 已渲染过的消息行：切回去先出内容，再等网络（这就是「切换会话不用再等」）。
+	const rowCache = new Map();
 
 	function stopAutoRefresh() {
 		if (refreshTimer) {
 			clearInterval(refreshTimer);
 			refreshTimer = null;
 		}
+		if (followUpTimer) {
+			clearTimeout(followUpTimer);
+			followUpTimer = null;
+		}
+	}
+
+	/** 缓存时间的人话：刚刚 / 23s 前 / 5 分钟前。 */
+	function ageLabel(ms) {
+		const n = Number(ms) || 0;
+		if (!n) return "";
+		if (n < 3000) return "刚刚";
+		if (n < 60_000) return `${Math.round(n / 1000)}s 前`;
+		if (n < 3600_000) return `${Math.round(n / 60_000)} 分钟前`;
+		return `${Math.round(n / 3600_000)} 小时前`;
 	}
 
 	/**
@@ -585,6 +720,37 @@ export function mountChatsView({ panel, call, say } = {}) {
 		void call("/dm/read", { method: "POST", body: { chatId: id } }).catch(() => {});
 	}
 
+	/** 服务端说「后台在补增量」时，过一次就快速回来看一眼（新消息通常在几百毫秒内落库）。 */
+	function scheduleFollowUp(chatId) {
+		if (followUpTimer) clearTimeout(followUpTimer);
+		followUpTimer = setTimeout(() => {
+			followUpTimer = null;
+			void refreshMessages(chatId);
+		}, 800);
+		followUpTimer?.unref?.();
+	}
+
+	/** 顶部的「本地缓存」标记：告诉用户这份内容是现拉的还是缓存里马上就有的。 */
+	function paintCacheHint(payload) {
+		const el = elCache;
+		if (!el) return;
+		const info = payload?.cache;
+		if (!info) {
+			el.textContent = "";
+			return;
+		}
+		const age = ageLabel(info.ageMs);
+		const parts = [];
+		parts.push(age ? `本地缓存 · ${age}` : "本地缓存");
+		if (Number(info.rows)) parts.push(`${Number(info.rows)} 条`);
+		if (info.refreshing) parts.push("刷新中…");
+		if (info.error) parts.push(`刷新失败：${info.error}`);
+		el.textContent = parts.join(" · ");
+		el.title = info.error
+			? `后台刷新失败：${info.error}（下面显示的是本地缓存内容）`
+			: "内容来自本地缓存；后台会自动补增量，点「刷新」立刻向飞书要最新的";
+	}
+
 	async function refreshMessages(chatId) {
 		if (disposed || !chatId || chatId !== selected?.id) return;
 		if (typeof document !== "undefined" && document.hidden) return;
@@ -594,6 +760,9 @@ export function mountChatsView({ panel, call, say } = {}) {
 			});
 			const rows = Array.isArray(payload.items) ? payload.items : [];
 			const topId = rows[0]?.id || "";
+			paintCacheHint(payload);
+			// 服务端在后台补增量 → 稍后再来一次（比等下个 5s 更跟手，也不会堆积请求）。
+			if (payload.refreshing) scheduleFollowUp(chatId);
 			if (topId && topId === lastTopId) return; // 无新消息：不重绘
 			// 有新消息落在这个打开着的会话里 → 立刻按已读处理（用户正看着，不该再计未读）
 			if (chats.find((c) => c.id === chatId)?.unread || Number(selected?.unread) > 0) markChatRead(chatId);
@@ -603,6 +772,7 @@ export function mountChatsView({ panel, call, say } = {}) {
 				paintList();
 				paintReader();
 			}
+			rowCache.set(chatId, rows);
 			// 用户停在底部附近就跟随到底，翻历史时保持位置
 			const nearBottom = elMsgs.scrollHeight - elMsgs.scrollTop - elMsgs.clientHeight < 60;
 			paintMessages(rows, { keepScroll: !nearBottom });
@@ -657,7 +827,7 @@ export function mountChatsView({ panel, call, say } = {}) {
 		}
 	}
 
-	async function openChat(id) {
+	async function openChat(id, { refresh = false } = {}) {
 		if (disposed) return;
 		stopAutoRefresh();
 		const chat = chats.find((c) => c.id === id);
@@ -672,19 +842,33 @@ export function mountChatsView({ panel, call, say } = {}) {
 		paintReader();
 		elInput.value = "";
 		setComposeHint("");
-		elMsgs.innerHTML = `<div class="fp-cv-empty">读取消息…</div>`;
+		if (elCache) elCache.textContent = "读取中…";
+		// 切回去先显示上一次看到的那些（内存缓存）：一毫秒就有内容，再等网络补最新的。
+		const remembered = rowCache.get(id) || [];
+		if (remembered.length) {
+			lastTopId = remembered[0]?.id || "";
+			paintMessages(remembered);
+		} else {
+			elMsgs.innerHTML = `<div class="fp-cv-empty">读取消息…</div>`;
+		}
 		try {
-			const payload = await call(`/chat/messages?chatId=${encodeURIComponent(id)}&limit=40`);
+			const payload = await call(
+				`/chat/messages?chatId=${encodeURIComponent(id)}&limit=40${refresh ? "&refresh=1" : ""}`,
+			);
 			// 打开会话**不改列表里的名字**（用户希望列表名保持原样，只在右侧标题按需展示）。
 			// 打开即视为已读：清掉服务端累计 + 本地徽标（/dm/read 的语义就是「我看到了」）。
 			markChatRead(id);
 			const rows = Array.isArray(payload.items) ? payload.items : [];
 			lastTopId = rows[0]?.id || "";
-			paintMessages(rows);
+			rowCache.set(id, rows);
+			paintMessages(rows, { keepScroll: remembered.length > 0 });
+			paintCacheHint(payload);
+			if (payload.refreshing) scheduleFollowUp(id);
 			setHint(payload.namesError ? `发送人姓名查询失败（不影响内容）：${payload.namesError}` : "");
 			startAutoRefresh(id);
 		} catch (err) {
-			elMsgs.innerHTML = "";
+			// 有内存缓存就别把内容清空：把失败原因写在标题旁边即可。
+			if (!remembered.length) elMsgs.innerHTML = "";
 			setHint(`读取消息失败：${err?.message || err}`, true);
 		}
 	}
@@ -812,6 +996,16 @@ export function mountChatsView({ panel, call, say } = {}) {
 	}
 
 	elList.addEventListener("click", (ev) => {
+		// 检索命中行：点一下就跳到那个会话（并退出检索态，不然列表还是命中列表）。
+		const hit = ev.target?.closest?.(".fp-cv-hit");
+		if (hit) {
+			const id = hit.getAttribute("data-chat") || "";
+			elFind.value = "";
+			hits = null;
+			hitsQuery = "";
+			if (id) void openChat(id);
+			return;
+		}
 		const row = ev.target?.closest?.(".fp-cv-row");
 		if (!row) return;
 		const id = row.getAttribute("data-chat") || "";
@@ -831,7 +1025,85 @@ export function mountChatsView({ panel, call, say } = {}) {
 		paintList();
 	});
 
+	/* --------------------------- 本地消息检索 --------------------------- */
+	//
+	// 数据来自 `GET /chat/search`：只翻本地缓存（后台轮询 + 打开过的会话 + AI 读过的），
+	// 不打飞书接口。所以它快、免费、离线也能用 —— 这是「拉回来的内容要能被二次检索」的落点。
+
+	async function runLocalSearch(query) {
+		const needle = String(query ?? "").trim();
+		hitsQuery = needle;
+		if (needle.length < 2) {
+			hits = null;
+			hitsBusy = false;
+			paintList();
+			return;
+		}
+		hitsBusy = true;
+		if (hits === null) hits = [];
+		paintHits();
+		try {
+			const payload = await call(`/chat/search?q=${encodeURIComponent(needle)}&limit=40`);
+			if (disposed || hitsQuery !== needle) return; // 期间又改了关键词：丢掉这次结果
+			hits = Array.isArray(payload.items) ? payload.items : [];
+			hitsBusy = false;
+			paintHits();
+		} catch (err) {
+			if (disposed) return;
+			hitsBusy = false;
+			hits = [];
+			elCount.textContent = "检索失败";
+			elList.innerHTML = `<div class="fp-cv-empty">本地检索失败：${esc(err?.message || err)}</div>`;
+		}
+	}
+
+	elFind.addEventListener("input", () => {
+		if (findTimer) clearTimeout(findTimer);
+		findTimer = setTimeout(() => {
+			findTimer = null;
+			void runLocalSearch(elFind.value);
+		}, 300);
+		findTimer?.unref?.();
+	});
+	elFind.addEventListener("keydown", (ev) => {
+		if (ev.key === "Enter") {
+			if (findTimer) {
+				clearTimeout(findTimer);
+				findTimer = null;
+			}
+			void runLocalSearch(elFind.value);
+		}
+		if (ev.key === "Escape") {
+			elFind.value = "";
+			void runLocalSearch("");
+		}
+	});
+
 	$(".fp-cv-refresh").addEventListener("click", () => void loadList());
+
+	/** 「刷新」按钮：向飞书要最新的（不等后台轮询），不清输入框里的草稿。 */
+	async function reloadSelected() {
+		if (!selected || busy) return;
+		const id = selected.id;
+		busy = true;
+		if (elCache) elCache.textContent = "刷新中…";
+		try {
+			const payload = await call(`/chat/messages?chatId=${encodeURIComponent(id)}&limit=40&refresh=1`);
+			if (disposed || selected?.id !== id) return;
+			const rows = Array.isArray(payload.items) ? payload.items : [];
+			lastTopId = rows[0]?.id || "";
+			rowCache.set(id, rows);
+			paintMessages(rows, { keepScroll: true });
+			paintCacheHint(payload);
+			setHint(payload.namesError ? `发送人姓名查询失败（不影响内容）：${payload.namesError}` : "");
+		} catch (err) {
+			setHint(`刷新失败：${err?.message || err}`, true);
+		} finally {
+			busy = false;
+		}
+	}
+
+	$(".fp-cv-reload").addEventListener("click", () => void reloadSelected());
 
 	elOpen.addEventListener("click", () => {
 		if (!selected) return;
@@ -897,18 +1169,79 @@ export function mountChatsView({ panel, call, say } = {}) {
 			if (row) row.watched = watch;
 			paintList();
 			paintReader();
-			say?.(watch ? "已加入私聊提醒轮询" : "已从私聊提醒中移除", "ok");
+			// 监听名单 = 手填的会话清单：这些会话无论单聊群聊都会进后台同步并弹提醒。
+			say?.(watch ? "已加入后台同步（这个会话的新消息会同步并提醒）" : "已从同步名单中移除", "ok");
 			if (payload?.dm && !payload.dm.config?.enabled) {
-				setHint("已加入监听名单，但轮询还没启用：到「设置 → 私聊提醒」勾上「启用轮询」");
+				setHint("已加入同步名单，但同步还没启用：到「设置 → 消息同步与提醒」勾上「启用后台同步」");
 			}
 		} catch (err) {
 			setHint(`监听设置失败：${err?.message || err}`, true);
 		}
 	});
 
-	// 挂载即刷一次未读，之后每 15s 跟一次（`/dm/state` 是内存状态，很轻）。
-	void refreshUnread();
-	unreadTimer = setInterval(() => void refreshUnread(), 15000);
+	/**
+	 * 同步跳过原因 → 人话（与设置页那张卡同一套口径）。
+	 * `busy` 是正常结果：手动同步与定时轮询共用一条路径，上一轮没跑完就会跳过。
+	 */
+	function skipSyncText(reason) {
+		switch (String(reason || "")) {
+			case "busy":
+				return "正在同步中（上一轮还没跑完），稍等一下";
+			case "no-channel":
+				return "lark-cli 未就绪：到「设置 → lark-cli」完成安装 / 配置 / 登录";
+			case "no-chats":
+				return "没有可同步的会话：到「同步设置」勾上同步范围或填 chat_id";
+			default:
+				return "没有新消息";
+		}
+	}
+
+	/* ---------------------- 顶部「立即同步 / 同步设置」 ---------------------- */
+	//
+	// 为什么要在会话页放这两个按钮：用户日常待在这个页签，以前只能去「设置」里摸到轮询开关，
+	// 在会话页看不到「同步到底开没开、刚同步了几条」—— 于是“新消息怎么不自己冒出来”只能靠猜。
+	// 这里只做「状态 + 一键触发」，**开关仍然只有一个地方**（设置页那张卡），避免两处配置打架。
+
+	let syncing = false;
+
+	async function runSyncNow() {
+		if (syncing) return;
+		syncing = true;
+		const label = elSyncRun.textContent;
+		elSyncRun.textContent = "同步中…";
+		elSyncRun.disabled = true;
+		try {
+			const payload = await call("/sync/run", { method: "POST", timeoutMs: 240_000 });
+			paintSyncState(payload);
+			const synced = payload?.synced || {};
+			if (synced.skipped) say?.(skipSyncText(synced.skipped));
+			else
+				say?.(
+					`${synced.waited ? "上一轮刚跑完" : "已同步"} ${synced.chats} 个会话 / ${synced.rows} 条消息，新增 ${
+						synced.fresh
+					} 条（首轮只建基线不提醒）`,
+					"ok",
+				);
+			// 同步完列表上的「最后一条」可能变了：只重绘当前列表的预览，不重拉会话列表（那是 CLI 子进程）。
+			await refreshPoller();
+		} catch (err) {
+			setHint(`同步失败：${err?.message || err}`, true);
+		} finally {
+			syncing = false;
+			elSyncRun.textContent = label;
+			elSyncRun.disabled = false;
+		}
+	}
+
+	elSyncRun.addEventListener("click", () => void runSyncNow());
+	elSyncCfg.addEventListener("click", () => {
+		if (typeof onOpenSettings === "function") onOpenSettings();
+		else setHint("到「设置 → 消息同步与提醒」里改同步范围与间隔", true);
+	});
+
+	// 挂载即刷一次（未读 + 同步状态），之后每 15s 跟一次（`/dm/state` 是内存状态，很轻）。
+	void refreshPoller();
+	unreadTimer = setInterval(() => void refreshPoller(), 15000);
 	unreadTimer?.unref?.();
 
 	return {
@@ -920,6 +1253,11 @@ export function mountChatsView({ panel, call, say } = {}) {
 				clearInterval(unreadTimer);
 				unreadTimer = null;
 			}
+			if (findTimer) {
+				clearTimeout(findTimer);
+				findTimer = null;
+			}
+			rowCache.clear();
 			closeLightbox();
 			closeMentionCard();
 			root.remove();

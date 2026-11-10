@@ -15,9 +15,9 @@
 import { apiBase, esc, hostApi } from "@pi-web-ui/plugin-sdk/client";
 // 文档渲染器：lark-cli 的 markdown / docx blocks 两种形态都能画（纯 vnode 层，无 innerHTML）。
 import { docPlainText, mountDocReader } from "./doc-reader.mjs";
-// 私聊提醒（轮询）面板：独立模块，不塞进下面那段巨型模板字符串。
-import { mountDmPanel } from "./dm-panel.mjs";
-import { mountAutoReplyPanel } from "./auto-reply-panel.mjs";
+// 设置页：分区导航 + 分组区（lark-cli 三态 / 同步 / 自动问答 / 诊断 / 关于）自己管 DOM，
+// entry 只提供传输层与 `/state` 缓存 —— 设置页的模板不再塞进这里那个巨型字符串。
+import { mountSettingsView } from "./settings-view.mjs";
 import { mountChatsView } from "./chats-view.mjs";
 // AI 待办页签：本地待办库 + AI 建议 + 一键让 AI 处理（独立模块，不塞进下面的巨型模板字符串）。
 import { mountTodoView } from "./todo-view.mjs";
@@ -240,61 +240,35 @@ const STYLES = `
 .fp-input::placeholder{color:var(--text-faint);}
 textarea.fp-input{resize:vertical;}
 select.fp-input{cursor:pointer;}
-/* 设置页骨架：单列卡片流，宽度收到 860 内保证可读行长 */
-.fp-settings{display:flex;flex-direction:column;gap:14px;width:100%;max-width:860px;margin:0 auto;padding:16px 16px 40px;}
-.fp-overview{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;}
-.fp-idcard{display:flex;align-items:center;gap:10px;min-width:0;padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:var(--bg-elev);}
-.fp-idcard-ico{flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:50%;font-size:14px;font-weight:600;color:var(--accent);background:var(--accent-soft);border:1px solid var(--border);}
-.fp-idcard-ico.on{color:var(--accent-contrast,#fff);background:var(--accent);}
-.fp-idcard-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px;}
-.fp-idcard-label{font-size:11px;color:var(--text-dim);}
-.fp-idcard-value{font-size:12.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.fp-idcard-sub{font-size:11px;color:var(--text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-/* 卡片 */
+/* 卡片（同步 / 自动问答面板与设置页分区共用骨架） */
 .fp-card{border:1px solid var(--border);border-radius:10px;background:var(--bg-elev);min-width:0;}
 .fp-card-head{display:flex;align-items:flex-start;gap:10px;padding:11px 14px;border-bottom:1px solid var(--border-soft);}
-.fp-card-step{flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;margin-top:1px;border-radius:50%;font-size:11px;font-weight:700;color:var(--accent);background:var(--accent-soft);border:1px solid var(--accent);}
 .fp-card-titles{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px;}
 .fp-card-title{font-size:13px;font-weight:600;}
 .fp-card-desc{font-size:11.5px;line-height:1.6;color:var(--text-dim);}
 .fp-card-body{display:flex;flex-direction:column;gap:12px;padding:14px;}
-.fp-note{font-size:11.5px;line-height:1.7;color:var(--text-dim);overflow-wrap:anywhere;}
-.fp-note.err{color:var(--red);}
-.fp-note.ok{color:var(--green);}
-.fp-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
-/* 键值行（账号状态） */
-.fp-kv{display:grid;grid-template-columns:auto minmax(0,1fr);gap:5px 14px;margin:0;font-size:11.5px;line-height:1.7;}
-.fp-kv dt{color:var(--text-dim);white-space:nowrap;}
-.fp-kv dd{margin:0;min-width:0;overflow-wrap:anywhere;word-break:break-word;}
-/* 设备码 */
-.fp-codebox{display:flex;flex-direction:column;align-items:center;gap:5px;padding:12px;border-radius:8px;border:1px dashed var(--accent);background:var(--accent-soft);}
-.fp-codevalue{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:22px;font-weight:700;letter-spacing:3px;color:var(--text);overflow-wrap:anywhere;text-align:center;}
-/* 等宽代码行（回调地址 / 标识符） */
-.fp-codeblock{display:flex;align-items:center;gap:8px;min-width:0;padding:7px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);}
-.fp-codeblock > code{flex:1;min-width:0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;line-height:1.6;color:var(--text);white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-all;}
-/* 折叠区 */
-.fp-fold{border:1px solid var(--border);border-radius:10px;background:var(--bg-elev);overflow:hidden;}
-.fp-fold > summary{display:flex;align-items:center;gap:8px;padding:10px 14px;cursor:pointer;font-size:12px;font-weight:600;color:var(--text-dim);list-style:none;}
-.fp-fold > summary::-webkit-details-marker{display:none;}
-.fp-fold > summary::after{content:"▾";margin-left:auto;font-size:11px;transition:transform .15s;}
-.fp-fold[open] > summary::after{transform:rotate(180deg);}
-.fp-fold > summary:hover{color:var(--text);}
-.fp-fold-body{display:flex;flex-direction:column;gap:12px;padding:0 14px 14px;}
-/* 表单栅格：窄屏单列，宽屏两列；标签在上、输入在下（标签不再被压成一行挤输入框） */
-.fp-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px 14px;}
+/* 卡底动作条：只有"改了但还没保存"时才出现（sticky 在卡内，不遮住上方控件） */
+.fp-card-foot{position:sticky;bottom:0;display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:9px 14px;border-top:1px solid var(--border);border-radius:0 0 10px 10px;background:var(--bg-elev);}
+.fp-card-foot-note{font-size:11.5px;line-height:1.6;color:var(--amber);}
+.fp-card-foot-actions{display:flex;gap:8px;margin-left:auto;}
+/* 表单栅格：标签在上、控件在下（窄屏自动单列，标签不再被压成一行挤输入框） */
+.fp-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px 16px;align-items:start;}
 .fp-field{display:flex;flex-direction:column;gap:5px;min-width:0;}
 .fp-field-wide{grid-column:1/-1;}
-.fp-field > label{font-size:11.5px;font-weight:600;color:var(--text-dim);}
-.fp-field-hint{font-size:11px;line-height:1.6;color:var(--text-faint);}
-.fp-divider{height:1px;background:var(--border-soft);}
-/* 探针结果 */
-.fp-probe{display:flex;flex-direction:column;gap:6px;font-size:11.5px;line-height:1.7;color:var(--text-dim);}
-.fp-probe-row{display:flex;gap:8px;align-items:baseline;min-width:0;}
-.fp-probe-detail{flex:1;min-width:0;color:var(--text-dim);overflow-wrap:anywhere;}
-.fp-probe-hint{padding-left:22px;color:var(--text-faint);overflow-wrap:anywhere;}
-/* 修复卡片：重定向 URL 未登记 */
-.fp-fix{display:flex;flex-direction:column;gap:8px;padding:11px 13px;border-radius:8px;border:1px solid var(--red);background:var(--red-soft);font-size:12px;line-height:1.7;overflow-wrap:anywhere;}
-.fp-hidden{display:none !important;}
+.fp-field-label{font-size:11px;font-weight:600;line-height:1.6;color:var(--text-dim);}
+.fp-field-hint{font-size:11px;line-height:1.65;color:var(--text-faint);overflow-wrap:anywhere;}
+.fp-field-hint.err{color:var(--red);}
+.fp-field-hint code,.fp-field-hint b{color:var(--text-dim);}
+.fp-check{display:inline-flex;align-items:center;gap:7px;min-width:0;font-size:12.5px;line-height:1.5;color:var(--text-dim);cursor:pointer;}
+.fp-mono{font-family:var(--mono);font-size:11.5px;}
+/* 折叠区（低频内容：手填 ID / 预览 / 历史） */
+.fp-fold{border:1px solid var(--border);border-radius:9px;background:var(--bg);overflow:hidden;}
+.fp-fold > summary{display:flex;align-items:center;gap:8px;padding:9px 12px;cursor:pointer;font-size:11.5px;font-weight:600;line-height:1.6;color:var(--text-dim);list-style:none;}
+.fp-fold > summary::-webkit-details-marker{display:none;}
+.fp-fold > summary::after{content:"▾";margin-left:auto;font-size:11px;color:var(--text-faint);transition:transform .15s;}
+.fp-fold[open] > summary::after{transform:rotate(180deg);}
+.fp-fold > summary:hover{color:var(--text);}
+.fp-fold-body{display:flex;flex-direction:column;gap:9px;padding:0 12px 12px;}
 `;
 
 /** 幂等注入样式表：视图被反复打开也只留一份。 */
@@ -400,39 +374,10 @@ function renderWorkbench(container) {
 			</div>
 		</div>
 
-		<!-- 设置：三步走（1 连接应用 → 2 登录账号 → 3 部署配置），使用者通常只动前两步 -->
-		<div class="fp-panel" data-panel="settings" style="flex:1;min-height:0;display:none;overflow:auto;">
-			<div class="fp-settings">
-<!-- 0 lark-cli：重构后的主通道（装 / 配 / 登录都交给官方 CLI） -->
-				<section class="fp-card">
-					<div class="fp-card-head">
-						<span class="fp-card-step">C</span>
-						<div class="fp-card-titles">
-							<span class="fp-card-title">lark-cli（官方 CLI 通道）</span>
-							<span class="fp-card-desc">凭证与接口都交给飞书官方 lark-cli；装好、配好、登录后，云文档与阅读走它。</span>
-						</div>
-						<span class="fp-pill fp-cli-pill">检测中</span>
-					</div>
-					<div class="fp-card-body fp-cli">
-						<div class="fp-note fp-cli-desc"></div>
-						<div class="fp-codebox fp-cli-code" style="display:none;">
-							<span class="fp-idcard-label fp-cli-codeLabel">在浏览器里完成配置 / 授权</span>
-							<a class="fp-codevalue fp-cli-url" href="#" target="_blank" rel="noopener noreferrer"></a>
-							<span class="fp-codevalue fp-cli-usercode" style="display:none;"></span>
-						</div>
-						<div class="fp-actions">
-							<span class="fp-field-hint fp-cli-mode" style="margin-right:auto;">固定模式：只走 lark-cli（无回落）</span>
-							<button class="fp-btn fp-btn-primary fp-cli-install">复制安装命令</button>
-							<button class="fp-btn fp-cli-config">配置应用</button>
-							<button class="fp-btn fp-cli-login">登录账号</button>
-							<button class="fp-btn fp-cli-refresh">重新检测</button>
-						</div>
-						<div class="fp-field-hint fp-cli-paths"></div>
-					</div>
-				</section>
-
-			</div>
-			</div>
+		<!-- 设置：分区导航 + 分组区，全部逻辑在 client/settings-view.mjs（entry 只给一个槽） -->
+		<div class="fp-panel" data-panel="settings" style="flex:1;min-height:0;display:none;overflow:hidden;">
+			<div class="fp-settings-slot" style="height:100%;min-height:0;"></div>
+		</div>
 	</div>`;
 	return container.querySelector(".fp-root");
 }
@@ -456,55 +401,6 @@ function statusWriter(root) {
 		},
 	};
 	return api;
-}
-
-/**
- * 状态轮询器：授权/连接在**另一个标签页**完成，本页按固定间隔拉状态。
- * 与宿主 MCP OAuth 弹窗同一套体验（"点一下就完成"，不需要用户回来粘贴）。
- *
- * @param {object} opts
- * @param {string} opts.path 轮询的接口路径
- * @param {(payload: any) => boolean} opts.isDone 判定"已完成"
- * @param {(payload: any) => void} opts.onTick 每次拿到状态
- * @param {(payload: any) => void} [opts.onDone]
- */
-function createStatusPoller({ path, intervalMs = 1500, ttlMs = 35 * 60_000, isDone, onTick, onDone }) {
-	let timer = null;
-	let deadline = 0;
-	const stop = () => {
-		if (timer) clearTimeout(timer);
-		timer = null;
-	};
-	const tick = async () => {
-		if (!timer) return;
-		if (Date.now() > deadline) {
-			stop();
-			return;
-		}
-		try {
-			const payload = await call(path, { timeoutMs: 8000 });
-			onTick?.(payload);
-			if (isDone?.(payload)) {
-				stop();
-				onDone?.(payload);
-				return;
-			}
-		} catch {
-			/* 一次拉取失败不打断轮询 */
-		}
-		timer = setTimeout(tick, intervalMs);
-	};
-	return {
-		start(customTtlMs) {
-			stop();
-			deadline = Date.now() + (customTtlMs ?? ttlMs);
-			timer = setTimeout(tick, 1200);
-		},
-		stop,
-		get active() {
-			return Boolean(timer);
-		},
-	};
 }
 
 function mount(el, _ctx) {
@@ -531,6 +427,8 @@ function mount(el, _ctx) {
 		panel: chatsPanel?.querySelector(".fp-chats-slot") ?? chatsPanel,
 		call,
 		say: (text, tone) => status.show(text, tone),
+		// 「会话」页的同步状态条需要“跳去设置改开关”：两个页签之间只有 entry 知道怎么切。
+		onOpenSettings: () => switchTab("settings"),
 	});
 	const docsPanel = root.querySelector('[data-panel="docs"]');
 	// 待办页：本地库 + AI 建议 + 动作执行，自己管 DOM；entry 只提供传输层与「插入输入框」。
@@ -542,10 +440,14 @@ function mount(el, _ctx) {
 		compose: (text) => insertToComposer(text),
 	});
 	const settingsPanel = root.querySelector('[data-panel="settings"]');
-	// 私聊提醒：挂到设置页卡片流的末尾（.fp-settings 是设置页骨架容器，找不到就挂面板本身）。
-	const dmPanel = mountDmPanel(settingsPanel?.querySelector(".fp-settings") ?? settingsPanel);
-	// 自动回复：紧跟在私聊提醒后面（要先有轮询，才谈得上自动回）。
-	const autoPanel = mountAutoReplyPanel(settingsPanel?.querySelector(".fp-settings") ?? settingsPanel);
+	// 设置页：分区导航 + 分组区（lark-cli 三态 / 同步 / 自动问答 / 诊断 / 关于），自己管 DOM。
+	// 只把传输层和 `/state` 缓存递进去：`/state` 只有一份（顶栏两枚胶囊也读它）。
+	const settingsView = mountSettingsView({
+		panel: settingsPanel?.querySelector(".fp-settings-slot") ?? settingsPanel,
+		call,
+		getInfo: () => state.info,
+		refreshInfo: () => refreshState(),
+	});
 	const contactList = root.querySelector(".fp-contact-list");
 	// 给每个联系人行补「发消息 / 打开飞书」两个动作（不侵入渲染函数）。
 	const contactActions = mountContactActions({
@@ -601,7 +503,6 @@ function mount(el, _ctx) {
 			const payload = await call("/state");
 			state.info = payload;
 			paintHeader();
-			paintCli();
 			return payload;
 		} catch (err) {
 			status.show(`读取插件状态失败：${err.message}`, "error");
@@ -761,7 +662,7 @@ function mount(el, _ctx) {
 				renderDocs(payload.items || [], "wiki");
 			}
 		} catch (err) {
-			docHint.textContent = err.needUser ? "这一步需要登录飞书账号：到「设置 → 登录飞书账号」" : "";
+			docHint.textContent = err.needUser ? "这一步需要登录飞书账号：到「设置 → lark-cli 与身份 → 登录账号」" : "";
 			docList.innerHTML = `<div style="padding:16px;color:var(--red,#f87171);font-size:12px;line-height:1.6;">${esc(err.message)}</div>`;
 		}
 	}
@@ -770,7 +671,7 @@ function mount(el, _ctx) {
 		if (!spaces.length) {
 			docList.innerHTML = asUser
 				? `<div style="padding:16px;color:var(--text-dim);font-size:12px;line-height:1.7;">你已经登录了飞书账号，但没有返回任何知识库。<br/>可能原因：该账号确实不在任何知识库成员里，或管理员限制了知识库接口。</div>`
-				: `<div style="padding:16px;color:var(--text-dim);font-size:12px;line-height:1.7;">应用身份读不到知识库列表。<br/>企业知识库通常是「私有」的，只有个人身份才能列出你被授权的那些 —— 去「设置 → 登录飞书账号」。</div>`;
+				: `<div style="padding:16px;color:var(--text-dim);font-size:12px;line-height:1.7;">应用身份读不到知识库列表。<br/>企业知识库通常是「私有」的，只有个人身份才能列出你被授权的那些 —— 去「设置 → lark-cli 与身份 → 登录账号」。</div>`;
 			return;
 		}
 		docList.innerHTML = spaces
@@ -842,100 +743,11 @@ function mount(el, _ctx) {
 			readerBody.classList.remove("fp-doc-render");
 			readerBody.style.color = "var(--red,#f87171)";
 			readerBody.textContent = err.needUser
-				? `${err.message}\n\n提示：应用身份读不到这篇文档时，通常需要文档所有者把应用加为协作者，或改用「个人授权」。`
+				? `${err.message}\n\n提示：应用身份读不到这篇文档时，通常需要文档所有者把应用加为协作者，或改用「登录个人账号」（设置 → lark-cli 与身份）。`
 				: err.message;
 		}
 	}
 
-	/* -------------------------------- 设置 -------------------------------- */
-
-	/* ------------------------------ lark-cli ------------------------------ */
-
-	/** lark-cli 卡片：状态 + 唯一「下一步」（装 / 配置 / 登录 / 就绪）。 */
-	function paintCli(cli = state.info?.cli) {
-		const pill = root.querySelector(".fp-cli-pill");
-		const desc = root.querySelector(".fp-cli-desc");
-		const paths = root.querySelector(".fp-cli-paths");
-		const codeBox = root.querySelector(".fp-cli-code");
-		const installBtn = root.querySelector(".fp-cli-install");
-		const configBtn = root.querySelector(".fp-cli-config");
-		const loginBtn = root.querySelector(".fp-cli-login");
-		if (!pill || !desc) return;
-		if (codeBox) codeBox.style.display = "none";
-		if (installBtn) installBtn.style.display = "none";
-		if (configBtn) configBtn.style.display = "none";
-		if (loginBtn) loginBtn.style.display = "none";
-
-		if (!cli) {
-			paintPill(pill, "fp-cli-pill", "未知", "warn");
-			desc.textContent = "读取 lark-cli 状态失败（插件服务端可能还是旧代码，到「插件」面板重新加载）。";
-			return;
-		}
-		if (!cli.installed) {
-			paintPill(pill, "fp-cli-pill", "未安装", "err");
-			desc.textContent = `没找到 lark-cli：在服务器终端执行 ${cli.installCommand || "npx @larksuite/cli@latest install"}，装完点「重新检测」。`;
-			if (installBtn) installBtn.style.display = "";
-		} else if (!cli.configured) {
-			paintPill(pill, "fp-cli-pill", "未配置应用", "err");
-			desc.textContent = `已找到 lark-cli ${cli.version || ""}（${cli.source || "本机"}），但还没配置应用凭证：点「配置应用」走官方设备码，或执行 ${cli.configCommand || "lark-cli config init --new"}。`;
-			if (configBtn) configBtn.style.display = "";
-		} else if (!cli.loggedIn) {
-			paintPill(pill, "fp-cli-pill", "未登录", "warn");
-			desc.textContent = "应用已配置，但还没登录个人账号：点「登录账号」拿验证链接（云文档与通讯录需要个人身份）。";
-			if (loginBtn) loginBtn.style.display = "";
-		} else {
-			const who = cli.users?.[0]?.name || cli.identity || "已登录";
-			paintPill(pill, "fp-cli-pill", "就绪", "ok");
-			desc.textContent = `lark-cli ${cli.version || ""}（${cli.source || "本机"}）已就绪：${who}。出问题会直接报 CLI 的真实错误（无回落）。`;
-		}
-		if (paths) {
-			const sources = (cli.candidates || []).map((c) => `${c.label || c.source}${c.ok ? ` ✓ ${c.version}` : " ✗"}`);
-			paths.textContent = cli.bin
-				? `二进制：${cli.bin}${sources.length ? `　候选：${sources.join(" · ")}` : ""}`
-				: sources.join(" · ");
-		}
-	}
-
-	/**
-	 * scope 摘要：整串 scope（可能几十项）不铺在界面上 —— 只给「几项 + 发消息能不能用」，
-	 * 完整列表走 tooltip。缺权限时点名缺的那几条（这才是有行动价值的）。
-	 */
-	function paintCliSetup(setup) {
-		const codeBox = root.querySelector(".fp-cli-code");
-		if (!codeBox) return;
-		if (!setup?.url && !setup?.userCode) {
-			codeBox.style.display = "none";
-			return;
-		}
-		codeBox.style.display = "";
-		const label = root.querySelector(".fp-cli-codeLabel");
-		if (label) {
-			label.textContent =
-				setup.step === "login"
-					? "浏览器授权：若只看到「任务」，切到「全部权限」勾选云文档 / 云空间 / 知识库 / 通讯录 / 消息"
-					: "在浏览器完成应用配置（新建或选择已有的飞书 CLI 应用）";
-		}
-		const urlEl = root.querySelector(".fp-cli-url");
-		if (urlEl) {
-			urlEl.textContent = setup.url || "";
-			urlEl.setAttribute("href", setup.url || "#");
-			urlEl.style.display = setup.url ? "" : "none";
-		}
-		const codeEl = root.querySelector(".fp-cli-usercode");
-		if (codeEl) {
-			codeEl.textContent = setup.userCode ? `设备码：${setup.userCode}` : "";
-			codeEl.style.display = setup.userCode ? "" : "none";
-		}
-		if (setup.url) {
-			try {
-				window.open(setup.url, "_blank", "noopener,noreferrer");
-			} catch {
-				/* 弹窗被拦就靠上面的链接 */
-			}
-		}
-	}
-
-	/** 连接飞书卡片：未连接 → 一个按钮；进行中 → 设备码 + 打开页面；完成 → 显示已就绪。 */
 	/* --------------------------------- 事件 --------------------------------- */
 
 	function switchTab(tab) {
@@ -954,7 +766,8 @@ function mount(el, _ctx) {
 		if (tab === "chats") void chatsView.refresh();
 		if (tab === "todos") void todoView.resume();
 		if (tab === "docs") void loadDocs();
-		if (tab === "settings") paintCli();
+		// 设置页自己拉 /state（顶栏胶囊也随之更新）与 /sync/state（诊断区）。
+		if (tab === "settings") void settingsView.refresh();
 	}
 
 	let debounce = null;
@@ -1072,38 +885,6 @@ function mount(el, _ctx) {
 			void loadDocs();
 			return;
 		}
-		if (button?.classList.contains("fp-cli-install")) {
-			const cmd = state.info?.cli?.installCommand || "npx @larksuite/cli@latest install";
-			const ok = await copyText(cmd);
-			status.show(
-				ok ? `已复制：${cmd}（在服务器终端执行后点「重新检测」）` : `请在服务器终端执行：${cmd}`,
-				ok ? "ok" : "error",
-			);
-			return;
-		}
-		if (button?.classList.contains("fp-cli-config") || button?.classList.contains("fp-cli-login")) {
-			const step = button.classList.contains("fp-cli-login") ? "login" : "config";
-			status.show(step === "login" ? "正在申请登录链接…" : "正在启动 lark-cli 配置…");
-			try {
-				const payload = await call("/cli/setup", { method: "POST", body: { step }, timeoutMs: 60000 });
-				paintCliSetup(payload.setup);
-				status.show(payload.setup?.hint || "已启动", "ok");
-			} catch (err) {
-				status.show(`启动失败：${err.message}`, "error");
-			}
-			return;
-		}
-		if (button?.classList.contains("fp-cli-refresh")) {
-			status.show("正在重新检测 lark-cli…");
-			try {
-				await call("/cli/refresh", { method: "POST", timeoutMs: 30000 });
-				await refreshState();
-				status.show("已重新检测", "ok");
-			} catch (err) {
-				status.show(`检测失败：${err.message}`, "error");
-			}
-			return;
-		}
 		if (button?.classList.contains("fp-reader-close")) {
 			reader.style.display = "none";
 			state.reading = null;
@@ -1142,17 +923,23 @@ function mount(el, _ctx) {
 		// 0.10.0 起只有 lark-cli 一条通道：按 install → config → login 三态引导，别让人在这里空等。
 		const cli = state.info?.cli;
 		if (!cli?.installed) {
-			status.show("没找到 lark-cli：到「设置 → lark-cli」点「复制安装命令」，装完点「重新检测」", "error");
+			status.show(
+				"没找到 lark-cli：到「设置 → lark-cli 与身份」点第 1 步的「复制安装命令」，装完点「重新检测」",
+				"error",
+			);
 			switchTab("settings");
 			return;
 		}
 		if (!cli.configured) {
-			status.show("lark-cli 还没配置应用：到「设置 → lark-cli」点「配置应用」（浏览器里走官方设备码）", "warn");
+			status.show(
+				"lark-cli 还没配置应用：到「设置 → lark-cli 与身份」点第 2 步的「配置应用」（浏览器里走官方设备码）",
+				"warn",
+			);
 			switchTab("settings");
 			return;
 		}
 		if (!cli.loggedIn) {
-			status.show("lark-cli 还没登录个人账号：到「设置 → lark-cli」点「登录账号」", "warn");
+			status.show("lark-cli 还没登录个人账号：到「设置 → lark-cli 与身份」点第 3 步的「登录账号」", "warn");
 			switchTab("settings");
 			return;
 		}
@@ -1171,12 +958,7 @@ function mount(el, _ctx) {
 			/* 容器已移除 */
 		}
 		try {
-			dmPanel?.destroy?.();
-		} catch {
-			/* 容器已移除 */
-		}
-		try {
-			autoPanel?.destroy?.();
+			settingsView?.destroy?.();
 		} catch {
 			/* 容器已移除 */
 		}

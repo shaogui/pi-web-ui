@@ -1,6 +1,6 @@
 /**
  * plugins/feishu-pro/lib/dm-watch.mjs
- * 轮询式「私聊提醒」：把「有人私聊我」变成插件能感知的事件。
+ * 轮询式「消息同步 / 私聊提醒」：把「有人给我发了消息」变成插件能感知的事件。
  *
  * 为什么只能轮询（这是飞书的产品边界，不是偷懒）：
  *   - 事件订阅 `im.message.receive_v1` **只推机器人收到的消息**，人类账号的私聊没有事件；
@@ -13,6 +13,12 @@
  *      发现结果本身也带诊断信息（total/p2p/groups），界面据此告诉用户"飞书没给单聊"。
  *   2. **首次轮询不能刷屏**：没有水位（watermark）的会话，第一次只**建基线**（把水位推到最新一条，
  *      不通知），之后只报比水位新的消息。否则一启用就把最近 50 条历史全弹一遍。
+ *      建基线只取**一页**（多翻的页会被缓存条数上限剪掉，纯白 spawn）—— 首轮 50 个会话的成本就靠这条压住。
+ *
+ * 0.14.0 起本模块同时承担**群消息同步**（`syncGroups`）：同一轮轮询里，单聊与群聊都拉增量、
+ * 都写进本地会话缓存（`onFetched`），区别只在于**要不要弹通知**（群默认静默，见 `pickNotifyRecords`）。
+ * 也就是说「消息同步」与「私聊提醒」是**同一个引擎的两个面**：一个控制面（`/sync/*`）、
+ * 一份水位、一份缓存；不存在第二套定时器，也就不会出现「两处各拉一遍」的配额浪费。
  *
  * 幂等与限流：
  *   - 水位存秒（飞书 create_time 是毫秒字符串，`im/v1/messages` 的 start_time 要秒）；
@@ -39,11 +45,20 @@ export const DM_HISTORY_KEY = "dm_watch_history";
 export const MIN_INTERVAL_SEC = 30;
 export const MAX_INTERVAL_SEC = 900;
 /**
- * 每轮最多轮询的会话数。
+ * 每轮最多轮询的**单聊**会话数（手填 / 监听名单也算在这个预算里）。
  * 从 10 提到 30：未读数要覆盖「全部单聊」（实测 26 个），30s 一轮 ≈ 0.9 QPS，
  * 仍远低于飞书 im/v1/messages 的限流；多出来的会话按 CLI 的 active_time 顺序排后面。
  */
 export const MAX_CHATS_PER_POLL = 30;
+/**
+ * 每轮最多轮询的**群聊**会话数（独立预算，不与单聊抢名额）。
+ *
+ * 为什么单开一份预算：群的数量通常远多于单聊，若共用一个 30 的上限，
+ * 26 个单聊就把名额吃光了，`syncGroups` 打开也等于没开。
+ * 成本口径（按 lark-cli 单次 spawn ≈ 25ms 实测）：30 单聊 + 20 群 = 50 次/轮，
+ * 60s 间隔 ≈ 每天 1.8 分钟 CPU（单核 0.13%）；30s 间隔 ≈ 0.25%，仍可接受。
+ */
+export const MAX_GROUPS_PER_POLL = 20;
 /** 已见 message_id 上限。 */
 export const SEEN_LIMIT = 600;
 /** 每会话每页取多少条（飞书 `im/v1/messages` 上限 50）。 */
@@ -76,8 +91,20 @@ export const DM_DEFAULT_CONFIG = {
 	chatIds: "",
 	/** 自动发现：用个人身份调 `im/v1/chats` 找 p2p 会话（可能返回空，见文件头）。 */
 	autoDiscover: true,
-	/** 新消息是否弹通知。 */
+	/**
+	 * 群聊是否也自动发现并纳入轮询（**默认开**：群消息也要自动进本地缓存）。
+	 *
+	 * 为什么敢默认开：
+	 *   - 群聊有**独立预算**（`MAX_GROUPS_PER_POLL`），不会和单聊抢名额；
+	 *   - 群消息默认**只同步不提醒**（`notifyGroups: false`）—— 拉取存在感最小；
+	 *   - 成本可算：30 单聊 + 20 群、60s 一轮 ≈ 每天 1.8 分钟 CPU（单核 0.13%）。
+	 * 关掉它只影响「后台自动拉」，不影响打开会话时的按需拉取。
+	 */
+	syncGroups: true,
+	/** 新消息是否弹通知（单聊提醒）。 */
 	notify: true,
+	/** 群消息是否也弹通知（默认关：同步不等于要打扰）。 */
+	notifyGroups: false,
 };
 
 const CHAT_ID_RE = /^oc_[A-Za-z0-9_-]{4,}$/;
@@ -128,7 +155,9 @@ export function normalizeDmConfig(input, base = DM_DEFAULT_CONFIG) {
 		identity,
 		chatIds: parseChatIds(pick("chatIds")).join(","),
 		autoDiscover: Boolean(pick("autoDiscover")),
+		syncGroups: Boolean(pick("syncGroups")),
 		notify: pick("notify") === undefined ? true : Boolean(pick("notify")),
+		notifyGroups: Boolean(pick("notifyGroups")),
 	};
 }
 
@@ -157,6 +186,79 @@ export function normalizeChatItems(items) {
 		if (!chat || seen.has(chat.id)) continue;
 		seen.add(chat.id);
 		out.push(chat);
+	}
+	return out;
+}
+
+/** 会话种类（候选集合、通知判定、界面展示的唯一口径）。 */
+export const CHAT_KINDS = ["p2p", "group", "unknown"];
+
+/**
+ * 本次轮询要拉哪些会话（纯函数，单测直接钉住）。
+ *
+ * 优先级与预算（这是「私聊和群消息的拉取机制」的核心规则）：
+ *   1. **手填 / 手动监听**（explicit）：用户明确要求的，最高优先级，群聊也一样；
+ *   2. **自动发现的单聊**：预算 `maxChats`（手填的单聊也算在里面）；
+ *   3. **自动发现的群聊**：预算 `maxGroups`，**独立计数** —— 否则单聊一多群就永远轮不到。
+ * 顺序也决定了「配额不够时先扔谁」：靠后的先被截掉（CLI 的 chat-list 已按 active_time 排序，
+ * 所以被截掉的通常是最近没说话的会话）。
+ *
+ * @param {{explicit?: string[], p2p?: string[], groups?: string[]}} [sources]
+ * @returns {{id: string, kind: "p2p"|"group"|"unknown", explicit: boolean}[]}
+ */
+export function buildPollCandidates({ explicit = [], p2p = [], groups = [] } = {}, options = {}) {
+	const maxChats = clampInt(options.maxChats, 1, 200, MAX_CHATS_PER_POLL);
+	const maxGroups = clampInt(options.maxGroups, 0, 200, MAX_GROUPS_PER_POLL);
+	const asIds = (value) => {
+		const out = [];
+		for (const item of Array.isArray(value) ? value : []) {
+			const id = text(item);
+			// 条目也可能已经是 `{ id }` 形状（发现结果为对象时调用方不必先拆）。
+			const raw = typeof item === "object" && item ? text(item.id) : id;
+			if (!isValidChatId(raw) || out.includes(raw)) continue;
+			out.push(raw);
+		}
+		return out;
+	};
+	const dmIds = asIds(p2p);
+	const groupIds = asIds(groups);
+	const dmSet = new Set(dmIds);
+	const groupSet = new Set(groupIds);
+	const kindOf = (id) => (dmSet.has(id) ? "p2p" : groupSet.has(id) ? "group" : "unknown");
+
+	const out = [];
+	const taken = new Set();
+	let dmCount = 0;
+	let groupCount = 0;
+	const push = (id, isExplicit) => {
+		if (!isValidChatId(id) || taken.has(id)) return;
+		taken.add(id);
+		out.push({ id, kind: kindOf(id), explicit: isExplicit });
+	};
+
+	for (const id of asIds(explicit)) {
+		if (out.length >= maxChats + maxGroups) break;
+		const kind = kindOf(id);
+		if (kind === "group") {
+			if (groupCount >= maxGroups) continue;
+			groupCount += 1;
+		} else {
+			if (dmCount >= maxChats) continue;
+			dmCount += 1;
+		}
+		push(id, true);
+	}
+	for (const id of dmIds) {
+		if (dmCount >= maxChats) break;
+		if (taken.has(id)) continue;
+		push(id, false);
+		dmCount += 1;
+	}
+	for (const id of groupIds) {
+		if (groupCount >= maxGroups) break;
+		if (taken.has(id)) continue;
+		push(id, false);
+		groupCount += 1;
 	}
 	return out;
 }
@@ -423,6 +525,28 @@ export function summarizeNewMessages(list) {
 	return `${who}：${preview}${more}`;
 }
 
+/**
+ * 本轮哪些新消息该**弹通知**（纯函数）。
+ *
+ * 规则（「同步」与「提醒」的分界线就在这里）：
+ *   - `notify = false` → 一条都不弹（同步照跑，缓存照写）；
+ *   - 手填 / 手动监听（explicit）→ 弹（用户明确要盯的，群也弹）；
+ *   - 群聊 → 只有 `notifyGroups` 打开才弹（默认静默：群消息量比私聊大一个量级）；
+ *   - 其余（自动发现的单聊）→ 弹。
+ */
+export function pickNotifyRecords(records, config, { explicitIds } = {}) {
+	const cfg = config || DM_DEFAULT_CONFIG;
+	if (!cfg.notify) return [];
+	const explicit = explicitIds instanceof Set ? explicitIds : new Set(parseChatIds(explicitIds ?? cfg.chatIds));
+	return (Array.isArray(records) ? records : []).filter((record) => {
+		const id = text(record?.chatId);
+		if (!id) return false;
+		if (explicit.has(id)) return true;
+		if (text(record?.chatKind) === "group") return Boolean(cfg.notifyGroups);
+		return true;
+	});
+}
+
 /** `/dm/state` 的缺省形状（界面可以先渲染再拿数据）。 */
 export function dmStateDefaults() {
 	return {
@@ -436,7 +560,10 @@ export function dmStateDefaults() {
 		busy: false,
 		pollCount: 0,
 		totalNew: 0,
+		lastPoll: { at: 0, chats: 0, rows: 0, fresh: 0, truncated: 0, errors: 0, backfill: 0 },
+		candidates: { total: 0, p2p: 0, groups: 0, explicit: 0 },
 		discovered: { total: 0, p2p: 0, groups: 0, at: 0, error: "" },
+		unread: {},
 		history: [],
 	};
 }
@@ -451,6 +578,17 @@ export function dmStateDefaults() {
  * @param {(level:string, text:string) => void} [deps.log]
  * @param {() => number} [deps.now]                  可注入时钟（单测）
  * @param {(list: object[]) => void} [deps.onNew]    额外回调（宿主可投给 agent）
+ * @param {(info: {chatId:string, rows: object[], identity:string, backfill:boolean}) => void} [deps.onFetched]
+ *        每拉到一个会话的消息就回调一次（不管新不新）：宿主用它把**内容**落进本地会话缓存，
+ *        界面打开会话时直接读缓存，不必为同一批消息再 spawn 一次 CLI。
+ *        `backfill=true` 表示这一页是**不带 `--start` 的最新一页**（宿主可据此认定缓存里有一屏了）。
+ * @param {(chatId: string) => boolean|Promise<boolean>} [deps.needsBackfill]
+ *        这个会话的本地缓存还缺「一整屏」（缓存不归本模块管，宿主才知道）。
+ *        返回 true 时**这一轮改拉最新一页**（不带 `--start`）：
+ *        增量只能补新消息，补不进缓存里没有的历史 —— 不补就会出现「轮询一直在跑，
+ *        缓存里每个会话却永远只有 1 条」（真实故障：水位比缓存活得久）。
+ *        CLI 调用次数不变（这一轮本来就要拉这个会话），只是这一次多带回一屏历史；
+ *        通知口径也不变（`pickNewMessages` 仍按水位过滤）。
  * @param {any} [deps.cli]                           lark-cli 通道（唯一取数通道；窄接口）
  */
 export function createDmWatcher({
@@ -460,6 +598,8 @@ export function createDmWatcher({
 	log = () => {},
 	now = () => Date.now(),
 	onNew,
+	onFetched,
+	needsBackfill,
 	/**
 	 * lark-cli 通道（唯一取数通道）。
 	 * 接口故意做得很窄：dm-watch 不该知道 CLI 命令怎么拼。
@@ -487,12 +627,16 @@ export function createDmWatcher({
 	let lastPollError = "";
 	/** chat_id → 该会话最近一次错误（与 chats 元信息分开存，手填但没被发现的会话也能带上错误） */
 	let chatErrors = {};
+	/** chat_id → 最近一次**成功**拉取的时间（界面上的「这条会话多久没同步了」）。运行时状态，不落盘。 */
+	let chatSyncedAt = {};
 	/** chat_id → 未读数（本地累计：轮询到的新消息数，用户打开会话时清零）。 */
 	let unread = {};
 	/** 上一轮自动发现的错误：同一个错误只记一次日志（否则每 60s 刷一行）。 */
 	let lastDiscoverLog = "";
 	let pollCount = 0;
 	let totalNew = 0;
+	/** 上一轮的自述（界面上的「上轮同步了几个会话 / 多少条」）：不落盘，重启后从 0 开始。 */
+	let lastPoll = { at: 0, chats: 0, rows: 0, fresh: 0, truncated: 0, errors: 0, backfill: 0 };
 	let loaded = false;
 	/** 最近一次 CLI 可用性观测（null = 还没检查过）。界面用它解释「为什么没在轮询」。 */
 	let cliReadyObserved = null;
@@ -618,15 +762,16 @@ export function createDmWatcher({
 		return { chats: chats.filter((c) => c.p2p), diagnostics: diag };
 	}
 
-	/** 候选会话：手填优先，其次自动发现的 p2p。按 MAX_CHATS_PER_POLL 截断。 */
+	/**
+	 * 候选会话：手填优先 → 自动发现的单聊 → 自动发现的群聊（群聊只在 `syncGroups` 打开时纳入）。
+	 * 预算与顺序都在 `buildPollCandidates()` 里（纯函数，单测钉住）。
+	 */
 	function candidateChats() {
-		const explicit = parseChatIds(config.chatIds);
-		const auto = config.autoDiscover ? chats.filter((c) => c.p2p).map((c) => c.id) : [];
-		const merged = [];
-		for (const id of [...explicit, ...auto]) {
-			if (!merged.includes(id)) merged.push(id);
-		}
-		return merged.slice(0, MAX_CHATS_PER_POLL);
+		return buildPollCandidates({
+			explicit: parseChatIds(config.chatIds),
+			p2p: config.autoDiscover ? chats.filter((c) => c.p2p).map((c) => c.id) : [],
+			groups: config.syncGroups ? chats.filter((c) => !c.p2p).map((c) => c.id) : [],
+		});
 	}
 
 	/**
@@ -651,24 +796,60 @@ export function createDmWatcher({
 		}
 		const got = [];
 		let baselineChanged = false;
+		// 本轮自述（/sync/run 与界面都靠它说「上轮真正干了什么」）。
+		const round = { chats: 0, rows: 0, truncated: 0, errors: 0, backfill: 0 };
 		try {
-			if (config.autoDiscover) await discover({ channel });
+			// 群聊也要发现：只要有一个「自动」开关打开，就得拉会话列表（否则 chats 里没群，syncGroups 形同虚设）。
+			if (config.autoDiscover || config.syncGroups) await discover({ channel });
 			const targets = candidateChats();
 			if (targets.length === 0) {
-				lastPollError = "没有可轮询的会话（自动发现为空，且未手填 chat_id）";
+				lastPollError = config.syncGroups
+					? "没有可轮询的会话（自动发现为空，且未手填 chat_id）"
+					: "没有可轮询的会话（自动发现为空，且未手填 chat_id；群消息同步需要打开「群聊」）";
 				return { skipped: "no-chats", messages: [] };
 			}
 			const selfId = selfOpenId();
-			for (const chatId of targets) {
+			for (const target of targets) {
+				const chatId = target.id;
+				const chatKind = target.kind;
+				round.chats += 1;
 				try {
 					const watermark = normalizeWatermark(watermarks[chatId]);
 					const watermarkMs = watermark.ms;
+					// 缓存里还没一屏就先整页拉一次（不带 `--start`）：
+					// 增量只能补新消息，而水位比缓存活得久 —— 不补屏的话「缓存里永远只有 1 条」，
+					// 打开会话只看得到一条。代价是 0 次额外 CLI 调用，只是这一轮多带回一屏历史。
+					let backfill = false;
+					if (typeof needsBackfill === "function") {
+						try {
+							backfill = Boolean(await needsBackfill(chatId));
+						} catch (err) {
+							backfill = false;
+							log("warn", `dm-watch: 判定会话 ${chatId} 是否需要补一屏失败：${err?.message || err}`);
+						}
+					}
+					if (backfill) round.backfill += 1;
 					const { items: rawItems, truncated } = await channel.messages(chatId, {
-						startMs: watermarkMs,
+						startMs: backfill ? 0 : watermarkMs,
 						pageSize: POLL_PAGE_SIZE,
-						maxPages: MAX_PAGES_PER_CHAT,
+						// 建基线 / 补屏都只要**一页**：它的作用就是把水位推到「现在」+ 给缓存盛一屏。
+						// 多翻的页最终会被缓存的条数上限剪掉（60 条），纯属白 spawn + 白落盘。
+						// 增量（已有水位）才允许多翻几页，为的是把积压看清。
+						maxPages: watermarkMs && !backfill ? MAX_PAGES_PER_CHAT : 1,
 					});
 					const normalized = rawItems.map(normalizeMessageItem).filter(Boolean);
+					round.rows += normalized.length;
+					if (truncated) round.truncated += 1;
+					// 内容先落本地缓存，再谈「新不新」：本模块只关心提醒，缓存关心的是「这个会话最近说了什么」。
+					// 失败只记日志 —— 缓存是加速层，不该拖死提醒轮询。
+					if (normalized.length > 0 && typeof onFetched === "function") {
+						try {
+							await onFetched({ chatId, rows: normalized, identity: identity(), kind: chatKind, backfill });
+						} catch (err) {
+							log("warn", `dm-watch: 本地消息缓存写入失败（${chatId}）：${err?.message || err}`);
+						}
+					}
+					chatSyncedAt[chatId] = now();
 					// 降序取数 ⇒ 本批里最大时间就是该会话当前的真实最新时间。
 					const newest = nextWatermark(watermark, normalized);
 					const newestMs = newest.ms;
@@ -683,7 +864,10 @@ export function createDmWatcher({
 						// 同一分钟里后到的消息时间戳与水位相等，靠 seen 区分「已报过的」与「真的新」。
 						for (const item of normalized) seen.add(item.id);
 						delete chatErrors[chatId];
-						log("info", `dm-watch: 会话 ${chatId} 建立基线（水位 ${new Date(newestMs || 0).toISOString()}）`);
+						log(
+							"info",
+							`dm-watch: 会话 ${chatId}（${chatKind}）建立基线（水位 ${new Date(newestMs || 0).toISOString()}）`,
+						);
 						continue;
 					}
 					const fresh = pickNewMessages(rawItems, { watermark, seen, selfOpenId: selfId });
@@ -692,6 +876,8 @@ export function createDmWatcher({
 						const record = {
 							...msg,
 							chatName: chatLabel(chatId),
+							// 会话种类跟着记录走：通知要不要弹、界面上分不分群/私聊都看它。
+							chatKind,
 							at: now(),
 							...(truncated ? { truncated: true } : {}),
 						};
@@ -717,7 +903,8 @@ export function createDmWatcher({
 					const message = String(err?.message || err);
 					chatErrors[chatId] = message;
 					lastPollError = message;
-					log("warn", `dm-watch: 会话 ${chatId} 轮询失败：${message}`);
+					round.errors += 1;
+					log("warn", `dm-watch: 会话 ${chatId}（${chatKind}）轮询失败：${message}`);
 				}
 			}
 			if (history.length > HISTORY_LIMIT) history = history.slice(-HISTORY_LIMIT);
@@ -725,23 +912,27 @@ export function createDmWatcher({
 			// 跨会话按时间升序：通知摘要取「最新那条」才对得上用户的感知（之前取的是会话遍历顺序里的第一条）。
 			got.sort((a, b) => a.createTimeMs - b.createTimeMs);
 			pollCount += 1;
-			if (got.length === 0) lastPollError = "";
-			else {
-				lastPollError = "";
-				totalNew += got.length;
-			}
+			lastPoll = { at: lastPollAt, ...round, fresh: got.length };
+			// 全局错误只反映「本轮有会话失败」；单个会话的细节在 chatErrors 里，界面按行展示。
+			lastPollError = round.errors > 0 ? lastPollError || `${round.errors} 个会话同步失败` : "";
+			if (got.length > 0) totalNew += got.length;
 			if (baselineChanged || got.length > 0) await persistState();
 			if (got.length > 0) {
-				if (config.notify) {
-					const summary = summarizeNewMessages(got);
+				// 分成「要弹」与「只落缓存」两份：群消息默认只同步、不打断人。
+				const notifyList = pickNotifyRecords(got, config, { explicitIds: parseChatIds(config.chatIds) });
+				const summary = summarizeNewMessages(notifyList);
+				if (summary) {
 					// 积压被截断时如实说一声：宁可让人知道“更早的没计”，也别给个看起来精确的假数字。
-					const gap = got.some((item) => item.truncated) ? "（更早的积压未计入）" : "";
-					if (summary)
-						notify?.(
-							"info",
-							`飞书私聊：${summary}${gap}`,
-							`Feishu DM: ${summary}${gap ? " (older backlog skipped)" : ""}`,
-						);
+					const gap = notifyList.some((item) => item.truncated) ? "（更早的积压未计入）" : "";
+					const silent = got.length - notifyList.length;
+					const rest = silent > 0 ? `（另有 ${silent} 条已同步未提醒）` : "";
+					notify?.(
+						"info",
+						`飞书：${summary}${gap}${rest}`,
+						`Feishu: ${summary}${gap ? " (older backlog skipped)" : ""}${
+							silent > 0 ? ` (${silent} more synced silently)` : ""
+						}`,
+					);
 				}
 				try {
 					onNew?.(got);
@@ -749,7 +940,7 @@ export function createDmWatcher({
 					log("warn", `dm-watch: onNew 回调异常：${err?.message || err}`);
 				}
 			}
-			return { messages: got };
+			return { messages: got, chats: round.chats, rows: round.rows };
 		} finally {
 			polling = false;
 			lastError = lastPollError;
@@ -826,33 +1017,29 @@ export function createDmWatcher({
 	}
 
 	function status() {
+		// 列表口径 = **真的在轮询的候选**（手填 → 单聊 → 群聊），不是「发现了却没拉」的一大堆：
+		// 界面上这一列是「同步状态表」，混进不拉的会话只会让「多久没同步」变成假信息。
 		const explicit = parseChatIds(config.chatIds);
-		const listed = chats
-			.filter((c) => explicit.includes(c.id) || (config.autoDiscover && c.p2p))
-			.map((c) => ({
-				id: c.id,
-				name: c.name || "",
-				mode: c.mode,
-				type: c.type,
-				p2p: Boolean(c.p2p),
-				explicit: explicit.includes(c.id),
-				watermarkMs: normalizeWatermark(watermarks[c.id]).ms,
-				lastError: chatErrors[c.id] || "",
-			}));
-		for (const id of explicit) {
-			if (!listed.some((c) => c.id === id)) {
-				listed.push({
-					id,
-					name: "",
-					mode: "unknown",
-					type: "",
-					p2p: false,
-					explicit: true,
-					watermarkMs: normalizeWatermark(watermarks[id]).ms,
-					lastError: chatErrors[id] || "",
-				});
-			}
-		}
+		const candidates = candidateChats();
+		const listed = candidates.map((target) => {
+			const meta = chats.find((c) => c.id === target.id) || null;
+			return {
+				id: target.id,
+				name: meta?.name || "",
+				mode: meta?.mode || "unknown",
+				type: meta?.type || "",
+				p2p: target.kind === "p2p",
+				kind: target.kind,
+				explicit: target.explicit,
+				// 提醒开关跟着「会话种类 + 手填」走（与 pickNotifyRecords 同口径）。
+				notify: Boolean(config.notify) && (target.explicit || target.kind !== "group" || config.notifyGroups),
+				watermarkMs: normalizeWatermark(watermarks[target.id]).ms,
+				unread: Number(unread[target.id]) || 0,
+				syncedAt: Number(chatSyncedAt[target.id]) || 0,
+				lastError: chatErrors[target.id] || "",
+			};
+		});
+		const count = (kind) => candidates.filter((c) => c.kind === kind).length;
 		return {
 			ok: true,
 			config: { ...config },
@@ -863,9 +1050,17 @@ export function createDmWatcher({
 			running,
 			busy: polling,
 			chats: listed,
-			candidates: candidateChats().length,
+			// 候选自述（按种类分开）：界面据此说「在同步 26 个私聊 / 3 个群」。
+			candidates: {
+				total: candidates.length,
+				p2p: count("p2p"),
+				groups: count("group"),
+				explicit: candidates.filter((c) => c.explicit).length,
+				budget: { chats: MAX_CHATS_PER_POLL, groups: MAX_GROUPS_PER_POLL },
+			},
 			lastPollAt,
 			nextPollAt,
+			lastPoll: { ...lastPoll },
 			lastError,
 			pollCount,
 			totalNew,

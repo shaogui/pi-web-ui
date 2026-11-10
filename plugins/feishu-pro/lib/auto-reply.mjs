@@ -13,7 +13,7 @@
  *     不会形成自激回环；以 bot 身份发时由 `senderType === "app"` 挡住。
  */
 
-import { isValidChatId, parseChatIds } from "./dm-watch.mjs?v=0.12.0";
+import { isValidChatId, parseChatIds } from "./dm-watch.mjs?v=0.14.1";
 
 export const AUTO_CONFIG_KEY = "auto_reply";
 export const AUTO_STATE_KEY = "auto_reply_state";

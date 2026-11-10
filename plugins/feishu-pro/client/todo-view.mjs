@@ -381,8 +381,8 @@ export function mountTodoView({ panel, call, say, compose } = {}) {
 			<input class="fp-td-q" placeholder="搜索…" />
 			<button class="fp-td-btn" data-act="advise-batch" title="让 AI 逐条给出处理建议（逾期/今天优先）">AI 梳理</button>
 			<button class="fp-td-btn" data-act="sync" title="读飞书任务并合并进本地待办">同步飞书任务</button>
-			<button class="fp-td-btn" data-act="extract" title="从监听的会话里找「需要我做的事」">从消息提取</button>
-			<button class="fp-td-btn" data-act="auto-toggle" title="后台定时同步飞书任务 + 从监听会话提取待办（默认关）">⏱ 自动</button>
+			<button class="fp-td-btn" data-act="extract" title="从本地缓存的会话消息（看过的私聊与群聊）里找「需要我做的事」">从消息提取</button>
+			<button class="fp-td-btn" data-act="auto-toggle" title="后台定时同步飞书任务 + 从本地会话消息提取待办（默认关）">⏱ 自动</button>
 			<select class="fp-td-int" title="自动获取间隔">
 				<option value="15">15 分钟</option>
 				<option value="30">30 分钟</option>
@@ -452,7 +452,9 @@ export function mountTodoView({ panel, call, say, compose } = {}) {
 		}
 		for (const btn of root.querySelectorAll('[data-act="extract"]')) {
 			btn.disabled = !caps.extract || !caps.advice;
-			btn.title = caps.extract ? "从监听的会话里找「需要我做的事」" : "需要可读的飞书会话 + 模型补全";
+			btn.title = caps.extract
+				? "从本地缓存的会话消息里找「需要我做的事」（看过的私聊与群聊都算）"
+				: "需要可读的飞书会话 + 模型补全";
 		}
 		for (const btn of root.querySelectorAll('[data-act="sync"]')) {
 			btn.disabled = !caps.feishuTasks;
@@ -468,7 +470,7 @@ export function mountTodoView({ panel, call, say, compose } = {}) {
 			btn.textContent = on ? `⏱ 自动 · ${cfg.intervalMin || 30}分` : "⏱ 自动";
 			btn.title = on
 				? "已开启：后台定时同步飞书任务 + 提取消息待办（点一下关掉）"
-				: "后台定时同步飞书任务并从监听会话提取待办（默认关，会花模型额度）";
+				: "后台定时同步飞书任务并从本地会话消息提取待办（默认关，会花模型额度）";
 		}
 		if (elInt) elInt.value = String(cfg.intervalMin || 30);
 		if (elTf) {
@@ -484,7 +486,7 @@ export function mountTodoView({ panel, call, say, compose } = {}) {
 					? "还没有完成的待办。"
 					: query
 						? "没有匹配的待办。"
-						: "还没有待办。<br/>上面输入框记一条，或点「从消息提取」让 AI 从监听的会话里找「需要我做的事」。"
+						: "还没有待办。<br/>上面输入框记一条，或点「从消息提取」让 AI 从本地缓存的会话消息里找「需要我做的事」。"
 			}</div>`;
 			return;
 		}
@@ -801,9 +803,9 @@ export function mountTodoView({ panel, call, say, compose } = {}) {
 	}
 
 	async function extractTodos() {
-		note("正在读监听的会话并让 AI 找待办…");
+		note("正在读本地缓存的会话消息并让 AI 找待办…");
 		try {
-			const payload = await call("/todos/extract", { method: "POST", body: { limit: 3 }, timeoutMs: 150000 });
+			const payload = await call("/todos/extract", { method: "POST", body: {}, timeoutMs: 150000 });
 			// 服务端会把候选落盘（自动提取也一样）：以后者为准，手动这一次先用回包渲染。
 			if (Array.isArray(payload.pending)) {
 				snapshot = { ...snapshot, candidates: payload.pending };
@@ -957,7 +959,7 @@ export function mountTodoView({ panel, call, say, compose } = {}) {
 			const intervalMin = Number(elInt?.value) || Number(snapshot.config?.intervalMin) || 30;
 			await saveAutoConfig({ autoSync: next, autoExtract: next, intervalMin, restart: next }, (cfg) =>
 				next
-					? `已开启自动获取：每 ${cfg.intervalMin} 分钟同步飞书任务 + 从监听会话提取待办（会花模型额度）`
+					? `已开启自动获取：每 ${cfg.intervalMin} 分钟同步飞书任务 + 从本地会话消息提取待办（会花模型额度）`
 					: "已关闭自动获取（手动按钮照旧可用）",
 			);
 			return;
