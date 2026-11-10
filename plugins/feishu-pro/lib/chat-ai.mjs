@@ -13,16 +13,30 @@
  *   - 明确「只输出正文」——宿主没有独立 system 通道，规则只能写在正文提示里。
  */
 
-/** 与自动回复、待办各用各的账号：多轮会话记忆互不污染。 */
+/**
+ * 与自动回复、待办各用各的账号；再按 chatId 分成伪客户端。
+ *
+ * 为什么按 chatId 分：`host.chat` 不带 conversationId 时用的是该伪客户端的**当前活动会话**。
+ * 共用一个账号意味着 A 会话的草稿会留在 B 会话的模型上下文里（串台、被上一段对话带偏，
+ * 也把别的会话内容带进不该看到它的那次生成）。一个 chat 一个账号，上下文天然隔离。
+ */
 export const CHAT_AI_ACCOUNT_ID = "feishu-pro:chat-ai";
+
+export function chatAiAccountId(chatId) {
+	const suffix = String(chatId || "unknown").replace(/[^A-Za-z0-9_-]/g, "") || "unknown";
+	return `${CHAT_AI_ACCOUNT_ID}-${suffix}`;
+}
 /** 一轮生成的兜底时限：模型慢/工具卡住时别让浏览器请求一直挂着。 */
 export const CHAT_AI_TIMEOUT_MS = 180_000;
 /** 贴进提示词的最近消息条数（多了只是噪音，少了接不上话）。 */
 export const CHAT_AI_ROWS = 12;
 /** 单条消息进提示词的上限（避免一条长文把窗口吃满）。 */
 export const CHAT_AI_ROW_CHARS = 400;
-/** 转录总预算：从最新往回装，装不下就丢最旧的。 */
-export const CHAT_AI_TRANSCRIPT_CHARS = 4_000;
+/**
+ * 转录总预算：从最新往回装，装不下就丢最旧的。
+ * 3.6k 是给「我的背景」（≤1k）与规则段留余量：宿主对单次 chat 有 8000 字硬上限。
+ */
+export const CHAT_AI_TRANSCRIPT_CHARS = 3_600;
 /** 回复正文上限（与消息发送上限一致；超过就分条）。 */
 export const CHAT_AI_REPLY_CHARS = 4_000;
 /** 单条发送分片上限：飞书 text 上限 4000，留一点余量给「（续）」。 */
@@ -69,9 +83,17 @@ function whoOf(row) {
  * @param {Array<object>} [input.rows] 会话消息（UI 的 items，时间正序倒序都行，这里自己排）
  * @param {string} [input.instruction] 用户填的「回复要点」（可选：没有就按上下文自然回复）
  * @param {string} [input.messageId] 右键选中的那条消息：回复它，且不把更晚的消息带进上下文
+ * @param {string} [input.profile] 「我的背景」（角色 / 能拍板的事 / 常用口径），来自设置
  * @returns {string}
  */
-export function buildReplyPrompt({ chatName = "", chatId = "", rows = [], instruction = "", messageId = "" } = {}) {
+export function buildReplyPrompt({
+	chatName = "",
+	chatId = "",
+	rows = [],
+	instruction = "",
+	messageId = "",
+	profile = "",
+} = {}) {
 	const anchorId = String(messageId || "").trim();
 	// 缓存/接口回的是「最新在前」，但纯函数不赌调用方顺序：按时间排一遍再取。
 	const ordered = (Array.isArray(rows) ? rows : []).slice().sort((a, b) => num(a?.createTimeMs) - num(b?.createTimeMs));
@@ -104,6 +126,11 @@ export function buildReplyPrompt({ chatName = "", chatId = "", rows = [], instru
 
 	const title = String(chatName || "").trim() || String(chatId || "").trim() || "(unknown chat)";
 	const lines = [`[Feishu chat reply task] ${title}${chatId ? ` (${chatId})` : ""}`, ""];
+	// 「我的背景」是账号所有者自己写的可信上下文：只讲角色与口径，不是对方消息里的指令。
+	const about = String(profile ?? "")
+		.trim()
+		.slice(0, 1000);
+	if (about) lines.push("About me (the account owner; trusted background):", about, "");
 	if (kept.length) {
 		lines.push('Recent messages (oldest → newest; "me" = the account owner):');
 		for (const row of kept) {
@@ -131,11 +158,17 @@ export function buildReplyPrompt({ chatName = "", chatId = "", rows = [], instru
 		anchorId
 			? 'Write my reply to the message marked "<-- reply to this" (the last one above).'
 			: "Write the single next message that I (the account owner) should send in this chat.",
+		"Understand the ask first (silently): what outcome does the sender actually want from me, what is my next action, and which details can only they supply?",
 		"Rules:",
 		'- Output ONLY the message body: no preamble, no quotes, no markdown code fence, no "Reply:" label, no signature.',
 		"- Match the language and tone of the thread; keep it natural for IM (short paragraphs, no bullet lists unless asked).",
-		"- Never invent facts, numbers, links or commitments. If the last message asks something you cannot verify, ask one short clarifying question.",
+		"- Reply to the real ask, not the literal topic. If the sender asks me to do something normal for my role (open / apply / approve / grant / check / arrange), accept it and state the next concrete step — do not mirror the request back as a question.",
+		"- Never ask the sender to decide what I control (whether to proceed, account type, permission level, password). Pick the standard default, say what it will be, and move on.",
+		"- A question is allowed only for a fact only the sender has (their email / phone, exact name or project), at most one, and always paired with what I will do next.",
+		"- Do not invent facts, numbers, links, prices or deadlines. If a detail is genuinely unknown, commit to the action and say you will follow up with it.",
+		'- Weak: "What account name and password do you want?" — that bounces my own decisions back. Strong: "I\'ll create it with the standard developer access bound to your email and send the login details once it\'s ready."',
 		"- Do not call any tools and do not send anything yourself: the plugin sends the text after the user decides.",
+		"- Final check: if the draft only asks questions or restates the request, rewrite it as acceptance + next step.",
 	);
 	return lines.join("\n");
 }
@@ -265,6 +298,7 @@ export function createChatAiReplier({
 		instruction = "",
 		conversationId = "",
 		messageId = "",
+		profile = "",
 	} = {}) {
 		const id = String(chatId ?? "").trim();
 		if (!id) throw new Error("缺少 chatId");
@@ -279,7 +313,14 @@ export function createChatAiReplier({
 				throw new Error("这个会话还没有可读消息：先在「回复要点」写一句你想要的结果，再让 AI 回复");
 			}
 		}
-		const prompt = buildReplyPrompt({ chatName, chatId: id, rows: list, instruction, messageId: anchorId });
+		const prompt = buildReplyPrompt({
+			chatName,
+			chatId: id,
+			rows: list,
+			instruction,
+			messageId: anchorId,
+			profile,
+		});
 		// 先占位再 await：两次点击的间隔可能短于一次 host.chat 的往返，
 		// 等回执回来才占位的话，第二次点击会照样派活（连点 = 烧两份额度且互相插队）。
 		const reservation = `pending:${id}`;
@@ -289,7 +330,7 @@ export function createChatAiReplier({
 		try {
 			receipt = await chat({
 				text: prompt,
-				accountId: CHAT_AI_ACCOUNT_ID,
+				accountId: chatAiAccountId(id),
 				...(conversationId ? { conversationId } : {}),
 			});
 		} catch (err) {

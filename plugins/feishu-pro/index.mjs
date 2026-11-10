@@ -98,9 +98,9 @@ import {
 	createAutoReplier,
 	matchAutoReply,
 	normalizeAutoConfig,
-} from "./lib/auto-reply.mjs?v=0.18.0";
+} from "./lib/auto-reply.mjs?v=0.18.1";
 // 会话页按需「让 AI 代写回复」：预览 / 直发共用同一个生成引擎。
-import { createChatAiReplier, splitReplyText } from "./lib/chat-ai.mjs?v=0.16.0";
+import { createChatAiReplier, splitReplyText } from "./lib/chat-ai.mjs?v=0.18.1";
 import {
 	fetchChatInfo as fetchChatInfoViaCli,
 	fetchChatMessages as fetchChatMessagesViaCli,
@@ -174,7 +174,7 @@ export {
 } from "./lib/todo-ai.mjs?v=0.14.1";
 export { listMyTasks as listMyTasksShape, normalizeCliTask } from "./lib/cli-tasks.mjs?v=0.14.1";
 // 会话页 AI 回复：纯函数（提示词 / 清洗 / 分片）单测直接 import，不必起插件。
-export { buildReplyPrompt, cleanAiReply, splitReplyText } from "./lib/chat-ai.mjs?v=0.16.0";
+export { buildReplyPrompt, chatAiAccountId, cleanAiReply, splitReplyText } from "./lib/chat-ai.mjs?v=0.18.1";
 export {
 	ANON_OWNER,
 	RECENT_LIMIT,
@@ -2135,12 +2135,16 @@ export default {
 					// 读 60 条是为了兜住「右键的是屏幕上偏旧的一条」，提示词内部仍只取锚点前 ≤12 条。
 					const payload = await chatMessagesPayload(chatId, { limit: 60 });
 					const chatName = String(payload.label || payload.peer?.name || "").trim();
+					// 「我的背景」与自动回复共用一份（设置里只填一次）：起草回复同样要知道我是谁、能拍板什么。
+					await autoReplier.load();
+					const profile = autoReplier.status().config.ownerProfile || "";
 					const generated = await chatAiReplier.generate({
 						chatId,
 						chatName,
 						rows: payload.items,
 						instruction,
 						messageId,
+						profile,
 					});
 					if (!generated.ok) throw new Error(generated.error || "AI 没有产出回复");
 					const text = generated.text;
@@ -2270,6 +2274,7 @@ export default {
 						staleSec: body.staleSec,
 						dryRun: body.dryRun,
 						signature: body.signature,
+						ownerProfile: body.ownerProfile,
 						triage: body.triage,
 						workEnabled: body.workEnabled,
 						maxWorkPerHour: body.maxWorkPerHour,

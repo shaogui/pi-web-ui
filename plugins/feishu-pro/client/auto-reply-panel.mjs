@@ -20,6 +20,7 @@ const STYLES = `
 .fp-auto{display:flex;flex-direction:column;gap:12px;}
 .fp-auto .fp-auto-num{width:78px;text-align:center;}
 .fp-auto .fp-auto-ids{width:100%;min-height:58px;line-height:1.6;resize:vertical;word-break:break-all;}
+.fp-auto .fp-auto-profile{width:100%;min-height:64px;line-height:1.6;resize:vertical;}
 .fp-auto-state{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-dim);word-break:break-word;overflow-wrap:anywhere;}
 .fp-auto-dot{flex:0 0 auto;width:8px;height:8px;border-radius:50%;background:var(--text-faint);}
 .fp-auto-dot.on{background:var(--green);}
@@ -121,6 +122,11 @@ export function mountAutoReplyPanel(container, opts = {}) {
 				<div class="fp-field-hint">「动手」= 允许它检索飞书文档 / 历史消息、读素材目录、写本地待办。发送始终由插件完成，AI 不直接对外发消息。</div>
 			</div>
 			<div class="fp-field">
+				<div class="fp-field-label">我的背景（AI 回复共用）</div>
+				<textarea class="fp-input fp-auto-profile" rows="3" placeholder="例：我负责公司 GitLab 与账号权限审批；开通账号默认给 Developer 权限、账号绑对方邮箱。"></textarea>
+				<div class="fp-field-hint">写清你的角色、能直接拍板的事和常用口径。会话页「AI 回复」与自动回复起草时都会参考；<b>别写密码等敏感信息</b>（它会进每一次生成的提示词）。</div>
+			</div>
+			<div class="fp-field">
 				<div class="fp-field-label">对外素材目录（只读）</div>
 				<input class="fp-input fp-mono fp-auto-library fp-auto-dir" spellcheck="false" placeholder="（留空 = 没有素材，只能查飞书）" />
 				<div class="fp-field-hint">这个目录里的文件 AI 可以读、可以摘要给对方，但<b>不会写</b>。不能填根目录 / 主目录 / 数据目录。</div>
@@ -195,6 +201,7 @@ export function mountAutoReplyPanel(container, opts = {}) {
 	const elRunTimeout = $(".fp-auto-runtimeout");
 	const elEscTodo = $(".fp-auto-esctodo");
 	const elRedact = $(".fp-auto-redact");
+	const elProfile = $(".fp-auto-profile");
 	const elLibrary = $(".fp-auto-library");
 	const elAllDms = $(".fp-auto-all-dms");
 	const elAllGroups = $(".fp-auto-all-groups");
@@ -296,6 +303,7 @@ export function mountAutoReplyPanel(container, opts = {}) {
 			elRunTimeout.value = String(cfg.runTimeoutSec ?? 120);
 			elEscTodo.checked = cfg.escalateTodo !== false;
 			elRedact.checked = cfg.redact !== false;
+			elProfile.value = String(cfg.ownerProfile ?? "");
 			elLibrary.value = String(cfg.libraryDir ?? "");
 			elAllDms.checked = Boolean(cfg.allDms);
 			elAllGroups.checked = Boolean(cfg.allGroups);
@@ -438,6 +446,7 @@ export function mountAutoReplyPanel(container, opts = {}) {
 			runTimeoutSec: Number(elRunTimeout.value) || 0,
 			escalateTodo: elEscTodo.checked,
 			redact: elRedact.checked,
+			ownerProfile: elProfile.value,
 			libraryDir: elLibrary.value,
 			chatIds: elIds.value,
 			allDms: elAllDms.checked,
@@ -519,6 +528,7 @@ export function mountAutoReplyPanel(container, opts = {}) {
 		elRunTimeout,
 		elEscTodo,
 		elRedact,
+		elProfile,
 		elLibrary,
 		elAllDms,
 		elAllGroups,

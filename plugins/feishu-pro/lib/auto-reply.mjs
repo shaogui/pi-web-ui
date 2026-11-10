@@ -95,6 +95,12 @@ export const AUTO_DEFAULT_CONFIG = {
 	dryRun: false,
 	/** 回包后缀/签名（留空 = 不加）。让收件人知道这是自动回复。 */
 	signature: "",
+	/**
+	 * 我的背景（给人看的角色说明，AI 起草回复时参考）：
+	 * 「我负责什么 / 哪些事我能直接拍板 / 常用口径」。会话内 AI 回复与自动回复共用。
+	 * 不写密码等敏感信息 —— 它会被贴进每一次生成的提示词。
+	 */
+	ownerProfile: "",
 	/** 前置分析：开 = 每条消息先花一次小补全判定路由（关掉就退回"只写正文"）。 */
 	triage: true,
 	/** 允许 agent 真正动手（work 路由）。默认关：先只看"会不会想动手"。 */
@@ -150,6 +156,10 @@ export function normalizeAutoConfig(input = {}, base = AUTO_DEFAULT_CONFIG) {
 		staleSec: clampInt(pick("staleSec"), { min: 0, max: 86_400, fallback: 300 }),
 		dryRun: Boolean(pick("dryRun")),
 		signature: String(pick("signature") ?? "").slice(0, 120),
+		ownerProfile: String(pick("ownerProfile") ?? "")
+			.replace(/\u0000/g, "")
+			.trim()
+			.slice(0, 1000),
 		triage: Boolean(pick("triage")),
 		workEnabled: Boolean(pick("workEnabled")),
 		maxWorkPerHour: clampInt(pick("maxWorkPerHour"), { min: 0, max: 100, fallback: 3 }),
@@ -235,7 +245,7 @@ export function normalizeAutoState(input) {
 			ask: String(t?.ask ?? "").slice(0, 200),
 			route: String(t?.route ?? ""),
 			why: String(t?.why ?? "").slice(0, 160),
-			intent: String(t?.intent ?? "").slice(0, 40),
+			intent: String(t?.intent ?? "").slice(0, 80),
 			tier: String(t?.tier ?? ""),
 		}))
 		.filter((t) => t.at > 0);
@@ -369,7 +379,7 @@ function contextLines(rows = [], limit = 6) {
  * `feishu_pro action=im_messages`，需要上下文时自己去取（省 token，也不会因为
  * 我们截断历史而让模型以为对话只有这几句）。
  */
-export function buildAutoPrompt({ record, chatName = "", chatId = "" } = {}) {
+export function buildAutoPrompt({ record, chatName = "", chatId = "", profile = "" } = {}) {
 	const row = record || {};
 	const group = chatKindOf(row) === "group";
 	const who = String(row.senderName || "").trim() || `…${String(row.senderId || "").slice(-6)}`;
@@ -378,6 +388,10 @@ export function buildAutoPrompt({ record, chatName = "", chatId = "" } = {}) {
 		`[Feishu ${group ? "group message" : "direct message"}] ${who} → me${chatName ? ` (${chatName})` : ""}${stamp(row.createTimeMs) ? ` at ${stamp(row.createTimeMs)}` : ""}:`,
 		body,
 	];
+	const about = String(profile ?? "")
+		.trim()
+		.slice(0, 1000);
+	if (about) lines.push("", "About me (the account owner; trusted background):", about);
 	if (group)
 		lines.push(
 			"",
@@ -387,7 +401,9 @@ export function buildAutoPrompt({ record, chatName = "", chatId = "" } = {}) {
 		"",
 		"Reply as me to this message. Output ONLY the message body that will be sent back to Feishu — no preamble, no quotes, no code fence, no signature (one is appended automatically).",
 		`Match the sender's language. Call feishu_pro with action=im_messages chat_id=${chatId || row.chatId || "<chat_id>"} limit=10 when you need the earlier context of this thread.`,
-		"If the request is ambiguous or involves commitments you cannot verify, answer with a short safe acknowledgement instead of inventing facts.",
+		"First work out what the sender actually wants me to do, not just the topic. If it is a normal request for my role, accept it and state the next step; do not mirror the request back as a question.",
+		"Never ask the sender to decide what I control (whether to proceed, account type, permission level, password). Pick the standard default and say so; ask at most one question, only for a fact only the sender has.",
+		"If a detail cannot be verified, commit to the action and say you will follow up — never invent it and never use that as an excuse to ask a filler question.",
 	);
 	return lines.join("\n");
 }
@@ -424,15 +440,21 @@ export function buildTriagePrompt({ record, chatName = "", chatId = "", recent =
 	}
 	const ctx = contextLines(recent, 6);
 	if (ctx.length) lines.push("", 'Earlier messages (oldest → newest; "me" = the account owner):', ...ctx);
+	const about = String(config?.ownerProfile ?? "")
+		.trim()
+		.slice(0, 1000);
+	if (about) lines.push("", "About me (the account owner; trusted background):", about);
 	lines.push(
 		"",
+		"Think first about the underlying request: what does the sender actually want the owner to DO or decide? Use the message and earlier messages, not just keywords.",
+		"",
 		"Routes:",
-		'- "reply": answer right now from what you already know; put the ready-to-send body in `reply`.',
+		'- "reply": answer right now from what you already know; put the ready-to-send body in `reply`. For a request to act (open / apply / approve / grant / check / arrange), accept it and state the next step — never ask the sender to choose what the owner controls (whether to proceed, account type, permission level, password).',
 		'- "work": the request needs looking things up or doing something (Feishu docs / chat history / contacts, a local read-only library, local to-dos). Put a one-sentence, self-contained task in `brief`.',
 		'- "escalate": money, contracts, prices, HR, credentials, confidential material, or any commitment the owner must make personally.',
 		'- "ignore": ads, spam, group announcements, automated notices.',
 		"",
-		`Work route is ${config?.workEnabled ? "available" : "DISABLED — never choose work; use reply with a short safe acknowledgement instead"}.`,
+		`Work route is ${config?.workEnabled ? "available" : "DISABLED — never choose work; use reply to accept the request and say the owner will follow up"}.`,
 		risk?.tier === "block" || risk?.tier === "overreach"
 			? `Keyword pre-check already flagged this message (${risk.reason}). You MUST choose "escalate".`
 			: risk?.tier === "ignore"
@@ -443,12 +465,13 @@ export function buildTriagePrompt({ record, chatName = "", chatId = "", recent =
 		"",
 		"Rules:",
 		"- Output ONE JSON object, no prose, no code fence.",
+		"- intent: one sentence — what the sender actually wants the owner to do (this drives the route).",
 		'- route must be one of "reply" | "work" | "escalate" | "ignore".',
-		"- reply is only for route=reply: 1–4 sentences, the exact message to send, no greeting-only filler, no signature.",
+		"- reply is only for route=reply: 1–4 sentences, the exact message to send, no greeting-only filler, no signature. A question here is allowed only for a fact only the sender has, never as a substitute for acting.",
 		"- brief is only for route=work: what to accomplish, not how.",
-		"- Never promise prices, dates, deliverables, or facts not present in the message or earlier messages.",
+		"- Never promise prices, dates, deliverables, or facts not present in the message or earlier messages. Accepting a routine request the owner can handle is not a forbidden promise.",
 		"",
-		'Shape: {"route":"reply|work|escalate|ignore","intent":"...","risk":"low|med|high","brief":"...","reply":"...","why":"..."}',
+		'Shape: {"intent":"...","risk":"low|med|high","route":"reply|work|escalate|ignore","brief":"...","reply":"...","why":"..."}',
 	);
 	return clip(lines.join("\n"), 7000);
 }
@@ -478,7 +501,7 @@ export function parseTriage(text) {
 		note: "",
 		plan: {
 			route,
-			intent: clip(String(json.intent ?? "").trim(), 40),
+			intent: clip(String(json.intent ?? "").trim(), 80),
 			risk: ["low", "med", "high"].includes(risk) ? risk : "",
 			brief: clip(String(json.brief ?? "").trim(), 300),
 			reply: clip(String(json.reply ?? "").trim(), 1200),
@@ -553,6 +576,7 @@ export function buildWorkPrompt({
 	libraryDir = "",
 	review = false,
 	now = Date.now(),
+	profile = "",
 } = {}) {
 	const row = record || {};
 	const group = chatKindOf(row) === "group";
@@ -566,6 +590,10 @@ export function buildWorkPrompt({
 	lines.push("", "Message:", clip(String(row.text || "").trim() || "[image or file only]", 1500));
 	const ctx = contextLines(recent, 8);
 	if (ctx.length) lines.push("", 'Earlier messages (oldest → newest; "me" = the account owner):', ...ctx);
+	const about = String(profile ?? "")
+		.trim()
+		.slice(0, 1000);
+	if (about) lines.push("", "About me (the account owner; trusted background):", about);
 	if (plan?.brief) lines.push("", `Task: ${plan.brief}`);
 	lines.push(
 		"",
@@ -585,6 +613,7 @@ export function buildWorkPrompt({
 		"Do the work first (use tools when needed), then end your reply with:",
 		"FINAL:",
 		"<the message body to send back to the sender — 1–4 sentences, IM tone, no bullets, no signature; link instead of pasting long text>",
+		"Write FINAL as the owner taking the next step, not a questionnaire: accept the real request and say what happens next. Never ask the sender to choose what the owner controls (permission level, password, whether to proceed); a question is allowed only for a fact only the sender has.",
 		"If you could not finish, say what you did and what still needs the account owner.",
 	);
 	return clip(lines.join("\n"), 7000);
@@ -1022,8 +1051,14 @@ export function createAutoReplier({
 					libraryDir: config.libraryDir,
 					review: Boolean(job.decision.review),
 					now: now(),
+					profile: config.ownerProfile,
 				})
-			: buildAutoPrompt({ record, chatName: job.chatName, chatId: job.chatId });
+			: buildAutoPrompt({
+					record,
+					chatName: job.chatName,
+					chatId: job.chatId,
+					profile: config.ownerProfile,
+				});
 		const accountId = work ? autoWorkAccountId(job.chatId) : autoAccountId(job.chatId);
 		const bound = (work ? state.workConversations : state.conversations)[job.chatId] || undefined;
 
@@ -1377,7 +1412,7 @@ export function createAutoReplier({
 			reason: verdict.reason,
 			risk,
 			triage: config.triage ? buildTriagePrompt({ record, chatName, chatId, recent, risk, config }) : "",
-			prompt: config.triage ? "" : buildAutoPrompt({ record, chatName, chatId }),
+			prompt: config.triage ? "" : buildAutoPrompt({ record, chatName, chatId, profile: config.ownerProfile }),
 			work: buildWorkPrompt({
 				record,
 				chatName,
@@ -1387,6 +1422,7 @@ export function createAutoReplier({
 				workDir: "<scratch>/<chatId>",
 				libraryDir: config.libraryDir,
 				now: now(),
+				profile: config.ownerProfile,
 			}),
 			config,
 		};

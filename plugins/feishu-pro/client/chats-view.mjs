@@ -279,7 +279,7 @@ export function mountChatsView({ panel, call, say, onOpenSettings } = {}) {
 				<div class="fp-cv-msgs"><div class="fp-cv-empty">左侧选一个会话查看消息</div></div>
 				<div class="fp-cv-compose">
 					<div class="fp-cv-airow">
-						<span class="fp-cv-ai-tag" title="AI 会读这条消息之前的上下文，按当前发送身份回复">AI</span>
+						<span class="fp-cv-ai-tag" title="AI 会读这条消息之前的上下文，按当前发送身份回复；可在「设置 → 自动问答 → 我的背景」补充你的角色与常用口径">AI</span>
 						<input class="fp-cv-ai-want" aria-label="AI 回复要点" placeholder="回复要点（可选，右键消息时生效）：想让 AI 说什么、什么语气" disabled />
 						<span class="fp-cv-ai-tip">右键任意消息 → AI 直接回复 / AI 预览回复</span>
 					</div>
