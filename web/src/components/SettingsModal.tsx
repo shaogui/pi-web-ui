@@ -7,6 +7,7 @@ import {
 	FiBox,
 	FiCheck,
 	FiChevronDown,
+	FiChevronLeft,
 	FiChevronUp,
 	FiClock,
 	FiCpu,
@@ -46,7 +47,11 @@ import {
 import { CopyButton } from "./copy-button";
 import { PluginIcon } from "../plugin-icon";
 import { formatBytes } from "../format-bytes";
-import { HintTip } from "./HintTip";
+import { HintTip, TipButton } from "./HintTip";
+import { SettingsMobileHome, type MobileSettingsGroup } from "./settings-mobile/SettingsMobileHome";
+import { groupTabs } from "./settings-mobile/mobile-ia";
+import { useNarrowLayout } from "./settings-mobile/use-narrow-layout";
+import "./settings-mobile/settings-mobile.css";
 import { sortAgentPresets, presetText } from "./DshPresetBar";
 import { DSH_PERMISSION_ORDER, permDescKey, permLabelKey } from "./DshPermissionBar";
 import { PluginPage } from "./PluginPage";
@@ -95,12 +100,13 @@ import {
 	savePromptHistorySettings,
 } from "../prompt-history";
 import { randomUuid } from "../uuid";
-import { THINKING_VALUES } from "../thinking-levels";
 import { QuickAskSettings, type QuickAskPatch } from "./QuickAskSettings";
+import { SubagentTemplateWizard } from "./SubagentTemplateWizard";
 import { formatTokenDraft, parseTokenInput } from "../token-input";
 import { useWideChat, saveChatWidthSettings, useHideModelRow, saveHideModelRowSettings } from "../chat-width-settings";
 import { usePresentAutoOpen, savePresentAutoOpen } from "../present-settings";
 import { useProjectClickSwitch, saveProjectClickSwitch } from "../project-click-settings";
+import { useProjectOrderManual, saveProjectOrderManual } from "../project-order-settings";
 import { type SendKey, saveSendKeyPref, useEffectiveSendKey } from "../composer-keys";
 import { useProjectTitle, saveTitleSettings } from "../title-settings";
 import {
@@ -154,18 +160,16 @@ import {
 	isReadonlyPromptSource,
 } from "../../../server/prompt-composer.js";
 import { isWindowsPlatform } from "../notify";
-import {
-	AGENT_TOOL_CATALOG,
-	CORE_TOOL_CATALOG,
-	filterToolsByPreset,
-	presetShowsSkillCatalog,
-	TERMINAL_TOOL_NAMES,
-} from "../../../server/tool-manager.js";
+import { AGENT_TOOL_CATALOG, filterToolsByPreset, presetShowsSkillCatalog } from "../../../server/tool-manager.js";
 
-const OTHER_AGENT_TOOLS = AGENT_TOOL_CATALOG.filter((e) => e.group === "other");
-const CONVERSATION_TOOL_NAMES = [
-	...new Set(AGENT_TOOL_CATALOG.filter((tool) => tool.group === "subagent").map((tool) => tool.name)),
-];
+import {
+	buildFlowCategories,
+	buildOnDemandOptions,
+	getFlowState,
+	nextFlowState,
+	applyFlowState,
+	NEVER_LAZY_NAMES,
+} from "../tool-inventory";
 
 interface SettingsTerminalBridge {
 	create: (meta: {
@@ -339,21 +343,6 @@ function ToggleRow({
 				<span className="set-switch-knob" />
 			</button>
 		</div>
-	);
-}
-
-function ToolPromptButton({ name, edited, onEdit }: { name: string; edited: boolean; onEdit: (name: string) => void }) {
-	const t = useT();
-	return (
-		<button
-			type="button"
-			className={`set-icon-btn tool-prompt-edit${edited ? " edited" : ""}`}
-			title={edited ? t("toolPromptEdited") : t("toolPromptEdit")}
-			aria-label={t("toolPromptEdit")}
-			onClick={() => onEdit(name)}
-		>
-			<FiEdit3 />
-		</button>
 	);
 }
 
@@ -648,7 +637,6 @@ interface SettingsPatch extends QuickAskPatch {
 	softCapByModel?: Record<string, number>;
 	reviewPrompt?: string;
 	reviewDisabledSkills?: string[];
-	markersEnabled?: boolean;
 	disabledMarkers?: string[];
 }
 
@@ -710,6 +698,17 @@ function LoadedSettingsModal({
 	const isPi = !isDsh && !isClaude && !isCodex;
 	const defaultTab: SettingsTab = isClaude || isCodex || isDsh ? "models" : "prompt";
 	const [tab, setTab] = useState<SettingsTab>(initialSection ?? defaultTab);
+	// 窄屏改为「首页列表 → 推入二级页」；桌面维持左右分栏。
+	const narrow = useNarrowLayout();
+	// 带 initialSection 打开（如「管理插件」）时直接落在该页，否则停在首页。
+	const [mobileHome, setMobileHome] = useState(() => !initialSection);
+	const wasNarrow = useRef(narrow);
+	useEffect(() => {
+		// 只在「变窄」这一下回首页（宽屏拖窄 / 横竖屏切换），避免停在一个无法返回的二级页；
+		// 首帧不触发，否则会覆盖 initialSection 的深链。
+		if (narrow && !wasNarrow.current) setMobileHome(true);
+		wasNarrow.current = narrow;
+	}, [narrow]);
 	const [pluginSub, setPluginSub] = useState<"official" | "community" | "installed">("official");
 	const bodyRef = useRef<HTMLDivElement>(null);
 	useEffect(() => {
@@ -865,11 +864,7 @@ function LoadedSettingsModal({
 			return next;
 		});
 	};
-	const toolEditAction = (name: string) => {
-		return isDsh ? null : (
-			<ToolPromptButton name={name} edited={editedToolNames.has(name)} onEdit={setEditingToolPrompt} />
-		);
-	};
+
 	const applyToolPromptOverride = (name: string, override: UiToolPromptOverride | null) =>
 		setPartial({ toolPromptOverrides: { [name]: override ?? {} } });
 	const promptTokenEstimate = useMemo(
@@ -886,6 +881,7 @@ function LoadedSettingsModal({
 	const effectiveSendKey = useEffectiveSendKey();
 	const presentAutoOpen = usePresentAutoOpen();
 	const projectClickSwitch = useProjectClickSwitch();
+	const projectOrderManual = useProjectOrderManual();
 	const projectTitle = useProjectTitle();
 	const faviconSettings = useFaviconSettings();
 	const wallpaper = useWallpaperSettings();
@@ -1492,6 +1488,29 @@ function LoadedSettingsModal({
 		}
 	}, [filteredTabs, tab, tabSearchQuery]);
 
+	// 移动端首页：复用页签清单与既有分组，不新增任何入口或文案。
+	const mobileTabOf = (tb: (typeof tabs)[number]) => ({
+		id: tb.id,
+		icon: tb.icon,
+		label: tb.label,
+		count: tb.count,
+		dot: tb.dot,
+		// 目前只有引擎是「不点进去也该看到」的稳定短值，其余留空，避免造文案。
+		value: tb.id === "models" ? engine : undefined,
+	});
+	const mobileGroups: MobileSettingsGroup[] = groupTabs(tabs, (id) => TAB_GROUPS[id] ?? "ui", GROUP_KEYS).map(
+		(group) => ({
+			key: group.key,
+			label: GROUP_LABELS[group.key as keyof typeof GROUP_LABELS] ?? "",
+			tabs: group.tabs.map(mobileTabOf),
+		}),
+	);
+	const mobileResults = filteredTabs.map((tb) => ({
+		...mobileTabOf(tb),
+		group: GROUP_LABELS[(TAB_GROUPS[tb.id] ?? "ui") as keyof typeof GROUP_LABELS] ?? "",
+	}));
+	const showMobileHome = narrow && mobileHome;
+
 	const handleSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
 		if (e.key === "Escape") {
 			if (tabSearchQuery) {
@@ -1565,52 +1584,75 @@ function LoadedSettingsModal({
 		setPartial({ disabledExtensions: [...next] });
 	};
 
-	const SUBAGENT_TOOL_TIPS: Record<string, string> = {
-		conversation: t("toolDescSubagent"),
-		...Object.fromEntries(
-			AGENT_TOOL_CATALOG.filter((tool) => tool.group === "subagent" && tool.descKey).map((tool) => [
-				tool.name,
-				`${t(tool.descKey as any)}${tool.offHintKey ? `\n${t(tool.offHintKey as any)}` : ""}`,
-			]),
-		),
-		subagent_spawn: t("toolDescSubagentSpawn"),
-		subagent_get_result: t("toolDescSubagentGetResult"),
-		subagent_steer: t("toolDescSubagentSteer"),
-		subagent_list: t("toolDescSubagentList"),
-		subagent_stop: t("toolDescSubagentStop"),
-		subagent_wait_all: t("toolDescSubagentWaitAll"),
-		subagent_templates: t("toolDescSubagentTemplates"),
-	};
-	const CORE_TOOL_TIPS: Record<string, string> = Object.fromEntries(
-		CORE_TOOL_CATALOG.map((c) => [c.name, t(c.descKey as any)]),
-	);
-	const toggleAgentTool = (name: string) => {
-		const next = new Set(disabledTools);
-		if (next.has(name)) next.delete(name);
-		else next.add(name);
-		setPartial({ disabledAgentTools: [...next] });
-	};
 	const onDemandTools = settings.toolOnDemandTools ?? [];
 	const onDemandToolNames = new Set(onDemandTools);
-	const toggleOnDemandTool = (name: string) => {
-		const next = new Set(onDemandToolNames);
-		if (next.has(name)) next.delete(name);
-		else next.add(name);
-		setPartial({ toolOnDemandTools: [...next] });
+
+	// 统一库存：内置 + 实时插件 + 孤儿兜底（见 web/src/tool-inventory.ts），不再写死 AGENT+CORE。
+	const onDemandEffectiveCount = onDemandTools.filter((n) => !NEVER_LAZY_NAMES.has(n)).length;
+	// flow-A：分类块 + 流式三态（正式面板单源，旧 chips/各组 ToggleRow 逐步下线）。
+	const [toolFlowQuery, setToolFlowQuery] = useState("");
+	const toolFlowMasterOn = settings.toolLazyLoading === true;
+	const toolFlowInventory = buildOnDemandOptions({
+		plugins: chat.plugins,
+		selections: [...onDemandTools, ...disabledTools, ...Array.from(new Set(settings.disabledPluginTools ?? []))],
+	});
+	const toolFlowCats = buildFlowCategories(toolFlowInventory, { isWindows: isWindowsPlatform() });
+	const getFlowStateFor = (name: string) =>
+		getFlowState(name, {
+			disabled: disabledTools,
+			disabledPlugin: new Set(settings.disabledPluginTools ?? []),
+			onDemand: onDemandToolNames,
+			masterOn: toolFlowMasterOn,
+		});
+	const cycleFlowTool = (name: string, isPlugin: boolean, neverLazy: boolean) => {
+		if (neverLazy || isBlockedByPreset(name)) return;
+		const cur = getFlowStateFor(name);
+		const next = nextFlowState(cur, { masterOn: toolFlowMasterOn, neverLazy });
+		const r = applyFlowState(name, next, {
+			disabled: disabledTools,
+			disabledPlugin: new Set(settings.disabledPluginTools ?? []),
+			onDemand: onDemandToolNames,
+			isPlugin,
+		});
+		const patch: Partial<typeof settings> = {
+			disabledAgentTools: r.disabled,
+			disabledPluginTools: r.disabledPlugin,
+			toolOnDemandTools: r.onDemand,
+		};
+		if (r.needMasterOn && !toolFlowMasterOn) (patch as Record<string, unknown>).toolLazyLoading = true;
+		setPartial(patch);
+	};
+	const bulkFlowCat = (names: string[], isPluginOf: (n: string) => boolean, target: "resident" | "lazy" | "off") => {
+		const d = new Set(disabledTools);
+		const dp = new Set(settings.disabledPluginTools ?? []);
+		const od = new Set(onDemandToolNames);
+		let needMaster = false;
+		for (const n of names) {
+			if (NEVER_LAZY_NAMES.has(n) || isBlockedByPreset(n)) continue;
+			const r = applyFlowState(n, target, { disabled: d, disabledPlugin: dp, onDemand: od, isPlugin: isPluginOf(n) });
+			// applyFlowState 返回的是快照，逐项合并回工作集。
+			d.clear();
+			r.disabled.forEach((x) => d.add(x));
+			dp.clear();
+			r.disabledPlugin.forEach((x) => dp.add(x));
+			od.clear();
+			r.onDemand.forEach((x) => od.add(x));
+			if (r.needMasterOn) needMaster = true;
+		}
+		const patch: Partial<typeof settings> = {
+			disabledAgentTools: [...d],
+			disabledPluginTools: [...dp],
+			toolOnDemandTools: [...od],
+		};
+		if (needMaster && !toolFlowMasterOn) (patch as Record<string, unknown>).toolLazyLoading = true;
+		setPartial(patch);
 	};
 	const disabledPluginTools = new Set(settings.disabledPluginTools ?? []);
-	const togglePluginTool = (name: string) => {
-		const next = new Set(disabledPluginTools);
-		if (next.has(name)) next.delete(name);
-		else next.add(name);
-		setPartial({ disabledPluginTools: [...next] });
-	};
-	const pluginToolGroups = chat.plugins
-		.map((p) => ({ plugin: p, tools: [...(p.agentTools ?? [])].sort((a, b) => a.name.localeCompare(b.name)) }))
-		.filter((g) => g.tools.length > 0);
 
-	const markersEnabled = settings.markersEnabled ?? true;
 	const disabledMarkers = new Set(settings.disabledMarkers ?? []);
+	// 标记没有独立的全局开关：只要还剩一个开着就是启用，全关 = 不再注入/解析标记。
+	const markersOn = (settings.markers ?? []).filter((m) => m.enabled).length;
+	const markersTotal = settings.markers?.length ?? 0;
 	const toggleMarker = (name: string) => {
 		const next = new Set(disabledMarkers);
 		const currentlyEnabled = !next.has(name);
@@ -2105,6 +2147,7 @@ function LoadedSettingsModal({
 	const handleTabChange = (nextTab: SettingsTab) => {
 		flushAllDrafts();
 		setTab(nextTab);
+		if (narrow) setMobileHome(false);
 	};
 
 	useEscapeKey(handleClose, !tplDraft && !ruleDraft && !editingToolPrompt && !presetShareFor && !inspectingSkill);
@@ -2121,12 +2164,26 @@ function LoadedSettingsModal({
 		Object.values(promptOverridesDraft).some((v) => v.trim());
 
 	return (
-		<div className="modal-backdrop" onClick={handleClose}>
-			<div className="modal settings-modal" onClick={(e) => e.stopPropagation()}>
+		<div className={`modal-backdrop${narrow ? " settings-mobile-backdrop" : ""}`} onClick={handleClose}>
+			<div
+				className={`modal settings-modal${narrow ? " is-mobile" : ""}${showMobileHome ? " is-mobile-home" : ""}`}
+				onClick={(e) => e.stopPropagation()}
+			>
 				<div className="modal-head settings-cmd-head">
 					<div className="settings-head-brand">
+						{narrow && (
+							<button
+								type="button"
+								className="settings-mobile-back"
+								onClick={() => setMobileHome(true)}
+								aria-label={t("settingsTitle")}
+								title={t("settingsTitle")}
+							>
+								<FiChevronLeft aria-hidden="true" />
+							</button>
+						)}
 						<FiSettings className="modal-head-icon" />
-						<h2>{t("settingsTitle")}</h2>
+						<h2>{narrow ? (tabs.find((item) => item.id === tab)?.label ?? t("settingsTitle")) : t("settingsTitle")}</h2>
 						<HintTip text={t("settingsDesc")} />
 					</div>
 
@@ -2243,6 +2300,18 @@ function LoadedSettingsModal({
 							})
 						)}
 					</nav>
+					{showMobileHome && (
+						<SettingsMobileHome
+							groups={mobileGroups}
+							results={mobileResults}
+							query={tabSearchQuery}
+							onQueryChange={setTabSearchQuery}
+							onOpen={(id) => handleTabChange(id as SettingsTab)}
+							onClose={handleClose}
+							saveStatus={saveStatus}
+							onRetrySave={retryFailedSave}
+						/>
+					)}
 					<div className="modal-body" ref={bodyRef}>
 						{tab === "models" && (
 							<div className="set-section">
@@ -2467,165 +2536,17 @@ function LoadedSettingsModal({
 						)}
 
 						{tab === "prompt" && (
-							<div className="set-section">
-								<div className="set-section-title">
-									<FiAperture className="set-section-icon" />
-									{t("settingsEngineSection")}
-									<HintTip text={t("settingsEngineHint")} />
-								</div>
-								<div className="set-mode-row" role="radiogroup" aria-label={t("settingsEngineSection")}>
-									{SUPPORTED_ENGINES.map((item) => {
-										const isSelected = item.id === engine;
-										const status = engines.find((e) => e.id === item.id);
-										const isInstalled = item.id === "pi" || (status ? status.installed : false);
-										const isUpdating = Boolean(status?.updating);
-										const isUninstalling = Boolean(status?.uninstalling);
-										const hasUpdate = Boolean(isInstalled && status?.hasUpdate && status?.latestVersion);
-										const showUpdate = hasUpdate || isUpdating;
-										const canUninstall = item.id !== "pi" && isInstalled;
-
-										const handleInstall = (e: React.MouseEvent) => {
-											e.stopPropagation();
-											if (item.installCommand) {
-												runTerminalCommand(t("installEngineTabTitle", { name: item.badge }), item.installCommand);
-											}
-										};
-
-										const handleUpdate = (e: React.MouseEvent) => {
-											e.stopPropagation();
-											if (isUpdating || isUninstalling) return;
-											appSend({ type: "update_engine", engineId: item.id });
-										};
-
-										const handleUninstall = (e: React.MouseEvent) => {
-											e.stopPropagation();
-											if (isUninstalling || isUpdating) return;
-											if (isSelected) return;
-											if (confirmEngineUninstallId === item.id) {
-												setConfirmEngineUninstallId(null);
-												appSend({ type: "uninstall_engine", engineId: item.id });
-											} else {
-												setConfirmEngineUninstallId(item.id);
-											}
-										};
-
-										return (
-											<button
-												key={item.id}
-												type="button"
-												role="radio"
-												aria-checked={isSelected}
-												data-testid={`engine-switch-${item.id}`}
-												title={!isInstalled ? t("engineInstallTip") : undefined}
-												className={`set-mode-btn${isSelected ? " active" : ""}${!isInstalled ? " uninstalled" : ""}`}
-												onClick={() => {
-													if (!isInstalled) {
-														if (item.installCommand) {
-															runTerminalCommand(t("installEngineTabTitle", { name: item.badge }), item.installCommand);
-														}
-														return;
-													}
-													if (!isSelected) appSend({ type: "switch_engine", engine: item.id as EngineId });
-												}}
-											>
-												<div
-													className="set-mode-title"
-													style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6 }}
-												>
-													<div style={{ display: "inline-flex", alignItems: "center", gap: 6, minWidth: 0 }}>
-														{t(item.titleKey) !== item.badge ? (
-															<>
-																<span>{t(item.titleKey)}</span>
-																<span className={`engine-badge ${item.colorClass}`}>{item.badge}</span>
-															</>
-														) : (
-															<span className={`engine-badge ${item.colorClass}`}>{item.badge}</span>
-														)}
-														{!isInstalled ? (
-															<span className="engine-picker-item-tag uninstalled" style={{ marginLeft: 4 }}>
-																{t("engineNotInstalled")}
-															</span>
-														) : isUninstalling ? (
-															<span className="engine-picker-item-tag uninstalling" style={{ marginLeft: 4 }}>
-																{t("engineUninstalling")}
-															</span>
-														) : isUpdating ? (
-															<span className="engine-picker-item-tag update-available" style={{ marginLeft: 4 }}>
-																{t("engineUpdating")}
-															</span>
-														) : null}
-													</div>
-													<div style={{ display: "inline-flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
-														{!isInstalled && item.installCommand && (
-															<button
-																type="button"
-																className="engine-picker-install-btn"
-																title={t("engineInstallTip")}
-																onClick={handleInstall}
-															>
-																<FiDownload className="engine-install-icon" />
-																<span>{t("engineInstall")}</span>
-															</button>
-														)}
-														{showUpdate && (
-															<button
-																type="button"
-																className="engine-picker-update-btn"
-																disabled={isUpdating || isUninstalling}
-																title={
-																	isUpdating
-																		? t("engineUpdating")
-																		: t("engineUpdateTip", {
-																				current: status?.version ?? "",
-																				latest: status?.latestVersion ?? "",
-																			})
-																}
-																onClick={handleUpdate}
-															>
-																<FiRefreshCw className={`engine-update-icon${isUpdating ? " spinning" : ""}`} />
-																<span>{isUpdating ? t("engineUpdating") : t("engineUpdate")}</span>
-															</button>
-														)}
-														{canUninstall && (
-															<button
-																type="button"
-																data-testid={`settings-engine-uninstall-${item.id}`}
-																className={`engine-picker-uninstall-btn${confirmEngineUninstallId === item.id ? " confirm" : ""}`}
-																disabled={isUninstalling || isUpdating || isSelected}
-																title={
-																	isSelected
-																		? t("engineActiveNoUninstall")
-																		: isUninstalling
-																			? t("engineUninstalling")
-																			: confirmEngineUninstallId === item.id
-																				? t("engineUninstallConfirm")
-																				: t("engineUninstallTip")
-																}
-																onClick={handleUninstall}
-															>
-																<FiTrash2 className="engine-uninstall-icon" />
-																<span>
-																	{isUninstalling
-																		? t("engineUninstalling")
-																		: confirmEngineUninstallId === item.id
-																			? t("engineUninstallConfirm")
-																			: t("engineUninstall")}
-																</span>
-															</button>
-														)}
-													</div>
-												</div>
-												<div className="set-mode-desc">{t(item.descKey)}</div>
-											</button>
-										);
-									})}
-								</div>
-								<div className="set-section-title" style={{ marginTop: 16 }}>
-									<FiZap className="set-section-icon" />
-									{t("settingsSystemPrompt")}
+							<div className="set-section prompt-a">
+								{/* A单列流：引擎切换只在「模型」页，此处不再重复展示 */}
+								<div className="prompt-a-engine-note">
+									<span className="prompt-a-dot" />
+									<span className="prompt-a-engine-name">{t("settingsSystemPrompt")}</span>
 									<HintTip
 										text={isDsh ? t("dshPromptSectionsDesc") : `${t("promptComposeHint")}\n${t("promptComposeDesc")}`}
 									/>
+									<button type="button" className="prompt-a-engine-jump" onClick={() => handleTabChange("models")}>
+										{t("settingsEngineSection")} ›
+									</button>
 								</div>
 								{totalContextTokenEstimate > 0 ? (
 									<div className="set-token-meter-card">
@@ -2763,7 +2684,7 @@ function LoadedSettingsModal({
 											<label className="set-field-label">{t("promptTemplateLabel")}</label>
 											<textarea
 												className="set-prompt-input"
-												rows={6}
+												rows={4}
 												spellCheck={false}
 												placeholder={DEFAULT_PROMPT_TEMPLATE}
 												value={promptTemplateDraft}
@@ -3282,55 +3203,61 @@ function LoadedSettingsModal({
 						{tab === "quick-ask" && <QuickAskSettings settings={settings} onChange={setPartial} />}
 
 						{tab === "prompt" && !isDsh && (
-							<div className="set-section">
-								<div className="set-section-title">
+							<details className="set-section prompt-a-fold">
+								<summary className="prompt-a-fold-head">
 									<FiGitBranch className="set-section-icon" />
 									{t("scmCommitMsgSettingsTitle")}
 									<HintTip text={t("scmCommitMsgSettingsDesc")} />
+									<span className="prompt-a-fold-chev">›</span>
+								</summary>
+								<div className="prompt-a-fold-body">
+									<PromptOverrideEditor
+										mode={scmMsgMode}
+										onModeChange={setScmMsgMode}
+										draft={scmMsgDraft}
+										onDraftChange={setScmMsgDraft}
+										defaultPrompt={settings.scmCommitMsgDefaultPrompt}
+										placeholder={t("scmCommitMsgPromptPlaceholder")}
+										rows={4}
+										onCommit={(mode, text) => {
+											setPartial({
+												scmCommitMsgPromptMode: mode,
+												scmCommitMsgPrompt: text,
+											});
+										}}
+										hint={t("scmCommitMsgSettingsHint")}
+										focusRef={scmMsgFocus}
+									/>
 								</div>
-								<PromptOverrideEditor
-									mode={scmMsgMode}
-									onModeChange={setScmMsgMode}
-									draft={scmMsgDraft}
-									onDraftChange={setScmMsgDraft}
-									defaultPrompt={settings.scmCommitMsgDefaultPrompt}
-									placeholder={t("scmCommitMsgPromptPlaceholder")}
-									rows={4}
-									onCommit={(mode, text) => {
-										setPartial({
-											scmCommitMsgPromptMode: mode,
-											scmCommitMsgPrompt: text,
-										});
-									}}
-									hint={t("scmCommitMsgSettingsHint")}
-									focusRef={scmMsgFocus}
-								/>
-							</div>
+							</details>
 						)}
 
 						{tab === "prompt" && !isDsh && (
-							<div className="set-section">
-								<div className="set-section-title">
+							<details className="set-section prompt-a-fold">
+								<summary className="prompt-a-fold-head">
 									<FiEdit3 className="set-section-icon" />
 									{t("planModePromptSettingsTitle")}
 									<HintTip text={t("planModePromptSettingsDesc")} />
+									<span className="prompt-a-fold-chev">›</span>
+								</summary>
+								<div className="prompt-a-fold-body">
+									<PromptOverrideEditor
+										mode={planModeMode}
+										onModeChange={setPlanModeMode}
+										draft={planModeDraft}
+										onDraftChange={setPlanModeDraft}
+										defaultPrompt={settings.planModeDefaultPrompt}
+										placeholder={t("planModePromptPlaceholder")}
+										rows={8}
+										onCommit={(mode, text) => {
+											setPartial({ planModePromptMode: mode, planModePrompt: text });
+										}}
+										modeLabel={t("planModePromptMode")}
+										hint={t("planModePromptSettingsHint")}
+										focusRef={planModeFocus}
+									/>
 								</div>
-								<PromptOverrideEditor
-									mode={planModeMode}
-									onModeChange={setPlanModeMode}
-									draft={planModeDraft}
-									onDraftChange={setPlanModeDraft}
-									defaultPrompt={settings.planModeDefaultPrompt}
-									placeholder={t("planModePromptPlaceholder")}
-									rows={8}
-									onCommit={(mode, text) => {
-										setPartial({ planModePromptMode: mode, planModePrompt: text });
-									}}
-									modeLabel={t("planModePromptMode")}
-									hint={t("planModePromptSettingsHint")}
-									focusRef={planModeFocus}
-								/>
-							</div>
+							</details>
 						)}
 
 						{tab === "scheduler" && !isDsh && (
@@ -3479,28 +3406,7 @@ function LoadedSettingsModal({
 										onToggle={() => setPartial({ toolLazyLoading: settings.toolLazyLoading !== true })}
 									/>
 								)}
-								{!isDsh && (
-									<div className="tpl-pick-block">
-										<div className="tpl-pick-head">
-											<span>
-												{t("toolOnDemandTools")} · {onDemandTools.length}
-											</span>
-											<HintTip text={t("toolOnDemandToolsDesc")} />
-										</div>
-										<div className="tpl-pick">
-											{[...AGENT_TOOL_CATALOG.map((e) => e.name), ...CORE_TOOL_CATALOG.map((c) => c.name)].map((n) => (
-												<label key={n} className={`tpl-chip${onDemandToolNames.has(n) ? " on" : ""}`}>
-													<input
-														type="checkbox"
-														checked={onDemandToolNames.has(n)}
-														onChange={() => toggleOnDemandTool(n)}
-													/>
-													{n}
-												</label>
-											))}
-										</div>
-									</div>
-								)}
+
 								<ToggleRow
 									title={t("toolApprovalEnabled")}
 									tip={isDsh ? t("toolApprovalDshNotice") : t("toolApprovalEnabledDesc")}
@@ -3616,44 +3522,6 @@ function LoadedSettingsModal({
 										}}
 									/>
 								</FieldRow>
-								<div className="set-field-label">
-									{t("toolsSectionCore")}
-									<HintTip text={t("toolsCoreHint")} />
-								</div>
-								{CORE_TOOL_CATALOG.filter(
-									(c) => !c.platform || (c.platform === "win32" ? isWindowsPlatform() : true),
-								).map((c) => {
-									const n = c.name;
-									const blocked = isBlockedByPreset(n);
-									return (
-										<ToggleRow
-											key={n}
-											title={n}
-											tip={CORE_TOOL_TIPS[n]}
-											action={toolEditAction(n)}
-											subtitle={blocked ? t("toolsBlockedByPreset", { name: piPresetName }) : undefined}
-											enabled={!blocked && !disabledTools.has(n)}
-											disabled={blocked}
-											onToggle={() => toggleAgentTool(n)}
-										/>
-									);
-								})}
-								<div className="set-field-label">{t("toolsSectionTerminal")}</div>
-								{TERMINAL_TOOL_NAMES.map((n) => {
-									const blocked = isBlockedByPreset(n);
-									return (
-										<ToggleRow
-											key={n}
-											title={n}
-											tip={t("settingsTerminalToolsDesc")}
-											action={toolEditAction(n)}
-											subtitle={blocked ? t("toolsBlockedByPreset", { name: piPresetName }) : undefined}
-											enabled={!blocked && !disabledTools.has(n)}
-											disabled={blocked}
-											onToggle={() => toggleAgentTool(n)}
-										/>
-									);
-								})}
 								<ToggleRow
 									title={t("terminalBashTakeover")}
 									tip={t("terminalBashTakeoverDesc")}
@@ -3704,46 +3572,298 @@ function LoadedSettingsModal({
 										</FieldRow>
 									</>
 								)}
-								<div className="set-field-label">
-									{t("toolsSectionSubagent")} <HintTip text={t("toolsSubagentDepHint")} />
-								</div>
-								{CONVERSATION_TOOL_NAMES.map((n) => {
-									const names = [n];
-									const blocked = names.some(isBlockedByPreset);
-									return (
-										<ToggleRow
-											key={n}
-											title={n}
-											tip={SUBAGENT_TOOL_TIPS[n]}
-											action={toolEditAction(n)}
-											subtitle={blocked ? t("toolsBlockedByPreset", { name: piPresetName }) : undefined}
-											enabled={!blocked && !names.some((name) => disabledTools.has(name))}
-											disabled={blocked}
-											onToggle={() => toggleAgentTool(n)}
-										/>
-									);
-								})}
-								<div className="set-field-label">
-									{t("settingsMarkers")}
-									<HintTip text={`${t("settingsMarkersDesc")}\n${t("markerRenameTip")}`} />
-								</div>
-								<ToggleRow
-									title={t("markersEnabled")}
-									tip={`${t("markersEnabledDesc")}\n${t("markersOffHint")}`}
-									enabled={markersEnabled}
-									onToggle={() => setPartial({ markersEnabled: !markersEnabled })}
-								/>
-								{markersEnabled && (settings.markers?.length ?? 0) === 0 && (
-									<p className="set-empty">{t("loading")}...</p>
+
+								{!isDsh && (
+									<div className="toolflow-top">
+										<div className="toolflow-counts">
+											{(() => {
+												let rs = 0,
+													lz = 0,
+													of = 0;
+												for (const c of toolFlowCats)
+													for (const it of c.items) {
+														const st = getFlowStateFor(it.name);
+														if (st === "resident") rs++;
+														else if (st === "lazy") lz++;
+														else of++;
+													}
+												return (
+													<>
+														<span className="toolflow-count">
+															{t("toolOnDemandTools")} · {onDemandEffectiveCount}
+														</span>
+														<span className="toolflow-count">
+															常驻<b>{rs}</b>
+														</span>
+														<span className="toolflow-count">
+															按需<b>{lz}</b>
+														</span>
+														<span className="toolflow-count">
+															关闭<b>{of}</b>
+														</span>
+													</>
+												);
+											})()}
+											<HintTip text={t("toolOnDemandToolsDesc")} />
+										</div>
+										<div className="toolflow-search">
+											<span>🔍</span>
+											<input
+												value={toolFlowQuery}
+												onChange={(e) => setToolFlowQuery(e.target.value)}
+												placeholder="搜索工具名 / 描述 / 插件…"
+											/>
+											{toolFlowQuery && (
+												<button type="button" className="tpl-chip" onClick={() => setToolFlowQuery("")}>
+													×
+												</button>
+											)}
+										</div>
+									</div>
 								)}
-								{markersEnabled &&
-									settings.markers &&
-									settings.markers.length > 0 &&
-									settings.markers.map((m) => (
-										<ToggleRow
-											key={m.name}
-											title={
-												m.label
+								{!isDsh &&
+									toolFlowCats.map((cat) => {
+										const title =
+											cat.id === "core"
+												? t("toolsSectionCore")
+												: cat.id === "terminal"
+													? `${t("toolsSectionTerminal")} · ${t("toolsSectionSubagent")}`
+													: cat.id === "other"
+														? t("toolsSectionOther")
+														: cat.id === "plugin"
+															? t("toolsSectionPlugin")
+															: cat.fallbackTitle;
+										const kw = toolFlowQuery.trim().toLowerCase();
+										const items = cat.items.filter((it) => {
+											if (!kw) return true;
+											const desc =
+												it.kind === "plugin"
+													? (it.description ?? it.pluginName ?? "")
+													: it.descKey
+														? String(t(it.descKey as never) ?? "")
+														: "";
+											return (
+												it.name.toLowerCase().includes(kw) ||
+												desc.toLowerCase().includes(kw) ||
+												(it.pluginName ?? "").toLowerCase().includes(kw)
+											);
+										});
+										if (items.length === 0) return null;
+										const isPluginCat = cat.id === "plugin" || cat.id === "orphan";
+										const bulk = (target: "resident" | "lazy" | "off") =>
+											bulkFlowCat(
+												items.filter((it) => !NEVER_LAZY_NAMES.has(it.name)).map((it) => it.name),
+												(n) => isPluginCat || toolFlowInventory.some((x) => x.name === n && x.kind === "plugin"),
+												target,
+											);
+										const groups =
+											cat.id === "plugin"
+												? (() => {
+														const order: string[] = [];
+														const map = new Map<string, typeof items>();
+														for (const it of items) {
+															const pid = it.pluginId ?? "";
+															if (!map.has(pid)) {
+																map.set(pid, []);
+																order.push(pid);
+															}
+															map.get(pid)!.push(it);
+														}
+														return order.map((pid) => {
+															const list = map.get(pid)!;
+															const first = list[0];
+															return {
+																key: pid || "__unknown__",
+																label: first.pluginName ?? pid ?? "未知插件",
+																sub: pid,
+																list,
+															};
+														});
+													})()
+												: [{ key: "__all__", label: "", sub: "", list: items }];
+										return (
+											<div className="toolflow-cat" key={cat.id}>
+												<div className="toolflow-chead">
+													<b>{title}</b>
+													<span className="sub">{cat.sub}</span>
+													<span className="nums">
+														{(() => {
+															let rs = 0,
+																lz = 0,
+																of = 0;
+															for (const it of items) {
+																const st = getFlowStateFor(it.name);
+																if (st === "resident") rs++;
+																else if (st === "lazy") lz++;
+																else of++;
+															}
+															return (
+																<>
+																	<span>常驻 {rs}</span>
+																	<span>按需 {lz}</span>
+																	<span>关闭 {of}</span>
+																</>
+															);
+														})()}
+													</span>
+													<button type="button" className="tpl-chip" onClick={() => bulk("resident")}>
+														全常驻
+													</button>
+													<button type="button" className="tpl-chip" onClick={() => bulk("lazy")}>
+														全按需
+													</button>
+													<button type="button" className="tpl-chip" onClick={() => bulk("off")}>
+														全关
+													</button>
+												</div>
+												{groups.map((g) => {
+													const gBulk = (target: "resident" | "lazy" | "off") =>
+														bulkFlowCat(
+															g.list.filter((it) => !NEVER_LAZY_NAMES.has(it.name)).map((it) => it.name),
+															() => true,
+															target,
+														);
+													return (
+														<div key={g.key}>
+															{g.label ? (
+																<div className="toolflow-subhead">
+																	<b>{g.label}</b>
+																	<span className="sub">{g.sub}</span>
+																	<span className="ops">
+																		<button type="button" className="tpl-chip" onClick={() => gBulk("resident")}>
+																			全常驻
+																		</button>
+																		<button type="button" className="tpl-chip" onClick={() => gBulk("lazy")}>
+																			全按需
+																		</button>
+																		<button type="button" className="tpl-chip" onClick={() => gBulk("off")}>
+																			全关
+																		</button>
+																	</span>
+																</div>
+															) : null}
+															<div
+																className={cat.id === "plugin" ? "toolflow-flow toolflow-flow--wide" : "toolflow-flow"}
+															>
+																{g.list.map((item) => {
+																	const n = item.name;
+																	const neverLazy = item.neverLazy || NEVER_LAZY_NAMES.has(n);
+																	const blocked = isBlockedByPreset(n);
+																	const pluginOff = !!item.pluginId && disabledPlugins.has(item.pluginId);
+																	const st = getFlowStateFor(n);
+																	const desc =
+																		item.kind === "plugin"
+																			? (item.description ?? item.pluginName ?? "")
+																			: item.descKey
+																				? String(t(item.descKey as never) ?? "")
+																				: item.group;
+																	const stateLabel = st === "resident" ? "常驻" : st === "lazy" ? "按需" : "关闭";
+																	const reason = neverLazy
+																		? "核心常驻"
+																		: blocked
+																			? t("toolsBlockedByPreset", { name: piPresetName })
+																			: pluginOff
+																				? t("pluginToolsDisabledByPlugin")
+																				: "";
+																	const fullDesc = desc || item.group;
+																	const capped = fullDesc.length > 42 ? fullDesc.slice(0, 42) + "…" : fullDesc;
+																	const disabled = neverLazy || blocked || pluginOff;
+																	const isPlugin = item.kind === "plugin" || item.kind === "orphan";
+																	return (
+																		<div
+																			key={n}
+																			role="button"
+																			tabIndex={disabled ? -1 : 0}
+																			className="toolflow-chip"
+																			data-s={st}
+																			aria-disabled={disabled}
+																			onClick={() => cycleFlowTool(n, isPlugin, neverLazy)}
+																			onKeyDown={(e) => {
+																				if (e.key === "Enter" || e.key === " ") {
+																					e.preventDefault();
+																					cycleFlowTool(n, isPlugin, neverLazy);
+																				}
+																			}}
+																		>
+																			<div className="nm" data-tip={n}>
+																				<span className="dot" />
+																				<span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{n}</span>
+																			</div>
+																			<div className="st">
+																				<span className="st-text">
+																					{stateLabel} · {desc || item.group}
+																				</span>
+																				<TipButton
+																					className="qbtn"
+																					tip={n + " · " + stateLabel + (reason ? " · " + reason : "") + " — " + capped}
+																					onClick={(e) => e.stopPropagation()}
+																					onKeyDown={(e) => e.stopPropagation()}
+																				>
+																					?
+																				</TipButton>
+																			</div>
+																			{!isDsh && !blocked && !pluginOff ? (
+																				<button
+																					type="button"
+																					className={"editbtn" + (editedToolNames.has(n) ? " has-edit" : "")}
+																					title={
+																						editedToolNames.has(n) ? "文案已自定义，点一下继续改" : "改这个工具的提示词"
+																					}
+																					onClick={(e) => {
+																						e.stopPropagation();
+																						setEditingToolPrompt(n);
+																					}}
+																				>
+																					{editedToolNames.has(n) ? "●✎" : "✎"}
+																				</button>
+																			) : null}
+																		</div>
+																	);
+																})}
+															</div>
+														</div>
+													);
+												})}
+											</div>
+										);
+									})}
+								{markersTotal === 0 && <p className="set-empty">{t("loading")}...</p>}
+								{markersTotal > 0 && settings.markers && (
+									<div className="toolflow-cat">
+										<div className="toolflow-chead">
+											<b>{t("settingsMarkers")}</b>
+											<HintTip text={`${t("settingsMarkersDesc")}\n${t("markerRenameTip")}`} />
+											<span className="sub">
+												{markersOn === 0 ? "已全部关闭" : `${markersOn} / ${markersTotal} 已启用`}
+											</span>
+											<span className="ops">
+												<button
+													type="button"
+													className="tpl-chip"
+													onClick={() => {
+														const keep = new Set(disabledMarkers);
+														for (const m of settings.markers ?? []) keep.delete(m.name);
+														setPartial({ disabledMarkers: [...keep] });
+													}}
+												>
+													全开
+												</button>
+												<button
+													type="button"
+													className="tpl-chip"
+													onClick={() => {
+														const keep = new Set(disabledMarkers);
+														for (const m of settings.markers ?? []) keep.add(m.name);
+														setPartial({ disabledMarkers: [...keep] });
+													}}
+												>
+													全关
+												</button>
+											</span>
+										</div>
+										<div className="toolflow-flow toolflow-flow--wide">
+											{settings.markers.map((m) => {
+												const displayName = m.label
 													? m.label
 													: m.name === "notify"
 														? t("markerGroupNotify")
@@ -3751,134 +3871,111 @@ function LoadedSettingsModal({
 															? t("markerGroupRename")
 															: m.name === "action"
 																? t("markerGroupAction")
-																: m.name
-											}
-											subtitle={m.pluginId ? `[${m.name}] • ${m.pluginId}` : undefined}
-											tip={m.guidance.join("\n")}
-											enabled={m.enabled}
-											onToggle={() => toggleMarker(m.name)}
-										/>
-									))}
+																: m.name;
+												const detail = displayName + " · " + (m.enabled ? "启用" : "关闭");
+												const guide = (m.guidance ?? []).join(" ");
+												const capped = guide.length > 60 ? guide.slice(0, 60) + "…" : guide;
+												return (
+													<div
+														key={m.name}
+														role="button"
+														tabIndex={0}
+														className="toolflow-chip"
+														data-s={m.enabled ? "resident" : "off"}
+														onClick={() => toggleMarker(m.name)}
+														onKeyDown={(e) => {
+															if (e.key === "Enter" || e.key === " ") {
+																e.preventDefault();
+																toggleMarker(m.name);
+															}
+														}}
+													>
+														<div className="nm" data-tip={displayName}>
+															<span className="dot" />
+															<span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{displayName}</span>
+															{m.pluginId ? <span className="plug">{m.pluginId}</span> : null}
+														</div>
+														<div className="st">
+															<span className="st-text">
+																{m.enabled ? "启用" : "关闭"} · {m.pluginId ?? m.name}
+															</span>
+															<TipButton
+																className="qbtn"
+																tip={detail + (capped ? " — " + capped : "")}
+																onClick={(e) => e.stopPropagation()}
+																onKeyDown={(e) => e.stopPropagation()}
+															>
+																?
+															</TipButton>
+														</div>
+													</div>
+												);
+											})}
+										</div>
+									</div>
+								)}
+
 								<div className="set-field-label">{t("toolsSectionOther")}</div>
-								{OTHER_AGENT_TOOLS.map((tool) => {
-									const blocked = isBlockedByPreset(tool.name);
-									const isCodemodeActive = tool.name === "codemode" && !blocked && !disabledTools.has(tool.name);
-									const isConfigExpanded = expandedToolConfigs.has(tool.name);
-
-									const configToggleBtn = isCodemodeActive ? (
-										<button
-											type="button"
-											className={`set-icon-btn tool-sub-config-btn${isConfigExpanded ? " active" : ""}`}
-											title={isConfigExpanded ? t("collapseSection") : t("expandSection")}
-											aria-expanded={isConfigExpanded}
-											aria-label={isConfigExpanded ? t("collapseSection") : t("expandSection")}
-											onClick={() => toggleToolConfigExpand(tool.name)}
-										>
-											<FiSliders />
-										</button>
-									) : null;
-
+								{(() => {
+									const blocked = isBlockedByPreset("codemode");
+									const active = !blocked && !disabledTools.has("codemode");
+									if (!active) return null;
+									const expanded = expandedToolConfigs.has("codemode");
 									return (
-										<div key={tool.name}>
-											<ToggleRow
-												title={tool.name}
-												tip={`${tt(tool.descKey ?? tool.name)}\n${tt(tool.offHintKey ?? tool.name)}`}
-												action={
-													<div style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-														{configToggleBtn}
-														{toolEditAction(tool.name)}
-													</div>
-												}
-												subtitle={blocked ? t("toolsBlockedByPreset", { name: piPresetName }) : undefined}
-												enabled={!blocked && !disabledTools.has(tool.name)}
-												disabled={blocked}
-												onToggle={() => toggleAgentTool(tool.name)}
-											/>
-											{isCodemodeActive && isConfigExpanded && (
-												<div className="tool-sub-config-card">
-													<div className="tool-sub-config-row">
-														<label className="set-field-label">
-															{t("codemodeModeLabel")}
-															<HintTip text={t("codemodeModeHint")} />
-														</label>
-														<select
-															className="set-select"
-															style={{ width: "auto", minWidth: 140 }}
-															value={settings.codemodeMode ?? "on"}
-															onChange={(e) => setPartial({ codemodeMode: e.target.value as "on" | "only" })}
-														>
-															<option value="on">{t("codemodeModeOn")}</option>
-															<option value="only">{t("codemodeModeOnly")}</option>
-														</select>
-													</div>
-													<div className="tool-sub-config-row">
-														<label className="set-field-label">
-															{t("codemodeInlineBudgetLabel")}
-															<HintTip text={t("codemodeInlineBudgetHint")} />
-														</label>
-														<input
-															type="number"
-															className="set-input"
-															style={{ width: 100, textAlign: "right" }}
-															min={500}
-															max={50000}
-															step={500}
-															value={settings.codemodeInlineBudget ?? 3000}
-															onChange={(e) => {
-																const val = parseInt(e.target.value, 10);
-																if (!isNaN(val) && val > 0) {
-																	setPartial({ codemodeInlineBudget: val });
-																}
-															}}
-														/>
-													</div>
+										<div className="tool-sub-config-card">
+											<div className="tool-sub-config-row">
+												<label className="set-field-label">
+													{t("codemodeModeLabel")}
+													<HintTip text={t("codemodeModeHint")} />
+												</label>
+												<div style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+													<button
+														type="button"
+														className={`set-icon-btn tool-sub-config-btn${expanded ? " active" : ""}`}
+														title={expanded ? t("collapseSection") : t("expandSection")}
+														aria-expanded={expanded}
+														aria-label={expanded ? t("collapseSection") : t("expandSection")}
+														onClick={() => toggleToolConfigExpand("codemode")}
+													>
+														<FiSliders />
+													</button>
+													<select
+														className="set-select"
+														style={{ width: "auto", minWidth: 140 }}
+														value={settings.codemodeMode ?? "on"}
+														onChange={(e) => setPartial({ codemodeMode: e.target.value as "on" | "only" })}
+													>
+														<option value="on">{t("codemodeModeOn")}</option>
+														<option value="only">{t("codemodeModeOnly")}</option>
+													</select>
+												</div>
+											</div>
+											{expanded && (
+												<div className="tool-sub-config-row">
+													<label className="set-field-label">
+														{t("codemodeInlineBudgetLabel")}
+														<HintTip text={t("codemodeInlineBudgetHint")} />
+													</label>
+													<input
+														type="number"
+														className="set-input"
+														style={{ width: 100, textAlign: "right" }}
+														min={500}
+														max={50000}
+														step={500}
+														value={settings.codemodeInlineBudget ?? 3000}
+														onChange={(e) => {
+															const val = parseInt(e.target.value, 10);
+															if (!isNaN(val) && val > 0) {
+																setPartial({ codemodeInlineBudget: val });
+															}
+														}}
+													/>
 												</div>
 											)}
 										</div>
 									);
-								})}
-								<div className="set-field-label">
-									{t("toolsSectionPlugin")}
-									<HintTip text={t("toolsPluginHint")} />
-								</div>
-								{pluginToolGroups.length === 0 ? (
-									<p className="set-empty">{chat.plugins.length === 0 ? t("noUiPlugins") : t("pluginToolsEmpty")}</p>
-								) : (
-									pluginToolGroups.map((g) => {
-										const pluginDisabled = disabledPlugins.has(g.plugin.id);
-										return (
-											<div key={g.plugin.id}>
-												<div className="set-row-desc">
-													{g.plugin.icon ? `${g.plugin.icon} ` : ""}
-													{g.plugin.name} · {g.plugin.id}
-													{pluginDisabled ? ` (${t("pluginDisabledInPlugins")})` : ""}
-												</div>
-												{g.tools.map((tool) => (
-													<ToggleRow
-														key={tool.name}
-														title={tool.label && tool.label !== tool.name ? `${tool.label} (${tool.name})` : tool.name}
-														tip={
-															tool.description
-																? `${tool.description}\n${t("pluginToolOffHint")}`
-																: t("pluginToolOffHint")
-														}
-														action={toolEditAction(tool.name)}
-														subtitle={
-															pluginDisabled
-																? t("pluginToolsDisabledByPlugin")
-																: piPresetFiltering
-																	? t("toolsBlockedByPreset", { name: piPresetName })
-																	: undefined
-														}
-														enabled={!pluginDisabled && !piPresetFiltering && !disabledPluginTools.has(tool.name)}
-														disabled={pluginDisabled || piPresetFiltering}
-														onToggle={() => !pluginDisabled && !piPresetFiltering && togglePluginTool(tool.name)}
-													/>
-												))}
-											</div>
-										);
-									})
-								)}
+								})()}
 							</div>
 						)}
 
@@ -4102,7 +4199,9 @@ function LoadedSettingsModal({
 									tip={t("steeringDeliverAllDesc")}
 									enabled={settings.steeringMode !== "one-at-a-time"}
 									onToggle={() =>
-										setPartial({ steeringMode: settings.steeringMode === "one-at-a-time" ? "all" : "one-at-a-time" })
+										setPartial({
+											steeringMode: settings.steeringMode === "one-at-a-time" ? "all" : "one-at-a-time",
+										})
 									}
 								/>
 								<ToggleRow
@@ -4110,7 +4209,9 @@ function LoadedSettingsModal({
 									tip={t("followUpDeliverAllDesc")}
 									enabled={settings.followUpMode !== "one-at-a-time"}
 									onToggle={() =>
-										setPartial({ followUpMode: settings.followUpMode === "one-at-a-time" ? "all" : "one-at-a-time" })
+										setPartial({
+											followUpMode: settings.followUpMode === "one-at-a-time" ? "all" : "one-at-a-time",
+										})
 									}
 								/>
 								<ToggleRow
@@ -4192,6 +4293,12 @@ function LoadedSettingsModal({
 									tip={t("projectClickSwitchDesc")}
 									enabled={projectClickSwitch}
 									onToggle={() => saveProjectClickSwitch(!projectClickSwitch)}
+								/>{" "}
+								<ToggleRow
+									title={t("projectOrderManual")}
+									tip={t("projectOrderManualDesc")}
+									enabled={projectOrderManual}
+									onToggle={() => saveProjectOrderManual(!projectOrderManual)}
 								/>{" "}
 								<ToggleRow
 									title={t("minimalNewChat")}
@@ -6988,194 +7095,19 @@ function LoadedSettingsModal({
 								)}
 
 								{tplDraft && (
-									<div className="modal-backdrop tpl-modal-backdrop" onClick={() => setTplDraft(null)}>
-										<div className="modal tpl-modal" onClick={(e) => e.stopPropagation()}>
-											<button
-												type="button"
-												className="modal-close"
-												aria-label={t("close")}
-												onClick={() => setTplDraft(null)}
-											>
-												<FiX />
-											</button>
-											<div className="modal-head">
-												<FiUsers className="modal-head-icon" />
-												<h2>
-													{tplIsNew ? t("subagentTemplateNew") : `${t("subagentTemplateEdit")} · ${tplDraft.name}`}
-												</h2>
-											</div>
-											<div className="modal-body">
-												<div className="tpl-fields">
-													<input
-														className="set-input"
-														placeholder={t("tplNamePlaceholder")}
-														value={tplDraft.name}
-														onChange={(e) => setTplDraft({ ...tplDraft, name: e.target.value })}
-													/>
-													<input
-														className="set-input"
-														placeholder={t("tplDescriptionPlaceholder")}
-														value={tplDraft.description}
-														onChange={(e) => setTplDraft({ ...tplDraft, description: e.target.value })}
-													/>
-													<input
-														className="set-input"
-														placeholder={t("tplDescriptionEnPlaceholder")}
-														value={tplDraft.descriptionEn ?? ""}
-														onChange={(e) => setTplDraft({ ...tplDraft, descriptionEn: e.target.value })}
-													/>
-												</div>
-												<div className="set-mode-row">
-													<label className="set-field-label">{t("tplPromptModeLabel")}</label>
-													<select
-														className="set-select"
-														value={tplDraft.promptMode}
-														onChange={(e) =>
-															setTplDraft({ ...tplDraft, promptMode: e.target.value as "append" | "replace" })
-														}
-													>
-														<option value="replace">{t("promptModeReplace")}</option>
-														<option value="append">{t("promptModeAppend")}</option>
-													</select>
-												</div>
-												<div className="set-mode-row">
-													<label className="set-field-label">{t("tplModelLabel")}</label>
-													<select
-														className="set-select"
-														value={tplDraft.model ?? ""}
-														onChange={(e) => setTplDraft({ ...tplDraft, model: e.target.value })}
-													>
-														<option value="">{t("subagentFollowMain")}</option>
-														{settings.subagentModels.map((m) => (
-															<option key={`${m.provider}/${m.id}`} value={`${m.provider}/${m.id}`}>
-																{m.label}
-															</option>
-														))}
-													</select>
-												</div>
-												<div className="set-mode-row">
-													<label className="set-field-label">
-														{t("tplThinkingLabel")} <HintTip text={t("tplThinkingHint")} />
-													</label>
-													<select
-														className="set-select"
-														value={tplDraft.thinkingLevel ?? ""}
-														onChange={(e) => setTplDraft({ ...tplDraft, thinkingLevel: e.target.value })}
-													>
-														<option value="">{t("tplThinkingFollowMain")}</option>
-														{THINKING_VALUES.map((v) => (
-															<option key={v} value={v}>
-																{t(`thinking.${v}`)}
-															</option>
-														))}
-													</select>
-												</div>
-												<textarea
-													className="set-prompt-input"
-													rows={4}
-													placeholder={`${t("tplSystemPromptLabel")}${isZhLocale(locale) ? "：" : ": "}${t(
-														"tplSystemPromptPlaceholder",
-													)}`}
-													value={tplDraft.systemPrompt}
-													onChange={(e) => setTplDraft({ ...tplDraft, systemPrompt: e.target.value })}
-												/>
-												<textarea
-													className="set-prompt-input"
-													rows={4}
-													placeholder={`${t("tplSystemPromptLabel")}: ${t("tplSystemPromptEnPlaceholder")}`}
-													value={tplDraft.systemPromptEn ?? ""}
-													onChange={(e) => setTplDraft({ ...tplDraft, systemPromptEn: e.target.value })}
-												/>
-												<div className="tpl-pick-block">
-													<div className="tpl-pick-head">
-														<span>
-															{t("tplSkillsLabel")} · {t("tplWhitelistHint")}
-														</span>
-													</div>
-													{settings.skills.length === 0 ? (
-														<p className="set-hint">{t("noSkills")}</p>
-													) : (
-														<div className="tpl-pick">
-															{settings.skills.map((s) => (
-																<label
-																	key={s.name}
-																	className={`tpl-chip${tplDraft.enabledSkills.includes(s.name) ? " on" : ""}`}
-																>
-																	<input
-																		type="checkbox"
-																		checked={tplDraft.enabledSkills.includes(s.name)}
-																		onChange={(e) => {
-																			const on = e.target.checked;
-																			setTplDraft({
-																				...tplDraft,
-																				enabledSkills: on
-																					? [...tplDraft.enabledSkills, s.name]
-																					: tplDraft.enabledSkills.filter((n) => n !== s.name),
-																			});
-																		}}
-																	/>
-																	{s.name}
-																</label>
-															))}
-														</div>
-													)}
-												</div>
-												<div className="tpl-pick-block">
-													<div className="tpl-pick-head">
-														<span>
-															{t("tplExtensionsLabel")} · {t("tplWhitelistHint")}
-														</span>
-													</div>
-													{settings.extensions.length === 0 ? (
-														<p className="set-hint">{t("noExtensions")}</p>
-													) : (
-														<div className="tpl-pick">
-															{settings.extensions.map((x) => (
-																<label
-																	key={x.id}
-																	className={`tpl-chip${tplDraft.enabledExtensions.includes(x.id) ? " on" : ""}`}
-																>
-																	<input
-																		type="checkbox"
-																		checked={tplDraft.enabledExtensions.includes(x.id)}
-																		onChange={(e) => {
-																			const on = e.target.checked;
-																			setTplDraft({
-																				...tplDraft,
-																				enabledExtensions: on
-																					? [...tplDraft.enabledExtensions, x.id]
-																					: tplDraft.enabledExtensions.filter((id) => id !== x.id),
-																			});
-																		}}
-																	/>
-																	{x.name}
-																</label>
-															))}
-														</div>
-													)}
-												</div>
-											</div>
-											<div className="modal-actions">
-												<button
-													type="button"
-													className="set-save-btn"
-													disabled={!tplDraft.name.trim()}
-													onClick={() => {
-														appSend({
-															type: "save_subagent_template",
-															template: { ...tplDraft, name: tplDraft.name.trim() },
-														});
-														setTplDraft(null);
-													}}
-												>
-													{t("tplSave")}
-												</button>
-												<button type="button" className="dd-refresh" onClick={() => setTplDraft(null)}>
-													{t("tplCancel")}
-												</button>
-											</div>
-										</div>
-									</div>
+									<SubagentTemplateWizard
+										draft={tplDraft}
+										isNew={tplIsNew}
+										skills={settings.skills}
+										extensions={settings.extensions}
+										models={settings.subagentModels}
+										onChange={setTplDraft}
+										onClose={() => setTplDraft(null)}
+										onSave={(d) => {
+											appSend({ type: "save_subagent_template", template: d });
+											setTplDraft(null);
+										}}
+									/>
 								)}
 
 								{settings.subagentTemplates.length === 0 ? (

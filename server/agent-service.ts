@@ -184,6 +184,19 @@ import {
 	roleOutcomeOf,
 	countActiveSubagents,
 } from "./subagent-helpers.js";
+import { SubagentSettleRegistry } from "./subagent-settle.js";
+import { SubagentSpawnBudget } from "./subagent-budget.js";
+import { collectTranscriptFacts, verifyEvidence, type SubagentEvidenceInput } from "./subagent-evidence.js";
+import {
+	buildResumePrompt,
+	disabledSubagentLedger,
+	getSubagentLedger,
+	ledgerBootId,
+	toLedgerEvidence,
+	type LedgerRunRecord,
+	type LedgerRunState,
+	type SubagentLedger,
+} from "./subagent-ledger.js";
 import {
 	createSubagentTask,
 	restartSubagentTask,
@@ -205,6 +218,38 @@ import {
 	conversationParent,
 	parentConversationIdentity,
 } from "./conversation-identity.js";
+
+/**
+ * 会话文件 header 里的真实 cwd（跨机器 workspace URI 会先还原成本地路径）。
+ * 读不到时回落到 fallback —— 不能让一句读盘失败把置顶弄丢。
+ */
+export async function sessionOwnerCwd(sessionFile: string, fallback: string): Promise<string> {
+	try {
+		const headerCwd = restoreWorkspaceUriFromSessionDir((await readCwdFromSessionHeader(resolve(sessionFile))) ?? "");
+		return headerCwd || fallback;
+	} catch {
+		return fallback;
+	}
+}
+
+/**
+ * 过滤掉不属于当前 cwd 的置顶路径。
+ * 历史脏数据（在 A 视图下钉了 B 的会话）就靠这一层拦住，不必要求用户手工清理
+ * `client-state.json`。归属读不出来的路径保留原行为，宁多勿丢。
+ */
+export async function pinnedPathsOwnedBy(paths: string[], cwd: string): Promise<string[]> {
+	const owner = normalizePathKey(cwd);
+	const kept: string[] = [];
+	for (const path of paths) {
+		try {
+			const headerCwd = restoreWorkspaceUriFromSessionDir((await readCwdFromSessionHeader(resolve(path))) ?? "");
+			if (!headerCwd || normalizePathKey(headerCwd) === owner) kept.push(path);
+		} catch {
+			kept.push(path);
+		}
+	}
+	return kept;
+}
 
 const communicationAddress = conversationIdentity;
 import {
@@ -251,23 +296,19 @@ import { goalReviewDenial, shouldDeferPromptForReview } from "./goal-review-gate
 import { readPlanModeFromSession, readPlanFromSession } from "./permission-preset.js";
 import { readDelegateModeFromSession } from "./permission-preset.js";
 
-import {
-	applyHeadTail,
-	makePersistentTerminalTools,
-	makeTerminalBashTool,
-	stripAnsi,
-	TERMINAL_TOOLS_GUIDANCE,
-} from "./terminals.js";
+import { applyHeadTail, makePersistentTerminalTools, makeTerminalBashTool, stripAnsi } from "./terminals.js";
 import {
 	applyAgentToolsGating,
 	ASK_USER_QUESTION_TOOL_NAME,
 	effectiveDisabledAgentTools,
 	filterToolsByPreset,
 	isAgentToolEnabled,
-	isTerminalGuidanceOn,
+	isNeverLazyTool,
 	LAZY_CORE_TOOL_NAMES,
 	lazyLoadingDisabledTools,
 	LOAD_TOOLS_TOOL_NAME,
+	normalizeLazyOnDemandList,
+	partitionLazyTools,
 	CANVAS_TOOL_NAME,
 	localizedName,
 	PI_AGENT_PRESETS,
@@ -337,10 +378,13 @@ import {
 } from "./tool-prompt-overrides.js";
 import {
 	collectSubagentDescendantIds,
+	isSubagentTerminal,
 	makeSubagentTools,
 	subagentTitle,
 	withSubagentOwner,
 	type SubagentSnapshot,
+	type SubagentSteerReceipt,
+	type SubagentResumeResult,
 	type SubagentToolHost,
 } from "./subagents.js";
 import { makeDelegateTaskTool } from "./delegate-task.js";
@@ -551,6 +595,14 @@ import {
 	extractShotImage,
 } from "./browser-page-tool.js";
 import { makeBrowserScriptTool } from "./browser-script-tool.js";
+import {
+	normalizePhoneCallTimeoutMs,
+	collectPhoneArgs,
+	formatPhoneCallResult,
+	formatPhoneError,
+	makePhoneTool,
+	type PhoneCallResult,
+} from "./phone-tool.js";
 export { makeBrowserScriptTool };
 export {
 	makeAskUserQuestionTool,
@@ -604,6 +656,8 @@ export interface Conversation {
 	peerHandoffFrom?: string[];
 	notifyOnDone?: SubagentNotifyMode;
 	subagentTask?: SubagentTaskState;
+	/** 子代理完成时自报并以转录核对过的证据（父代理与 UI 只读）。 */
+	subagentEvidence?: import("./subagent-evidence.js").SubagentEvidence;
 	subagentTaskPending?: () => boolean;
 	subagentTaskStopped?: boolean;
 	subagentDoneNotified?: boolean;
@@ -693,6 +747,7 @@ export interface Conversation {
 }
 
 import { mapSessionsConcurrent } from "./session-scan.js";
+import { SessionListDiskIndex } from "./session-list-index.js";
 import {
 	searchSessions as searchSessionTranscripts,
 	piSessionsRoot,
@@ -837,6 +892,120 @@ export class ClientSession {
 	private pluginModelKeys = new Map<string, string>();
 	private sharedModelRuntime: Awaited<ReturnType<typeof createAgentSessionServices>>["modelRuntime"] | undefined;
 	private turnEndWaiters = new Map<string, Set<(o: RoleWaitOutcome) => void>>();
+	private subagentSettleStore?: SubagentSettleRegistry;
+	private subagentSpawnBudgetStore?: SubagentSpawnBudget;
+
+	/**
+	 * 子代理结算边沿：回合结束 / 停止 / 移出 / 问卷变化 都从这里唤醒等待方。
+	 * 做成原型访问器 + 懒建，测试里的 fake ClientSession（Object.create(prototype)）也能拿到自己的注册表。
+	 */
+	private get subagentSettle(): SubagentSettleRegistry {
+		return (this.subagentSettleStore ??= new SubagentSettleRegistry());
+	}
+
+	/** 每棵运行树的累计派发预算（并发与深度之外的第三道闸）。 */
+	private get subagentSpawnBudget(): SubagentSpawnBudget {
+		return (this.subagentSpawnBudgetStore ??= new SubagentSpawnBudget());
+	}
+
+	private subagentLedgerStore?: SubagentLedger;
+
+	/** 运行账本：dataDir 级单例，同一进程的多个 ClientSession 共用。 */
+	private get subagentLedger(): SubagentLedger {
+		if (!this.subagentLedgerStore) {
+			const dataDir = (this.stateStore as ClientStateStore | undefined)?.dataDir;
+			this.subagentLedgerStore = dataDir ? getSubagentLedger(dataDir) : disabledSubagentLedger();
+		}
+		return this.subagentLedgerStore;
+	}
+
+	/** 派发时登记一条 running；进程死在这里，重启后它就是「被中断的运行」。 */
+	private recordSubagentRunStart(
+		conv: Conversation,
+		info: { prompt: string; template?: string; persist: boolean },
+	): void {
+		const ledger = this.subagentLedger;
+		if (!ledger.enabled) return;
+		const runId = conversationIdentity(conv);
+		const parent = this.parentExecution(conv)?.conv;
+		let sessionFile: string | undefined;
+		try {
+			sessionFile = conv.session.sessionFile ?? undefined;
+		} catch {
+			sessionFile = undefined;
+		}
+		let model: string | undefined;
+		try {
+			const m = conv.session.model;
+			model = m ? `${m.provider}/${m.id}` : undefined;
+		} catch {
+			model = undefined;
+		}
+		const worktree = conv.subagentWorktree;
+		ledger.upsert({
+			runId,
+			parentRunId: parent ? conversationIdentity(parent) : undefined,
+			parentSessionFile: parent ? this.sessionFileOfConversation(parent) : undefined,
+			cwd: conv.cwd,
+			type: conv.subagentType ?? "general",
+			title: conv.title,
+			template: info.template,
+			model,
+			thinking: conv.subagentThinking,
+			prompt: info.prompt,
+			state: "running",
+			bootId: ledgerBootId(),
+			createdAt: Date.now(),
+			updatedAt: Date.now(),
+			sessionFile,
+			persisted: info.persist,
+			worktree: worktree ? { path: worktree.worktreePath, branch: worktree.branch } : undefined,
+		});
+		ledger.event(runId, "spawned", { type: conv.subagentType ?? "general", persist: info.persist });
+	}
+
+	private sessionFileOfConversation(conv: Conversation): string | undefined {
+		try {
+			return conv.session.sessionFile ?? undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** 把当前运行态同步进账本；没登记过的对话（普通对话）直接跳过。 */
+	private syncSubagentLedger(conv: Conversation, opts: { state?: LedgerRunState; event?: string } = {}): void {
+		const ledger = this.subagentLedger;
+		if (!ledger.enabled) return;
+		const runId = conversationIdentity(conv);
+		const previous = ledger.read(runId);
+		if (!previous) return;
+		const outcome = subagentRunOutcome(conv);
+		const state: LedgerRunState = opts.state ?? (outcome.error ? "failed" : outcome.canceled ? "canceled" : "running");
+		let outputTail: string | undefined;
+		try {
+			outputTail = conv.session.getLastAssistantText() ?? undefined;
+		} catch {
+			outputTail = undefined;
+		}
+		const worktree = conv.subagentWorktree;
+		ledger.upsert({
+			...previous,
+			runId,
+			cwd: conv.cwd,
+			type: conv.subagentType ?? previous.type,
+			title: conv.title || previous.title,
+			state,
+			updatedAt: Date.now(),
+			finishedAt: state === "running" ? previous.finishedAt : Date.now(),
+			error: outcome.error ?? previous.error,
+			outputTail: outputTail ?? previous.outputTail,
+			evidence: toLedgerEvidence(conv.subagentEvidence) ?? previous.evidence,
+			worktree: worktree
+				? { path: worktree.worktreePath, branch: worktree.branch, cleanedUp: Boolean(worktree.cleanedUp) }
+				: previous.worktree,
+		});
+		if (opts.event) ledger.event(runId, opts.event);
+	}
 	private pendingSubagentNotices = new Map<string, { timer: NodeJS.Timeout; subagents: Set<Conversation> }>();
 	private deliveringSubagentNotices = new Map<string, number>();
 	private pendingCliManagers = new Set<TerminalManager>();
@@ -1403,8 +1572,8 @@ export class ClientSession {
 				throw new Error(
 					pick(
 						this.getLang(),
-						`同时运行的子代理数量已达上限（${maxSubagents} 个），请先用 subagent(action="wait_all") 等一部分完成、或用 subagent(action="stop") 停掉不需要的再派发`,
-						`Active subagent limit reached (${maxSubagents} live). Wait for some with subagent(action="wait_all") or stop unneeded ones with subagent(action="stop") before spawning more`,
+						`同时运行的子代理数量已达上限（${maxSubagents} 个），请先用 conversation(action="wait_all") 等一部分完成、或用 conversation(action="stop") 停掉不需要的再派发`,
+						`Active subagent limit reached (${maxSubagents} live). Wait for some with conversation(action="wait_all") or stop unneeded ones with conversation(action="stop") before spawning more`,
 						"agent.subagent.limit.reached",
 						{ limit: maxSubagents },
 					),
@@ -1417,6 +1586,22 @@ export class ClientSession {
 		const isEphemeralSubagent = !persist;
 		if (isEphemeralSubagent) {
 			this.spawningSubagents++;
+		}
+		// 运行树累计预算：并发与深度之外再压一道，扇出→收口→再扇出也不会无限烧钱。
+		const budgetRoot = this.subagentRootId(parentId);
+		const budgetReservation = this.subagentSpawnBudget.reserve(budgetRoot);
+		if (!budgetReservation.ok) {
+			releaseSlot?.();
+			if (isEphemeralSubagent) this.spawningSubagents = Math.max(0, this.spawningSubagents - 1);
+			throw new Error(
+				pick(
+					this.getLang(),
+					`本次运行树累计已派发 ${budgetReservation.count} 个子代理（上限 ${budgetReservation.limit}），已拒绝继续派发。先收口已有结果；确实需要更多就把 PI_WEB_SUBAGENT_MAX_SPAWNS_PER_RUN 调大，或在新的顶层对话里开一批。`,
+					`This run tree already spawned ${budgetReservation.count} subagents (limit ${budgetReservation.limit}); further spawns are refused. Collect the results you have; raise PI_WEB_SUBAGENT_MAX_SPAWNS_PER_RUN or start a new top-level conversation for another batch.`,
+					"agent.subagent.budget.reached",
+					{ count: budgetReservation.count, limit: budgetReservation.limit },
+				),
+			);
 		}
 		let handedOffToConv = false;
 		let pendingRuntime: AgentSessionRuntime | undefined;
@@ -1632,6 +1817,7 @@ export class ClientSession {
 			};
 			signal?.addEventListener("abort", onSpawnAbort, { once: true });
 			holder.assertSubagentWorktreeAdmission(conv);
+			this.recordSubagentRunStart(conv, { prompt, template: apply?.name, persist: Boolean(persist) });
 			conv.kickoff = runtime.session
 				.sendUserMessage(prompt)
 				.catch((err) => {
@@ -1657,6 +1843,8 @@ export class ClientSession {
 			holder.emitConversations();
 			return conv.id;
 		} catch (error) {
+			this.subagentSpawnBudget.refund(budgetRoot);
+			if (registered) this.syncSubagentLedger(registered, { state: "failed", event: "spawn_failed" });
 			if (registered) {
 				const home = pendingRuntime && this.findConversationHome?.(pendingRuntime.session);
 				const holder = home?.session ?? this;
@@ -1782,6 +1970,25 @@ export class ClientSession {
 		return max > 0 && this.subagentDepthUnder(parentId) >= max;
 	}
 
+	/**
+	 * 运行树根：沿对话对象上的父子绑定走到最顶层会话；用作累计派发预算的记账键。
+	 * 刻意不投影快照（CLI / 临时对话没有 session，投影会抛）。
+	 */
+	private subagentRootId(parentId: string | undefined): string {
+		if (!parentId) return this.activeId || "session";
+		let conv = this.convs.get(parentId);
+		const seen = new Set<string>();
+		while (conv && !seen.has(conv.id)) {
+			seen.add(conv.id);
+			const parent =
+				(conversationParent(conv) as Conversation | undefined) ??
+				(conv.parentId ? this.convs.get(conv.parentId) : undefined);
+			if (!parent) return conversationIdentity(conv);
+			conv = parent;
+		}
+		return parentId;
+	}
+
 	private subagentOwnerOf(convId: string | undefined): ClientSession {
 		return convId ? (this.resolveExecution(convId)?.session ?? this) : this;
 	}
@@ -1819,6 +2026,87 @@ export class ClientSession {
 			if (cur === self) return true;
 		}
 		return false;
+	}
+
+	/**
+	 * 续跑一条账本运行：进程内子代理会话不落盘，接不上原转录，所以这是「带已知进度重派」。
+	 * 工作树若仍保留，就直接在旧工作树里跑（不新建），未提交的改动不丢。
+	 */
+	async resumeSubagentRun(selfId: string, runId: string, message?: string): Promise<SubagentResumeResult> {
+		const ledger = this.subagentLedger;
+		await ledger.ready();
+		const record = ledger.read(runId);
+		if (!record) return { ok: false, error: "not_found" };
+		const live = this.subagentSnapshotAnywhere(runId);
+		if (live && !isSubagentTerminal(live)) return { ok: false, error: "running", runId };
+		if (record.resumedBy) return { ok: false, error: "already_resumed", runId: record.resumedBy };
+		const parentId = this.subagentCurrentId(selfId);
+		if (!this.convs.get(parentId)) return { ok: false, error: "parent_missing" };
+		const recordedTemplate = record.template ? this.subagentTemplates.get(record.template) : undefined;
+		// 模板可能被删/停用：续跑不假装还带着原角色，明确降级并告知子代理。
+		const template = recordedTemplate && recordedTemplate.enabled !== false ? recordedTemplate : undefined;
+		const templateNote =
+			record.template && !template
+				? `\n\nNote: the original role template "${record.template}" is gone or disabled; you run with the default role.`
+				: "";
+		const cwd = record.worktree && !record.worktree.cleanedUp ? record.worktree.path : record.cwd;
+		const title = pick(
+			this.getLang(),
+			`续跑：${record.title}`,
+			`Resumed: ${record.title}`,
+			"agent.subagent.resume.title",
+			{ title: record.title },
+		);
+		const convId = await this.spawnSubagentConversation(
+			`${buildResumePrompt(record, message)}${templateNote}`,
+			record.type,
+			cwd,
+			template,
+			record.model ?? undefined,
+			parentId,
+			record.persisted,
+			title,
+			record.thinking,
+			true,
+			"none",
+		);
+		const conv = this.convs.get(convId);
+		const executionId = conv ? conversationIdentity(conv) : undefined;
+		const newRunId = executionId ?? convId;
+		const fresh = ledger.read(newRunId);
+		if (fresh) ledger.upsert({ ...fresh, resumedFrom: runId, updatedAt: Date.now() });
+		ledger.markResumed(runId, newRunId);
+		return {
+			ok: true,
+			runId,
+			convId,
+			executionId,
+			mode: "relaunch",
+			previousState: record.state,
+			sessionFile: record.sessionFile,
+		};
+	}
+
+	/** 启动对账：把上一次进程留下的 running 标成 interrupted，并提示可以续跑。 */
+	async recoverSubagentRuns(): Promise<void> {
+		const ledger = this.subagentLedger;
+		if (!ledger.enabled) return;
+		const recovered = await ledger.recover();
+		if (recovered.length === 0) return;
+		const shown = recovered
+			.slice(0, 5)
+			.map((record) => `${record.title || record.type}（${record.runId.slice(0, 8)}）`)
+			.join("、");
+		const more = recovered.length > 5 ? ` 等 ${recovered.length} 个` : "";
+		const notice: ServerMessage = {
+			type: "notice",
+			level: "warning",
+			text: `上次服务重启中断了 ${recovered.length} 个子代理运行：${shown}${more}。用 conversation(action="resume", runId="…") 带已知进度续跑，或 get_result 取已产出的证据。`,
+			textEn: `${recovered.length} subagent run(s) were interrupted by the last restart: ${shown}${more}. Use conversation(action="resume", runId="…") to relaunch with the recorded progress, or get_result for the evidence already produced.`,
+		};
+		// 对账是异步的：已有客户端就直发，否则排队到下次 attach（别只塞 pendingNotices 等下一次连接）。
+		if (this.sinks?.size === 0) this.pendingNotices.push(notice);
+		else this.emit(notice);
 	}
 
 	async spawnSubagentViaHost(
@@ -1905,6 +2193,7 @@ export class ClientSession {
 				conv.subagentWorktreePromise = undefined;
 			}
 		})();
+		void conv.subagentWorktreePromise.finally(() => this.syncSubagentLedger(conv, { event: "worktree_finalized" }));
 		return conv.subagentWorktreePromise;
 	}
 
@@ -1922,6 +2211,8 @@ export class ClientSession {
 			);
 		}
 		const currentOwner = this.resolveExecution(conversationIdentity(conv))?.session;
+		this.syncSubagentLedger(conv, { state: "canceled", event: "stopped" });
+		this.subagentSettle.notify(conv.id);
 		if (!currentOwner) return;
 		currentOwner.scheduleSubagentCompletionNotice(conv);
 		currentOwner.emitConversations();
@@ -1965,16 +2256,16 @@ export class ClientSession {
 		return false;
 	}
 
-	private async steerSubagentRound(conv: Conversation, message: string): Promise<void> {
+	private async steerSubagentRound(conv: Conversation, message: string): Promise<SubagentSteerReceipt> {
 		this.assertSubagentWorktreeAdmission(conv);
 		const session = conv.session;
 		if (session.isStreaming) {
 			await session.sendUserMessage(message, { deliverAs: "steer" });
-			return;
+			return { state: "delivered" };
 		}
 		if (conv.promptInFlight || !session.isIdle) {
 			await session.steer(message);
-			return;
+			return { state: "queued" };
 		}
 
 		const generation = (conv.subagentRunGeneration ?? 0) + 1;
@@ -1985,6 +2276,7 @@ export class ClientSession {
 		conv.subagentConsumedByParent = false;
 		conv.subagentError = undefined;
 		conv.subagentErrorNotified = undefined;
+		this.syncSubagentLedger(conv, { state: "running", event: "steer_restart" });
 		const parentKey = this.parentExecutionKey(conv);
 		if (parentKey) {
 			const pending = this.pendingSubagentNotices.get(parentKey);
@@ -2027,6 +2319,7 @@ export class ClientSession {
 			}
 		})();
 		this.emitConversations();
+		return { state: "restarted" };
 	}
 
 	scheduleSubagentCompletionNotice(conv: Conversation): void {
@@ -2054,6 +2347,7 @@ export class ClientSession {
 		const owner = this.subagentOwnerOf(parentId);
 		owner.emitConversations();
 		if (owner.activeId === (this.subagentCurrentId?.(parentId) ?? parentId)) owner.flushSnapshot();
+		owner.subagentSettle.notifyAll();
 	}
 
 	private drainSuspendedSubagents(conv: Conversation): Conversation[] {
@@ -2349,6 +2643,8 @@ export class ClientSession {
 	}
 
 	private notifyTurnEnd(conv: Conversation): void {
+		this.subagentSettle.notify(conv.id);
+		this.syncSubagentLedger(conv, { event: "turn_end" });
 		if (conv.session.isIdle && !conv.retryState) this.releaseConversationClaims(conv);
 		const set = this.turnEndWaiters.get(conv.id);
 		if (!set || set.size === 0) return;
@@ -2416,6 +2712,11 @@ export class ClientSession {
 		return this.settingsSvc?.current.toolLazyLoading === true;
 	}
 
+	/** 按需加载实际生效？开关开 + 名单非空。名单为空 = 无工具可加载，等同关闭（不挂 load_tools、不出目录段）。 */
+	private lazyEffectiveOn(): boolean {
+		return this.lazyLoadingOn() && this.lazyOnDemandSet().size > 0;
+	}
+
 	private sessionHasTranscript(session: AgentSession): boolean {
 		try {
 			return (session.state?.messages?.length ?? 0) > 0;
@@ -2424,14 +2725,27 @@ export class ClientSession {
 		}
 	}
 
+	private lazyOnDemandSet(): Set<string> {
+		try {
+			return new Set(normalizeLazyOnDemandList(this.settingsSvc.current.toolOnDemandTools));
+		} catch {
+			return new Set();
+		}
+	}
+
 	private lazyLoadedFor(session: AgentSession, seedFromActive: boolean): Set<string> {
 		const existing = this.lazyLoadedBySession.get(session);
 		if (existing) return existing;
 		const seed: string[] = [];
 		if (seedFromActive) {
-			const core = new Set<string>([...LAZY_CORE_TOOL_NAMES, LOAD_TOOLS_TOOL_NAME]);
+			const onDemand = this.lazyOnDemandSet();
 			try {
-				for (const n of session.getActiveToolNames()) if (!core.has(n)) seed.push(n);
+				for (const n of session.getActiveToolNames()) {
+					if (isNeverLazyTool(n)) continue;
+					// 名单制：只记住名单里的已加载，名单外常驻无需记忆。
+					if (onDemand.size > 0 && !onDemand.has(n)) continue;
+					seed.push(n);
+				}
 			} catch {}
 		}
 		const set = new Set(seed);
@@ -2446,13 +2760,14 @@ export class ClientSession {
 		const empty = { names: [] as string[], snippets: {} as Record<string, string>, infos: [] as LoadableToolInfo[] };
 		if (!session || !this.lazyLoadingOn()) return empty;
 		try {
-			const all = this.allowedToolNames(session, conv);
+			const { pending } = this.lazyPartition(session, conv);
+			if (pending.length === 0) return empty;
 			const active = new Set(session.getActiveToolNames());
 			const names: string[] = [];
 			const snippets: Record<string, string> = {};
 			const infos: LoadableToolInfo[] = [];
-			for (const name of all) {
-				if (active.has(name) || name === LOAD_TOOLS_TOOL_NAME) continue;
+			for (const name of pending) {
+				if (active.has(name) || isNeverLazyTool(name)) continue;
 				const def = session.getToolDefinition(name);
 				const snippet = this.toolSnippetOf(def);
 				if (snippet) snippets[name] = snippet;
@@ -2486,8 +2801,15 @@ export class ClientSession {
 					)
 					.map((t) => t.name),
 			);
+			const { pending, loadedLazy } = this.lazyPartition(session, conv);
+			if (pending.length === 0 && loadedLazy.length === 0) {
+				// 名单为空：没有可加载的工具，目录段整段不输出（常驻工具的 schema 已全量下发）。
+				return empty;
+			}
+			// 目录 = 按需名单（不过滤已加载，保证加载前后 system 逐字节相同）；核心/常驻不重复列。
+			const stableSet = new Set([...pending, ...loadedLazy]);
 			const names = this.allowedToolNames(session, conv).filter(
-				(n) => n !== LOAD_TOOLS_TOOL_NAME && !mcpDeferred.has(n),
+				(n) => n !== LOAD_TOOLS_TOOL_NAME && !mcpDeferred.has(n) && stableSet.has(n),
 			);
 			const snippets: Record<string, string> = {};
 			const signatures: Record<string, string> = {};
@@ -2506,10 +2828,8 @@ export class ClientSession {
 		}
 	}
 
-	private allowedToolNames(session: AgentSession, conv: Conversation | undefined): string[] {
-		const all = session.getAllTools().map((t) => t.name);
-		const preset = conv?.agentPreset ?? this.settingsSvc.current.defaultAgentPreset ?? "standard";
-		const allowed = new Set(filterToolsByPreset(all, preset));
+	/** 禁用集单源：内置禁用 + 计划/委派/子代理闸门。插件硬禁用在注册层过滤，不在此处。 */
+	private disabledToolSet(session: AgentSession, conv: Conversation | undefined, all: readonly string[]): Set<string> {
 		const disabled = new Set(effectiveDisabledAgentTools(this.settingsSvc.current));
 		if (conv?.planMode === true) for (const n of PLAN_MODE_BLOCKED_TOOL_NAMES) disabled.add(n);
 		if (conv?.subagentAllowedTools && conv.subagentAllowedTools.size > 0) {
@@ -2522,7 +2842,36 @@ export class ClientSession {
 				disabled.add(toolName);
 			}
 		}
+		return disabled;
+	}
+
+	private allowedToolNames(session: AgentSession, conv: Conversation | undefined): string[] {
+		const all = session.getAllTools().map((t) => t.name);
+		const preset = conv?.agentPreset ?? this.settingsSvc.current.defaultAgentPreset ?? "standard";
+		const allowed = new Set(filterToolsByPreset(all, preset));
+		const disabled = this.disabledToolSet(session, conv, all);
 		return all.filter((n) => allowed.has(n) && !disabled.has(n));
+	}
+
+	/** 延迟上下文单源：allowed + onDemand + loaded 一次算出 resident/pending，供目录/门控/加载共用。 */
+	private lazyPartition(
+		session: AgentSession,
+		conv: Conversation | undefined,
+	): {
+		all: string[];
+		allowed: string[];
+		onDemand: Set<string>;
+		loaded: Set<string>;
+		resident: string[];
+		pending: string[];
+		loadedLazy: string[];
+	} {
+		const all = session.getAllTools().map((t) => t.name);
+		const allowed = this.allowedToolNames(session, conv);
+		const onDemand = this.lazyOnDemandSet();
+		const loaded = this.lazyLoadedFor(session, this.sessionHasTranscript(session));
+		const part = partitionLazyTools({ all, allowed, onDemand, loaded });
+		return { all, allowed, onDemand, loaded, ...part };
 	}
 
 	private toolSnippetOf(def: ToolDefinition | undefined): string {
@@ -2543,6 +2892,15 @@ export class ClientSession {
 		}
 		const base = new Set<string>([...LAZY_CORE_TOOL_NAMES, LOAD_TOOLS_TOOL_NAME]);
 		return all.filter((n) => base.has(n));
+	}
+
+	private lazyResidentNames(session: AgentSession, conv: Conversation | undefined): string[] {
+		try {
+			// 单源划分：常驻 = 允许 - 可延迟名单（含插件），与门控/目录同一口径。
+			return this.lazyPartition(session, conv).resident;
+		} catch {
+			return this.lazyBaselineNames(session);
+		}
 	}
 
 	private loadToolsHost(ownerId: string | undefined): LoadToolsHost {
@@ -2607,20 +2965,12 @@ export class ClientSession {
 			};
 		}
 		const known = new Set(all);
+		// 与 allowedToolNames 同一口径：预设 + 禁用集单源，避免两处手写分歧。
+		// 插件硬禁用在注册层已过滤（不在 known 里），此处按未知处理，提示模型看目录。
 		const preset = conv?.agentPreset ?? this.settingsSvc.current.defaultAgentPreset ?? "standard";
-		const allowed = new Set(filterToolsByPreset(all, preset));
-		const disabled = new Set(effectiveDisabledAgentTools(this.settingsSvc.current));
-		if (conv?.planMode === true) for (const n of PLAN_MODE_BLOCKED_TOOL_NAMES) disabled.add(n);
-		if (conv?.subagentAllowedTools && conv.subagentAllowedTools.size > 0) {
-			for (const t of all) {
-				if (!conv.subagentAllowedTools.has(t)) disabled.add(t);
-			}
-		}
-		if (conv?.subagentSecurityMode === "readonly" || conv?.subagentSecurityMode === "verify") {
-			for (const toolName of SUBAGENT_WRITE_TOOL_NAMES) {
-				disabled.add(toolName);
-			}
-		}
+		const presetAllowed = new Set(filterToolsByPreset(all, preset));
+		const disabled = this.disabledToolSet(session, conv, all);
+		const allowed = new Set(all.filter((n) => presetAllowed.has(n) && !disabled.has(n)));
 		const set = this.lazyLoadedFor(session, this.sessionHasTranscript(session));
 		let activeNow = new Set<string>();
 		try {
@@ -2640,7 +2990,7 @@ export class ClientSession {
 				});
 				continue;
 			}
-			if (name === LOAD_TOOLS_TOOL_NAME || (LAZY_CORE_TOOL_NAMES as readonly string[]).includes(name)) {
+			if (isNeverLazyTool(name)) {
 				rejected.push({
 					name,
 					reason: pick(lang, "常驻核心工具，无需加载", "always available without loading", "loadtools.always"),
@@ -2649,6 +2999,19 @@ export class ClientSession {
 			}
 			if (set.has(name) && activeNow.has(name)) {
 				rejected.push({ name, reason: pick(lang, "已经加载过了", "already loaded", "loadtools.already") });
+				continue;
+			}
+			// 名单制：不在名单里的常驻可用，无需加载。
+			if (!this.lazyOnDemandSet().has(name)) {
+				rejected.push({
+					name,
+					reason: pick(
+						lang,
+						"常驻工具，无需加载（不在按需名单里，直接调用即可）",
+						"always available without loading (not in the on-demand list, call it directly)",
+						"loadtools.always",
+					),
+				});
 				continue;
 			}
 			if (disabled.has(name)) {
@@ -2702,14 +3065,11 @@ export class ClientSession {
 	}
 
 	private autoActivateToolIfLoadable(session: AgentSession, conv: Conversation, name: string): void {
-		if (
-			!this.lazyLoadingOn() ||
-			!name ||
-			name === LOAD_TOOLS_TOOL_NAME ||
-			(LAZY_CORE_TOOL_NAMES as readonly string[]).includes(name)
-		) {
+		if (!this.lazyLoadingOn() || !name || isNeverLazyTool(name)) {
 			return;
 		}
+		// 名单制：只有名单里的才会被 JIT 激活，名单外常驻本就可用。
+		if (!this.lazyOnDemandSet().has(name)) return;
 		const loaded = this.lazyLoadedFor(session, this.sessionHasTranscript(session));
 		if (loaded.has(name)) return;
 		const allowed = new Set(this.allowedToolNames(session, conv));
@@ -2740,7 +3100,6 @@ export class ClientSession {
 		const showSkills = presetShowsSkillCatalog(preset);
 		const effectiveSkills = showSkills ? this.fillSkillContents(src.skills) : [];
 		const realCwd = restoreWorkspaceUriFromSessionDir(src.cwd);
-		const isRemote = isRemoteWorkspaceUri(realCwd);
 		return {
 			cwd: formatCwdForPrompt(realCwd),
 			systemPromptFile: promptBase.system || undefined,
@@ -2758,14 +3117,6 @@ export class ClientSession {
 			pluginSdk: join(getPkgRoot(), "plugin-sdk"),
 			pluginsDir: join(this.stateStore.dataDir, "plugins"),
 			appendFiles: [...promptBase.append],
-			windowsPersona: isRemote
-				? buildRemoteWorkspacePersona(realCwd)
-				: process.platform === "win32"
-					? WINDOWS_PERSONA
-					: "",
-			terminalGuidance: isTerminalGuidanceOn(effectiveDisabledAgentTools(this.settingsSvc.current), preset)
-				? TERMINAL_TOOLS_GUIDANCE
-				: "",
 			markersGuidance: this.markerSvc.buildGuidance(),
 			lang: this.getLang(),
 			contextFiles: src.contextFiles,
@@ -2840,7 +3191,7 @@ export class ClientSession {
 			}
 			const loader = sess.resourceLoader;
 			const preset = conv?.agentPreset ?? this.settingsSvc.current.defaultAgentPreset ?? "standard";
-			const lazyOn = this.lazyLoadingOn();
+			const lazyOn = this.lazyEffectiveOn();
 			const catalog = lazyOn
 				? this.promptToolCatalog(sess, conv)
 				: {
@@ -2848,8 +3199,8 @@ export class ClientSession {
 						snippets: {} as Record<string, string>,
 						signatures: {} as Record<string, string>,
 					};
-			const baseNames = lazyOn ? this.lazyBaselineNames(sess) : active;
-			const baseSet = new Set(baseNames);
+			// 名单制：基线 = 常驻（允许集 - 名单，含核心 + load_tools），目录 = 名单（不重复列常驻）。
+			const baseNames = lazyOn ? this.lazyResidentNames(sess, conv) : active;
 			const snippets: Record<string, string> = {};
 			const signatures: Record<string, string> = catalog.signatures ?? {};
 			const guidelines: string[] = [];
@@ -2861,7 +3212,13 @@ export class ClientSession {
 				if (eff.promptSnippet && eff.promptSnippet.trim() && (lazyOn || ov?.promptSnippet)) {
 					snippets[name] = eff.promptSnippet.trim();
 				}
-				if (baseSet.has(name) && eff.promptGuidelines) guidelines.push(...eff.promptGuidelines);
+			}
+			for (const name of baseNames) {
+				const def = sess.getToolDefinition(name);
+				if (!def) continue;
+				const ov = toolPromptOverrideOf(this.settingsSvc.current.toolPromptOverrides, name);
+				const eff = effectiveToolPrompt(def, ov);
+				if (eff.promptGuidelines) guidelines.push(...eff.promptGuidelines);
 			}
 			const texts = resolveSectionTexts(
 				this.composeInputs({
@@ -3025,15 +3382,24 @@ export class ClientSession {
 				signal,
 			);
 		},
-		completeSubagent: (selfId, summary) => {
+		completeSubagent: (selfId, summary, evidenceInput) => {
 			const owner = this.subagentOwnerOf(selfId);
 			const conv = owner.convs.get(this.subagentCurrentId(selfId));
 			if (!conv?.parentId) throw new Error("Only a child task can complete itself.");
+			// 证据不采信自述：拿它自己的转录核对声称的文件与命令。
+			const facts = collectTranscriptFacts(sessionMessagesOf(conv.session));
+			const evidence = verifyEvidence(evidenceInput ?? {}, facts);
+			if (evidence.issues.length > 0) {
+				return { ok: false, error: evidence.issues[0], issues: evidence.issues, evidence };
+			}
+			conv.subagentEvidence = evidence;
+			owner.syncSubagentLedger(conv, { state: "running", event: "completion_requested" });
 			conv.subagentTask = requestSubagentCompletion(
 				conv.subagentTask ?? createSubagentTask(conv.notifyOnDone),
 				summary,
 			);
-			return { accepted: true, taskPending: owner.subagentTaskPending(conv) };
+			this.subagentSettle.notify(conv.id);
+			return { ok: true, taskPending: owner.subagentTaskPending(conv), evidence };
 		},
 		finalizeSubagentWorktree: async (convId: string) => {
 			const owner = this.subagentOwnerOf(convId);
@@ -3065,9 +3431,23 @@ export class ClientSession {
 			const owner = this.subagentOwnerOf(convId);
 			const curId = owner.convs.has(convId) ? convId : this.subagentCurrentId(convId);
 			const conv = owner.convs.get(curId);
-			if (!conv?.session) return;
-			await owner.steerSubagentRound(conv, message);
+			if (!conv?.session) return { state: "missed" as const };
+			return await owner.steerSubagentRound(conv, message);
 		},
+		waitForSubagentSettle: (ids, opts) => this.subagentSettle.waitFor(ids, opts),
+		listLedgerRuns: async (opts) => {
+			const ledger = this.subagentLedger;
+			await ledger.ready();
+			const limit = Math.max(1, Math.min(opts?.limit ?? 32, 100));
+			return ledger.list().slice(0, limit);
+		},
+		getLedgerRun: async (runId) => {
+			const ledger = this.subagentLedger;
+			await ledger.ready();
+			return ledger.read(runId);
+		},
+		getLedgerEvents: (runId, limit) => this.subagentLedger.events(runId, limit),
+		resumeLedgerRun: (selfId, runId, message) => this.resumeSubagentRun(selfId, runId, message),
 		stopSubagent: (convId) => this.stopSubagentTask(convId),
 		getActiveConversationId: () => this.activeId,
 		dismissSubagent: async (convId, opts) => {
@@ -3337,6 +3717,17 @@ export class ClientSession {
 		return undefined;
 	}
 
+	private phoneSeq = 0;
+	private pendingPhoneCalls = new Map<
+		string,
+		{
+			resolve: (r: PhoneCallResult) => void;
+			timer: ReturnType<typeof setTimeout>;
+			conversationId?: string;
+			timeoutMs: number;
+		}
+	>();
+
 	private pageSeq = 0;
 	private pendingPageCalls = new Map<
 		string,
@@ -3422,7 +3813,6 @@ export class ClientSession {
 				},
 				promptSnapshot: () => this.promptSnapshot(),
 				getMarkerState: () => ({
-					markersEnabled: this.markerSvc.current.markersEnabled,
 					disabledMarkers: [...this.markerSvc.current.disabledMarkers],
 					markers: this.markerSvc.listForUi(),
 				}),
@@ -3728,6 +4118,7 @@ export class ClientSession {
 			);
 		}
 		await cs.bindSession();
+		void cs.recoverSubagentRuns().catch(() => {});
 		const globalDefault = stateStore.getDefaultModel();
 		if (globalDefault) {
 			const slash = globalDefault.indexOf("/");
@@ -3749,7 +4140,7 @@ export class ClientSession {
 			conv.listed = true;
 		}
 
-		const pinnedPaths = botExecution ? [] : (cs.stateStore?.getPinnedSessions(cwd) ?? []);
+		const pinnedPaths = botExecution ? [] : await pinnedPathsOwnedBy(cs.stateStore?.getPinnedSessions(cwd) ?? [], cwd);
 		const maxOpenConversations = getMaxOpenConversations();
 		for (const p of pinnedPaths) {
 			if (cs.convs.size >= maxOpenConversations) break;
@@ -3877,11 +4268,6 @@ export class ClientSession {
 						} else if (process.platform === "win32") {
 							out.push(WINDOWS_PERSONA);
 						}
-						const presetForGuidance =
-							this.convs.get(ownerId ?? "")?.agentPreset ?? this.settingsSvc.current.defaultAgentPreset ?? "standard";
-						if (isTerminalGuidanceOn(effectiveDisabledAgentTools(this.settingsSvc.current), presetForGuidance)) {
-							out.push(TERMINAL_TOOLS_GUIDANCE);
-						}
 						const markerGuidance = this.markerSvc.buildGuidance();
 						if (markerGuidance) out.push(markerGuidance);
 						return out;
@@ -4000,7 +4386,7 @@ export class ClientSession {
 										const conv = this.convs.get(ownerId ?? this.activeId) ?? this.conv;
 										const sess = conv?.session;
 										const activeToolNames = sess ? sess.getActiveToolNames() : [];
-										const lazyOn = this.lazyLoadingOn();
+										const lazyOn = this.lazyEffectiveOn();
 										const catalog =
 											lazyOn && sess
 												? this.promptToolCatalog(sess, conv)
@@ -4009,8 +4395,7 @@ export class ClientSession {
 														snippets: {},
 														signatures: {},
 													};
-										const baseNames = lazyOn && sess ? this.lazyBaselineNames(sess) : activeToolNames;
-										const baseSet = new Set(baseNames);
+										const baseNames = lazyOn && sess ? this.lazyResidentNames(sess, conv) : activeToolNames;
 										const activeSnippets: Record<string, string> = {};
 										const activeSignatures: Record<string, string> = catalog.signatures ?? {};
 										const activeGuidelines: string[] = [];
@@ -4023,9 +4408,13 @@ export class ClientSession {
 												if (eff.promptSnippet && eff.promptSnippet.trim() && (lazyOn || ov?.promptSnippet)) {
 													activeSnippets[name] = eff.promptSnippet.trim();
 												}
-												if (baseSet.has(name) && eff.promptGuidelines) {
-													activeGuidelines.push(...eff.promptGuidelines);
-												}
+											}
+											for (const name of baseNames) {
+												const def = sess.getToolDefinition(name);
+												if (!def) continue;
+												const ov = toolPromptOverrideOf(this.settingsSvc.current.toolPromptOverrides, name);
+												const eff = effectiveToolPrompt(def, ov);
+												if (eff.promptGuidelines) activeGuidelines.push(...eff.promptGuidelines);
 											}
 										}
 										const currentPreset =
@@ -4297,6 +4686,7 @@ export class ClientSession {
 						),
 						makeAskUserQuestionTool(bridge, ownerId),
 						makeBrowserPageTool(bridge, ownerId),
+						makePhoneTool(bridge, ownerId),
 						makeBrowserScriptTool(bridge, ownerId),
 						makeConversationReadTool(this.conversationReadHost(), () => this.getLang(), {
 							listClaims: (cwd) =>
@@ -4679,6 +5069,8 @@ export class ClientSession {
 		const out: { title: string; cwd: string; sessionFile?: string }[] = [];
 		for (const conv of this.convs.values()) {
 			if (!conv.session.isStreaming) continue;
+			// 子代理/持久化子会话由运行账本负责重启对账与续跑，不能当成普通标签页重新打开。
+			if (conv.isSubagent || conv.parentId || conv.subagentPrompt) continue;
 			let sessionFile: string | undefined;
 			try {
 				sessionFile = conv.session.sessionFile ?? undefined;
@@ -5809,6 +6201,8 @@ export class ClientSession {
 			}
 			case "turn_end": {
 				this.emitRun(conv, { type: "turn_end" });
+				// 这一轮写进会话文件后，所属项目的会话列表要跟着刷新（可能属于别的项目）。
+				this.scheduleSessionsPush(conv.cwd);
 				break;
 			}
 			case "message_update": {
@@ -6187,6 +6581,13 @@ export class ClientSession {
 				const h = home();
 				return h.session.pageCall(req, sig, h.convId);
 			},
+			phoneCall: (
+				req: { op: string; args?: Record<string, unknown>; timeoutMs?: number },
+				sig: { aborted?: boolean },
+			) => {
+				const h = home();
+				return h.session.phoneCall(req, sig, h.convId);
+			},
 			canSeeImages: () => home().session.canSeeImages(),
 			transcribeToolImage: (image: { data: string; mimeType: string }, signal?: AbortSignal) =>
 				home().session.transcribeToolImage(image, signal),
@@ -6434,9 +6835,21 @@ export class ClientSession {
 				const home = current();
 				return home.session.answerConsult(conversationIdentity(home.session.convs.get(home.convId)!), runId, requestId);
 			},
-			completeSubagent: (_self, summary) => {
+			completeSubagent: (_self, summary, evidence) => {
 				const home = current();
-				return home.session.subagentHost.completeSubagent!(home.convId, summary);
+				return home.session.subagentHost.completeSubagent!(home.convId, summary, evidence);
+			},
+			waitForSubagentSettle: (ids, opts) => current().session.subagentSettle.waitFor(ids, opts),
+			listLedgerRuns: (opts) =>
+				current().session.subagentHost.listLedgerRuns?.(opts) ?? Promise.resolve([] as LedgerRunRecord[]),
+			getLedgerRun: (runId) => current().session.subagentHost.getLedgerRun?.(runId) ?? Promise.resolve(undefined),
+			getLedgerEvents: (runId, limit) =>
+				current().session.subagentHost.getLedgerEvents?.(runId, limit) ?? Promise.resolve([]),
+			resumeLedgerRun: (_self, runId, message) => {
+				const home = current();
+				const resume = home.session.subagentHost.resumeLedgerRun;
+				if (!resume) return Promise.resolve({ ok: false as const, error: "unsupported" });
+				return resume(home.convId, runId, message);
 			},
 			getPendingConsults: () => {
 				const home = current();
@@ -6715,6 +7128,7 @@ export class ClientSession {
 	}
 
 	private questionsChanged(): void {
+		this.subagentSettle.notifyAll();
 		for (const owner of new Set([this, ...(this.allSubagentSessions?.() ?? [])])) {
 			for (const request of owner.pendingQuestions.values()) owner.notifyUserQuestion(request);
 			owner.emitQuestionQueue();
@@ -7280,6 +7694,14 @@ export class ClientSession {
 			}
 			conv.pendingApprovals.clear();
 		}
+		for (const [id, p] of this.pendingPhoneCalls) {
+			if (p.conversationId !== convId) continue;
+			this.pendingPhoneCalls.delete(id);
+			clearTimeout(p.timer);
+			try {
+				p.resolve({ ok: false, error: "会话已重置或停止，挂起中的手机操控已取消。" });
+			} catch {}
+		}
 		for (const [id, p] of this.pendingPageCalls) {
 			if (p.conversationId !== convId) continue;
 			this.pendingPageCalls.delete(id);
@@ -7384,6 +7806,51 @@ export class ClientSession {
 			this.pendingPageCalls.set(id, { resolve, timer, conversationId, req, timeoutMs });
 			this.emit({ type: "page_request", id, op: req.op, args: req.args, target: req.target, timeoutMs });
 		});
+	}
+
+	/** 手机操控调用：与 pageCall 同一套「服务端发起 → 客户端执行 → 回来兑现 Promise」的桥。 */
+	phoneCall(
+		req: { op: string; args?: Record<string, unknown>; timeoutMs?: number },
+		sig: { aborted?: boolean },
+		conversationId?: string,
+	): Promise<PhoneCallResult> {
+		return new Promise((resolve) => {
+			if (sig?.aborted || this.disposed) {
+				resolve({ ok: false, error: "手机操控已中止（phone aborted）。" });
+				return;
+			}
+			if (this.sinks.size === 0) {
+				resolve({
+					ok: false,
+					error: "没有已连接的手机客户端（no phone connected）。请在手机上打开 pi，并确认无障碍服务已开启。",
+				});
+				return;
+			}
+			const id = `ph-${++this.phoneSeq}`;
+			const timeoutMs = normalizePhoneCallTimeoutMs(req.timeoutMs);
+			const timer = setTimeout(() => {
+				if (this.pendingPhoneCalls.delete(id)) {
+					resolve({
+						ok: false,
+						error: `${Math.round(timeoutMs / 1000)} 秒内没有收到手机响应（timeout ${timeoutMs}ms）。请确认 pi 手机端在前台且无障碍服务已开启。`,
+					});
+				}
+			}, timeoutMs);
+			this.pendingPhoneCalls.set(id, { resolve, timer, conversationId, timeoutMs });
+			this.emit({ type: "phone_request", id, op: req.op, args: req.args, timeoutMs });
+		});
+	}
+
+	resolvePhoneCall(id: string, ok: boolean, result?: unknown, error?: string, conversationId?: string): void {
+		const pending = this.pendingPhoneCalls.get(id);
+		if (conversationId && pending?.conversationId !== conversationId)
+			throw new Error("Phone request does not belong to the shared conversation");
+		if (!pending) return;
+		this.pendingPhoneCalls.delete(id);
+		clearTimeout(pending.timer);
+		pending.resolve(
+			ok ? { ok: true, result } : { ok: false, error: error?.trim() || "手机操作失败（no error message）" },
+		);
 	}
 
 	resolvePageCall(id: string, ok: boolean, result?: unknown, error?: string, conversationId?: string): void {
@@ -8357,7 +8824,6 @@ export class ClientSession {
 		reviewPrompt?: string;
 		reviewDisabledSkills?: string[];
 		disabledPlugins?: string[];
-		markersEnabled?: boolean;
 		disabledMarkers?: string[];
 		quickPhrases?: string[];
 		quickPhrasesEnabled?: boolean;
@@ -8365,18 +8831,14 @@ export class ClientSession {
 		preserveDraftAcrossConversations?: boolean;
 	}): Promise<void> {
 		if (this.botExecution) throw new Error("Bot settings are fixed");
-		const { markersEnabled, disabledMarkers, quickPhrasesSeeded, ...rest } = partial as {
-			markersEnabled?: boolean;
+		const { disabledMarkers, quickPhrasesSeeded, ...rest } = partial as {
 			disabledMarkers?: string[];
 			quickPhrasesSeeded?: boolean;
 		} & typeof partial;
 		if (quickPhrasesSeeded) this.stateStore.markQuickPhrasesSeeded();
 		let markerChanged = false;
-		if (markersEnabled !== undefined || disabledMarkers !== undefined) {
-			this.markerSvc.setAll({
-				...(markersEnabled !== undefined ? { markersEnabled } : {}),
-				...(disabledMarkers !== undefined ? { disabledMarkers } : {}),
-			});
+		if (disabledMarkers !== undefined) {
+			this.markerSvc.setDisabledMarkers(disabledMarkers);
 			markerChanged = true;
 		}
 		await this.settingsSvc.set(rest as never);
@@ -9240,14 +9702,18 @@ export class ClientSession {
 			}
 		}
 		let loadedNames: string[] = [];
-		const lazy = this.lazyLoadingOn();
+		const lazy = this.lazyEffectiveOn();
 		if (lazy) {
 			try {
 				const loaded = this.lazyLoadedFor(session, this.sessionHasTranscript(session));
 				loadedNames = [...loaded];
+				// 名单制：只延迟名单里的工具；名单为空等于都不延迟（仅常驻 + load_tools）。
+				const only = this.lazyOnDemandSet();
 				for (const name of lazyLoadingDisabledTools(
 					session.getAllTools().map((t) => t.name),
 					loaded,
+					undefined,
+					only,
 				)) {
 					disabled.add(name);
 				}
@@ -10196,6 +10662,8 @@ export class ClientSession {
 			this.flushSnapshot();
 			return;
 		}
+
+		this.markProjectConversationActivity(conv.cwd);
 
 		const promptAc = new AbortController();
 		conv.activePromptAc = promptAc;
@@ -12063,6 +12531,9 @@ export class ClientSession {
 			this.turnEndWaiters.delete(id);
 			for (const fn of waiters) fn("gone");
 		}
+		this.syncSubagentLedger(conv, { state: "dismissed", event: "dismissed" });
+		this.subagentSettle.notify(id);
+		this.subagentSpawnBudget.forget(this.subagentRootId(id));
 		try {
 			this.getClaimStore?.().releaseByOwner(id);
 		} catch {}
@@ -12121,6 +12592,11 @@ export class ClientSession {
 		return this.convs.has(convId);
 	}
 
+	/** 这个 conv 对象当前是不是本页持有的那一个（过户回退时用来判断要不要重新 insert）。 */
+	ownsConversation(conv: Conversation): boolean {
+		return this.convs.get(conv.id) === conv;
+	}
+
 	takeoverBriefs(): {
 		id: string;
 		title: string;
@@ -12147,7 +12623,16 @@ export class ClientSession {
 		});
 	}
 
-	async detachTakeoverConversations(
+	/**
+	 * 过户交接第一步：把要搬的对话从当前页的排队/订阅/看门狗里摘出来，组装 payload。
+	 *
+	 * 关键：**本步不动 `this.convs`**。持有权要等目标页 `insertTakeoverConvs` 完成之后，
+	 * 再由 `commitTakeoverRemoval` 摘掉——中间任何一帧都不能出现「两边都不持有」的真空：
+	 * 在飞的工具调用（wait_all 展开后代、subagent 查询）靠 session→conversation 身份反查
+	 * 归属，真空里会直接抛「Calling conversation is no longer available」把整个工具调用判死
+	 * （回归：tests/subagent-takeover-test.mjs）。
+	 */
+	async prepareTakeoverConversations(
 		ids: string[],
 	): Promise<{ ok: true; payload: TakeoverPayload } | { ok: false; reason: "missing" | "empty" }> {
 		if (this.botExecution) return { ok: false, reason: "missing" };
@@ -12171,7 +12656,6 @@ export class ClientSession {
 			for (const conv of convs) delete conv.transferring;
 		}
 		for (const conv of convs) {
-			this.convs.delete(conv.id);
 			this.pluginModelKeys?.delete(conv.id);
 			this.clearAllToolWatchdogs(conv);
 			conv.unsubscribe?.();
@@ -12182,14 +12666,6 @@ export class ClientSession {
 				for (const fn of waiters) fn("gone");
 			}
 			this.goalSvc.notifyTakeover(conv);
-		}
-		if (!this.convs.has(this.activeId)) {
-			const fallback = [...this.convs.values()].find((c) => !c.isSubagent) ?? [...this.convs.values()][0];
-			if (fallback) {
-				this.activeId = fallback.id;
-			} else {
-				await this.newChat();
-			}
 		}
 		const questions: TakeoverQuestion[] = [];
 		for (const [qid, p] of this.pendingQuestions) {
@@ -12219,6 +12695,29 @@ export class ClientSession {
 		}
 		this.questionsChanged();
 		return { ok: true, payload: { convs, questions, pageCalls, approvals } };
+	}
+
+	/**
+	 * 过户交接第二步：目标页接管后摘掉来源页的持有权。同步且必须紧跟在 `insertTakeoverConvs`
+	 * 之后调用（中间不许有 await）——先插入后移除，交接期间对话始终至少有且只有一个持有方。
+	 */
+	commitTakeoverRemoval(payload: TakeoverPayload): void {
+		// 按对象身份摘，不按 id：`insertTakeoverConvs` 在目标页撞号时会把 conv.id 重编，
+		// 那时来源页 map 的 key 还是旧 id，按 id 删会漏（留下一条「已搬走却还在」的幽灵行）。
+		const moved = new Set(payload.convs);
+		for (const [id, conv] of this.convs) if (moved.has(conv)) this.convs.delete(id);
+		if (!this.convs.has(this.activeId)) {
+			const fallback = [...this.convs.values()].find((c) => !c.isSubagent) ?? [...this.convs.values()][0];
+			if (fallback) this.activeId = fallback.id;
+		}
+	}
+
+	async detachTakeoverConversations(
+		ids: string[],
+	): Promise<{ ok: true; payload: TakeoverPayload } | { ok: false; reason: "missing" | "empty" }> {
+		const prepared = await this.prepareTakeoverConversations(ids);
+		if (prepared.ok) this.commitTakeoverRemoval(prepared.payload);
+		return prepared;
 	}
 
 	insertTakeoverConvs(payload: TakeoverPayload): string {
@@ -12368,12 +12867,25 @@ export class ClientSession {
 		}
 	}
 
+	/**
+	 * 只有在真的往项目里发了消息时才算「最近对话」：刷新项目 `lastUsed` 并推给客户端，
+	 * 这样左栏项目顺序只会因为对话而变，浏览/切换不会。
+	 */
+	private markProjectConversationActivity(cwd: string): void {
+		if (!this.stateStore || !cwd) return;
+		try {
+			this.stateStore.remember(this.clientId, cwd);
+			// 推送失败不影响发消息本身（假体会话、断连、无工作区都会在这里抛）
+			void this.pushProjects().catch(() => {});
+		} catch {}
+	}
+
 	private applyCwdSideEffects(abs: string): void {
 		this.roots = this.stateStore.getWorkspaceRoots(this.clientId, abs);
 		try {
 			this.onCwdChanged?.(abs, this.roots);
 		} catch {}
-		this.stateStore.remember(this.clientId, abs);
+		this.stateStore.remember(this.clientId, abs, { promote: false });
 		this.invalidateProjectsCache();
 		void this.pushProjects();
 		this.refreshSessionsOnSwitch();
@@ -12548,6 +13060,7 @@ export class ClientSession {
 				...(sessionFile ? { sessionFile } : {}),
 				...(modified ? { modified } : {}),
 				...(conv.isSubagent ? this.subagentRunOutcome(conv) : {}),
+				...(conv.subagentEvidence ? { subagentVerdict: conv.subagentEvidence.verdict } : {}),
 				...(pendingQuestion
 					? { hasQuestion: true as const, questionId: pendingQuestion.id, questionTitle: pendingQuestion.title }
 					: {}),
@@ -12588,6 +13101,13 @@ export class ClientSession {
 
 	private sessionsRequested = false;
 
+	/**
+	 * 会话跑完一轮后按它自己的 cwd 补推列表的节流句柄（cwd key → timer）。
+	 * 服务端在内容变化时只做缓存失效、不推送：前端「运行中」分组把会话移走之后，
+	 * 所属项目的会话列表里也没有它，得手点项目发一次 list_sessions 重新扫盘才出现。
+	 */
+	private sessionsPushTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
 	private static projectsCache: { at: number; projects: ProjectSummary[] } | null = null;
 	private static readonly PROJECTS_CACHE_TTL = 60_000;
 	private static projectsInFlight: Promise<ProjectSummary[] | null> | null = null;
@@ -12621,6 +13141,8 @@ export class ClientSession {
 	private static sessionInfosGeneration = 0;
 	private static readonly SESSION_INFO_CACHE_TTL = 30_000;
 	private static readonly SESSION_LIST_PARSE_EXTRA = 60;
+	/** 一页至少要这么多条（客户端首屏要的就是这个数）。 */
+	static readonly SESSION_LIST_MIN = 20;
 	static readonly SESSION_LIST_DEFAULT = 200;
 	static readonly SESSION_LIST_MAX = 5000;
 	private static SESSION_LIST_PARSE_LIMIT = ClientSession.SESSION_LIST_DEFAULT + ClientSession.SESSION_LIST_PARSE_EXTRA;
@@ -12631,10 +13153,7 @@ export class ClientSession {
 	): Promise<SessionInfo[]> {
 		const targetCwd = forCwd ?? this.cwd;
 		const listOnly = opts?.listOnly === true;
-		const listLimit = Math.max(
-			ClientSession.SESSION_LIST_DEFAULT,
-			opts?.listLimit ?? ClientSession.SESSION_LIST_DEFAULT,
-		);
+		const listLimit = Math.max(ClientSession.SESSION_LIST_MIN, opts?.listLimit ?? ClientSession.SESSION_LIST_DEFAULT);
 		const parseNeed = listOnly
 			? ClientSession.SESSION_LIST_PARSE_LIMIT + (listLimit - ClientSession.SESSION_LIST_DEFAULT)
 			: Number.POSITIVE_INFINITY;
@@ -12662,6 +13181,10 @@ export class ClientSession {
 			try {
 				const projectDir = SessionManager.create(sessionBaseDir).getSessionDir();
 				const extraRoot = piSessionsRoot() ? resolve(piSessionsRoot()!) : undefined;
+				// 磁盘索引（纯缓存）：命中就不必再读文件内容，只用 readdir + stat 校对文件没变。
+				const diskIndex = SessionListDiskIndex.open(this.stateStore?.dataDir, projectDir);
+				await diskIndex?.ensureLoaded();
+				let enumerationComplete = true;
 
 				const candidateFiles = new Map<string, string>();
 				if (existsSync(projectDir)) {
@@ -12691,7 +13214,10 @@ export class ClientSession {
 									candidateFiles.set(normalizePathKey(fp), fp);
 								}
 							}
-						} catch {}
+						} catch {
+							// 枚举不全时不要根据 present 修剪索引，否则会把没枚举到的条目全删掉
+							enumerationComplete = false;
+						}
 					}
 				}
 
@@ -12724,11 +13250,29 @@ export class ClientSession {
 						if (isOwn(cached.info)) ownCount++;
 						return cached.info;
 					}
+					// 磁盘索引命中：文件 mtime + size 没变，元信息直接用，省掉整份文件扫描。
+					const indexed = diskIndex?.lookup(file);
+					if (indexed) {
+						if (generation === ClientSession.sessionInfosGeneration) {
+							ClientSession.sessionFileCacheStore(file.path, {
+								mtime: file.mtime,
+								size: file.size,
+								info: indexed.info,
+								scan: indexed.scan,
+							});
+						}
+						if (isOwn(indexed.info)) ownCount++;
+						return indexed.info;
+					}
 					if (ownCount >= parseLimit) {
 						truncated = true;
 						return null;
 					}
-					const scanned = await scanSessionListInfo(file.path, file.mtime, cached?.scan);
+					const scanned = await scanSessionListInfo(
+						file.path,
+						file.mtime,
+						cached?.scan ?? diskIndex?.previousScan(file.path),
+					);
 					const info = scanned?.info ?? null;
 					if (info && scanned) {
 						if (generation === ClientSession.sessionInfosGeneration) {
@@ -12739,10 +13283,12 @@ export class ClientSession {
 								scan: scanned.state,
 							});
 						}
+						diskIndex?.remember(file, scanned.state);
 						if (isOwn(info)) ownCount++;
 					}
 					return info;
 				});
+				diskIndex?.reconcile(new Set(validStats.map((f) => normalizePathKey(f.path))), { prune: enumerationComplete });
 
 				const validInfos = results.filter((info): info is SessionInfo => info !== null);
 				const ownInfos = validInfos.filter(isOwn);
@@ -12835,6 +13381,33 @@ export class ClientSession {
 		if (this.sessionsRequested) void this.refreshSessions();
 	}
 
+	/**
+	 * 会话跑完一轮后，按会话自己的 cwd 补推列表：第一轮立刻推，600ms 内的后续轮次
+	 * 合并成一次尾部推送。
+	 * 不推的话前端「运行中」分组随手把会话移走、左栏里又没有它；推迟 600ms 再推的话
+	 * 中间那段空窗就是「跑完闪一下不见了，过一会儿又冒出来」，所以首轮必须立刻推。
+	 */
+	private scheduleSessionsPush(cwd: string): void {
+		if (!cwd || this.disposed || !this.sessionsRequested) return;
+		const key = normalizePathKey(cwd);
+		// 这一轮刚写进会话文件：先让该项目的列表缓存失效，否则推出去还是旧列表。
+		ClientSession.sessionInfosCache.delete(key);
+		const pending = this.sessionsPushTimers.get(key);
+		if (pending) {
+			clearTimeout(pending);
+		} else {
+			void this.pushSessionsForCwd(cwd).catch(() => {});
+		}
+		const timer = setTimeout(() => {
+			this.sessionsPushTimers.delete(key);
+			if (this.disposed) return;
+			ClientSession.sessionInfosCache.delete(key);
+			void this.pushSessionsForCwd(cwd).catch(() => {});
+		}, 600);
+		(timer as unknown as { unref?: () => void }).unref?.();
+		this.sessionsPushTimers.set(key, timer);
+	}
+
 	private sessionListLimits = new Map<string, number>();
 
 	setSessionListLimit(cwd: string, limit?: number): number {
@@ -12842,7 +13415,7 @@ export class ClientSession {
 		if (typeof limit === "number" && Number.isFinite(limit)) {
 			const clamped = Math.min(
 				ClientSession.SESSION_LIST_MAX,
-				Math.max(ClientSession.SESSION_LIST_DEFAULT, Math.floor(limit)),
+				Math.max(ClientSession.SESSION_LIST_MIN, Math.floor(limit)),
 			);
 			this.sessionListLimits.set(key, clamped);
 			return clamped;
@@ -12853,10 +13426,11 @@ export class ClientSession {
 	private async sessionListPayload(targetCwd: string): Promise<{ sessions: SessionSummary[]; hasMore: boolean }> {
 		const limit = this.setSessionListLimit(targetCwd);
 		const infos = await this.loadSessionInfos(targetCwd, { listOnly: true, listLimit: limit });
-		const all = this.buildSessionSummaries(targetCwd, infos, Number.POSITIVE_INFINITY);
+		// 多取一条只是为了判 hasMore：索引命中后 infos 可能是项目全量（上千条），没必要全建摘要。
+		const page = this.buildSessionSummaries(targetCwd, infos, limit + 1);
 		const cached = ClientSession.sessionInfosCache.get(normalizePathKey(targetCwd));
-		const hasMore = all.length > limit || (cached ? !cached.complete : false);
-		return { sessions: all.slice(0, limit), hasMore };
+		const hasMore = page.length > limit || (cached ? !cached.complete : false);
+		return { sessions: page.slice(0, limit), hasMore };
 	}
 
 	private buildSessionSummaries(
@@ -13115,6 +13689,10 @@ export class ClientSession {
 		}
 		this.emitConversations();
 		this.flushSnapshot();
+		// 历史行上的 📌 来自 sessions 摘要（`isSessionPinned`），emitConversations 不会动它：
+		// 不推的话，取消钉住后图标要等点一下项目重新拉列表才消失。按会话自己的 cwd 推，
+		// 在项目 A 里取消属于 B 的钉住时刷的也是 B 的列表。
+		void this.pushSessionsForCwd(conv.cwd).catch(() => {});
 		this.emit({
 			type: "notice",
 			level: "info",
@@ -13129,7 +13707,10 @@ export class ClientSession {
 
 	async pinSession(path: string, pinned: boolean): Promise<void> {
 		const targetPath = resolve(path);
-		this.stateStore?.setSessionPinned(this.cwd, targetPath, pinned);
+		// 置顶归属按会话自身 header 的 cwd 记账：在 A 项目里给 B 项目的会话点钉住，
+		// 记录必须落在 B 名下，否则刷新后它会被当成 A 的置顶会话预打开（跨项目串台）。
+		const pinCwd = await sessionOwnerCwd(targetPath, this.cwd);
+		this.stateStore?.setSessionPinned(pinCwd, targetPath, pinned);
 
 		for (const conv of this.convs.values()) {
 			if (conv.session.sessionFile && resolve(conv.session.sessionFile) === targetPath) {
@@ -13145,7 +13726,10 @@ export class ClientSession {
 
 		this.emitConversations();
 		this.flushSnapshot();
-		await this.refreshSessions();
+		// 摘要里的 pinned 按归属项目的 cwd 记账：与当前项目不同就推那一边的列表，
+		// 否则在这边怎么刷都不会让另一边的图标变化。
+		if (normalizePathKey(pinCwd) === normalizePathKey(this.cwd)) await this.refreshSessions();
+		else await this.pushSessionsForCwd(pinCwd);
 	}
 
 	async renameConversation(id: string, name: string): Promise<void> {
@@ -14513,7 +15097,7 @@ export class ClientSession {
 		await run;
 	}
 
-	private withCurrentCwd(projects: ProjectSummary[], now: number): ProjectSummary[] {
+	private withCurrentCwd(projects: ProjectSummary[], _now: number): ProjectSummary[] {
 		const currentKey = normalizePathKey(this.cwd);
 		const removedKeys = new Set(this.stateStore.getRemovedProjects(this.clientId).map(normalizePathKey));
 		const validProjects = projects.filter((p) => {
@@ -14527,11 +15111,10 @@ export class ClientSession {
 		if (removedKeys.has(currentKey)) {
 			list = validProjects;
 		} else if (validProjects.some((p) => normalizePathKey(p.path) === currentKey)) {
-			list = validProjects.map((p) =>
-				normalizePathKey(p.path) === currentKey ? { ...p, lastUsed: Math.max(p.lastUsed, now) } : p,
-			);
+			// 当前项目不刷时间：项目顺序只认真实对话，切过去看看不该把它顶到最新
+			list = validProjects;
 		} else {
-			list = [{ path: this.cwd, lastUsed: now }, ...validProjects].slice(0, RECENT_PROJECTS_MAX);
+			list = [{ path: this.cwd, lastUsed: 0 }, ...validProjects].slice(0, RECENT_PROJECTS_MAX);
 		}
 
 		const existingKeys = new Set(list.map((p) => normalizePathKey(p.path)));
@@ -15499,6 +16082,8 @@ export class ClientSession {
 			clearTimeout(this.sessionsTimer);
 			this.sessionsTimer = null;
 		}
+		for (const timer of this.sessionsPushTimers.values()) clearTimeout(timer);
+		this.sessionsPushTimers.clear();
 		if (this.widgetsTimer) {
 			clearInterval(this.widgetsTimer);
 			this.widgetsTimer = null;
@@ -15529,6 +16114,8 @@ export class ClientSession {
 			waiters.clear();
 		}
 		this.turnEndWaiters.clear();
+		this.subagentSettle.shutdown();
+		void this.subagentLedger.flush().catch(() => {});
 		try {
 			for (const id of this.convs.keys()) {
 				this.getClaimStore?.().releaseByOwner(id);

@@ -12,6 +12,7 @@ import {
 import { MAX_SUBAGENTS, getMaxSubagents } from "../../server/agent-formatters.js";
 import { countActiveSubagents, isSubagentActive, toSubagentSnapshot } from "../../server/subagent-helpers.js";
 import type { Conversation } from "../../server/agent-service.js";
+import { testSettleWaiter } from "../helpers/subagent-settle.js";
 
 function makeHostSpies() {
 	const host: SubagentToolHost = {
@@ -25,6 +26,7 @@ function makeHostSpies() {
 		dismissSubagent: vi.fn(async () => ({ ok: true })),
 		listTemplates: vi.fn(() => [{ name: "reviewer", description: "只读审查" }]),
 		isTemplateUsable: vi.fn((name: string) => name === "reviewer"),
+		waitForSubagentSettle: testSettleWaiter(),
 	};
 	return host;
 }
@@ -45,7 +47,7 @@ describe("subagents tools", () => {
 		}
 	});
 
-	it("makeSubagentTools 只产出 conversation，SUBAGENT_ACTIONS 包含 13 种 action", () => {
+	it("makeSubagentTools 只产出 conversation，SUBAGENT_ACTIONS 包含 14 种 action", () => {
 		expect(SUBAGENT_ACTIONS).toEqual([
 			"spawn",
 			"complete",
@@ -60,6 +62,7 @@ describe("subagents tools", () => {
 			"consult",
 			"answer",
 			"escalate",
+			"resume",
 		]);
 		const host = makeHostSpies();
 		const tools = makeSubagentTools(host);
@@ -68,6 +71,41 @@ describe("subagents tools", () => {
 		expect(subagent.description.length).toBeGreaterThan(10);
 		expect(subagent.description.length).toBeLessThan(700);
 		expect(subagent.parameters).toBeDefined();
+	});
+
+	it("notifyOnDone 不在联合类型上使用 enum，兼容 Moonshot schema 限制", () => {
+		const [tool] = makeSubagentTools(makeHostSpies());
+		const params = tool.parameters as any;
+		// 顶层与 tasks[] 扇出里的两份 schema 都要干净：供应商校验的是整份工具 schema。
+		const spawnFields = [params.properties.notifyOnDone, params.properties.tasks.items.properties.notifyOnDone];
+		for (const schema of spawnFields) {
+			expect(schema).toMatchObject({ type: ["boolean", "string"] });
+			expect(schema).not.toHaveProperty("enum");
+		}
+	});
+
+	it("notifyOnDone 去掉 schema enum 后由 handler 兜底：只有 false / manual 有意义", async () => {
+		const host = makeHostSpies();
+		const spawn = host.spawnSubagent as unknown as ReturnType<typeof vi.fn>;
+		const [subagent] = makeSubagentTools(host);
+		for (const [raw, expected] of [
+			[false, false],
+			["manual", "manual"],
+			[true, true],
+			// 非法值（模型乱填的字符串/数字）按默认「完成后通知」处理，不许漏进会话状态。
+			["yes", undefined],
+			[1, undefined],
+		] as const) {
+			spawn.mockClear();
+			await subagent.execute!(
+				"t1",
+				{ action: "spawn", prompt: "p", notifyOnDone: raw } as never,
+				undefined,
+				undefined,
+				{ cwd: "/root/proj" } as never,
+			);
+			expect(spawn.mock.calls[0][8]).toBe(expected);
+		}
 	});
 
 	it("缺少 action 或未知 action 时给出明确提示", async () => {
@@ -1274,7 +1312,7 @@ describe("Issue #713 subagent thinking, notification & information flow", () => 
 		expect(host.markSubagentsConsumed).toHaveBeenCalledWith(expect.arrayContaining(["sa-1", "sa-2"]));
 	});
 
-	describe("subagent(action='dismiss') 回收已结束子代理与安全护栏", () => {
+	describe("conversation(action='dismiss') 回收已结束子代理与安全护栏", () => {
 		it("缺少目标参数时报错并指导传参", async () => {
 			const host = makeHostSpies();
 			const [tool] = makeSubagentTools(host, () => "zh");
@@ -1327,7 +1365,7 @@ describe("Issue #713 subagent thinking, notification & information flow", () => 
 			});
 			expect(res.content[0].text).toContain("已移出子代理 sa-done-");
 			expect(res.content[0].text).toContain("移出后不可逆");
-			expect(res.content[0].text).toContain('subagent(action="get_result")');
+			expect(res.content[0].text).toContain('conversation(action="get_result")');
 			expect(res.details.dismissed).toEqual(["sa-done-1"]);
 		});
 

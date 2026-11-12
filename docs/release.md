@@ -52,7 +52,12 @@ node scripts/release-notes.mjs X.Y.Z --base v<上个版本>   # 预览（输出�
 # node scripts/release-notes.mjs X.Y.Z --base v<上个版本> --out /tmp/notes.md --create
 
 # 8) 发布 npm（会自动跑 prepublishOnly 构建）
-npm publish
+#    账号开了 2FA：用「绕过 2FA 的 granular token」直接 npm publish 会被 registry 降级成
+#    staged 发布（版本几分钟后才落库，期间重试只会 409 Cannot publish over previously
+#    staged version；unpublish / 改 dist-tag 更是直接 403）。走带 OTP 的封装：
+NPM_OTP=123456 npm run release:npm     # 预检脏工作区/账号/tag + 带 OTP 发布 + staged 自愈
+#    等价手工命令：npm publish --otp=123456
+#    只想看会打出什么：npm run release:npm -- --dry-run
 
 # 8.5) 桌面安装包（自动，三平台并行，无需手写）
 #    同一个 tag 也触发 .github/workflows/desktop-release.yml，三个 job 同时跑
@@ -70,6 +75,26 @@ npm publish
 #        dmg/AppImage 再广而告之。
 #    签名（SignPath Foundation）以后加在这个 workflow 里——SignPath 只签 CI 产物，
 #    本地 npm run desktop:dist 永远签不上（本地打包只能验证 Windows）。
+
+# 8.6) 手机端 APK + 桌面安装包（本地一键，推荐）
+#    一条命令出齐：桌面（当前平台）+ 手机 arm64（含引擎运行时），并挂到该 tag 的 Release：
+npm run release:local -- vX.Y.Z                # 全量：桌面 + 手机（手机那步 qemu 构建 15–25 分钟）
+npm run release:local -- vX.Y.Z --skip-mobile  # 只打桌面
+npm run release:local -- vX.Y.Z --skip-desktop # 只打手机
+npm run release:local -- vX.Y.Z --no-upload    # 只打包，不碰 Release
+npm run release:local -- vX.Y.Z --portable     # 额外出便携版（内置 Git/Node，较慢）
+#    脚本会先校验 tag 与 package.json 版本一致，然后：npm run build → 桌面打包 → （可选）构建
+#    arm64 运行时并打 APK → 生成 SHA256SUMS.txt → gh release upload --clobber。
+#    为什么本地优先：手机 APK 里带 280 MB 引擎运行时，CI 那份 qemu 又慢又每次换 debug 签名
+#    （新包装不上旧包，连手机上的引擎数据一起清）；桌面 Windows 安装包本地几分钟就出。
+#    两个已知限制：
+#      - Windows 的 NSIS 安装包本地生不出来（electron-builder 打完要执行刚产出的 setup.exe
+#        生成卸载器，本机被系统拦下：ERR_ELECTRON_BUILDER_CANNOT_EXECUTE / exit code null），
+#        所以本地出的是免安装 zip（release/pi-web-ui-desktop-<版本>-win-x64-portable.zip）；
+#        需要正式安装包时用 CI 的 desktop-release windows job。
+#      - macOS / Linux 安装包只能在对应系统上打，仍由 .github/workflows/desktop-release.yml 出。
+#    .github/workflows/mobile-release.yml 保留但改成手动触发（Actions 里点），用于云端兜底；
+#    它需要可选的 MOBILE_KEYSTORE_BASE64 等 secrets 才能发出可升级的包。
 
 # 9) 验证
 npm view pi-web-ui version        # 应显示新版本（registry 有缓存延迟属正常）

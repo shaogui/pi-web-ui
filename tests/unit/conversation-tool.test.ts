@@ -55,8 +55,11 @@ describe("conversation compatibility", () => {
 		expect(Object.keys(schema.properties)).toEqual([
 			"action",
 			"prompt",
+			"key",
+			"tasks",
 			"message",
 			"summary",
+			"evidence",
 			"payload",
 			"runId",
 			"runIds",
@@ -84,13 +87,15 @@ describe("conversation compatibility", () => {
 			"timeoutSeconds",
 		]);
 		expect(schema.required).toEqual(["action"]);
-		expect(schema.properties.action.enum).toHaveLength(16);
+		expect(schema.properties.action.enum).toHaveLength(17);
 		expect(json).not.toMatch(/"(anyOf|oneOf|allOf|minLength|minItems|maxItems|minimum|maximum)"/);
-		expect(json.length).toBeLessThan(1900);
+		expect(json.length).toBeLessThan(2600);
 		// 纯文本问答：结构化问题/回答只留在 ask_user_question。
 		expect(schema.properties.questions).toBeUndefined();
 		expect(schema.properties.answers).toBeUndefined();
-		expect(schema.properties.notifyOnDone.enum).toEqual([true, false, "manual"]);
+		// 联合类型上不写 enum：Moonshot 等严格端点只接受「单一 primitive + enum」，
+		// 联合类型带 enum 会让整轮请求 400；约束改由 handler 收口（见 subagents 单测）。
+		expect(schema.properties.notifyOnDone.enum).toBeUndefined();
 		// 严格校验端点（Moonshot 等）要求 Type.Unsafe 显式声明 type，见 tool-registration 单测。
 		expect(schema.properties.notifyOnDone.type).toEqual(["boolean", "string"]);
 	});

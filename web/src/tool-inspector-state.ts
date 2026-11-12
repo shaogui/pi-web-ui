@@ -21,6 +21,8 @@ export interface ToolInspectorState {
 	statusClass?: "ok" | "run" | "err" | "idle";
 	duration?: string;
 	durationMs?: number;
+	startTimestamp?: number;
+	endTimestamp?: number;
 	exitHint?: string;
 	hints?: ToolArgHints;
 	args?: string;
@@ -55,8 +57,22 @@ export function closeToolInspector(): void {
 	notify();
 }
 
-export function updateToolInspectorLive(toolCallId: string, patch: Partial<ToolInspectorState>): void {
-	if (!activeState || activeState.isThinking || activeState.toolCallId !== toolCallId) {
+export type ToolInspectorLiveKind = "tool" | "thinking";
+
+/**
+ * 实时同步更新当前检查器弹窗数据（仅当已打开弹窗的 toolCallId 相同、且种类一致时更新）。
+ * 用于工具执行 / 思考过程中的流式增量输出与状态平滑切换，避免弹窗定格在旧快照。
+ * kind 必须与已打开弹窗种类一致：思考弹窗只吃思考增量、工具弹窗只吃工具增量，防两条流互相覆盖。
+ */
+export function updateToolInspectorLive(
+	toolCallId: string,
+	patch: Partial<ToolInspectorState>,
+	kind: ToolInspectorLiveKind = "tool",
+): void {
+	if (!activeState || activeState.toolCallId !== toolCallId) {
+		return;
+	}
+	if (activeState.isThinking !== (kind === "thinking")) {
 		return;
 	}
 	let changed = false;
@@ -71,6 +87,20 @@ export function updateToolInspectorLive(toolCallId: string, patch: Partial<ToolI
 		activeState = { ...activeState, ...patch };
 		notify();
 	}
+}
+
+/**
+ * 把已打开弹窗的归属 id 迁移到新 id。
+ * 流式消息落地成持久消息时同一条思考会换壳（stream-xxx → a-xxx），
+ * 不迁移的话后续增量全部匹配不上，弹窗会定格在换壳前的快照。
+ */
+export function retargetToolInspector(fromId: string, toId: string): boolean {
+	if (!activeState || fromId === toId || activeState.toolCallId !== fromId) {
+		return false;
+	}
+	activeState = { ...activeState, toolCallId: toId };
+	notify();
+	return true;
 }
 
 export function getToolInspectorState(): ToolInspectorState | null {

@@ -39,6 +39,7 @@ import {
 	FiZap,
 } from "react-icons/fi";
 import type { ToolStatus, UiImageBlock, UiMessage, UiToolCallBlock } from "../types";
+import { formatDuration as formatDurationShared, formatTimeFull, resolveToolTimeRange } from "../tool-time";
 import { isZhLocale, useLocale, useT } from "../i18n";
 import { openContextMenu } from "../context-menu-state";
 import { openToolInfo } from "../tool-info-state";
@@ -180,6 +181,8 @@ function useToolInspectorLiveSync({
 	statusLabel,
 	duration,
 	durationMs,
+	startTimestamp,
+	endTimestamp,
 	exitHint,
 	isError,
 	isBash,
@@ -192,6 +195,8 @@ function useToolInspectorLiveSync({
 	statusLabel: string;
 	duration: string;
 	durationMs?: number;
+	startTimestamp?: number;
+	endTimestamp?: number;
 	exitHint: string;
 	isError: boolean;
 	isBash: boolean;
@@ -225,6 +230,8 @@ function useToolInspectorLiveSync({
 			statusClass,
 			duration,
 			durationMs,
+			startTimestamp,
+			endTimestamp,
 			exitHint,
 			rawOutput: currentRaw,
 			output: currentOutput,
@@ -243,6 +250,8 @@ function useToolInspectorLiveSync({
 		statusLabel,
 		duration,
 		durationMs,
+		startTimestamp,
+		endTimestamp,
 		exitHint,
 		isError,
 		isBash,
@@ -280,6 +289,7 @@ const ToolCallCapsule = memo(function ToolCallCapsule({
 	const statusDuration = view.status?.durationMs;
 	const resultDuration = (view.result as unknown as { durationMs?: number } | undefined)?.durationMs;
 	const durationMs = typeof resultDuration === "number" ? resultDuration : statusDuration;
+	const timeRange = resolveToolTimeRange(view.result?.timestamp, resultDuration, statusDuration);
 
 	const statusClass = isError ? "err" : done ? "ok" : running || waitingModel ? "run" : "idle";
 	let statusLabel = isError
@@ -291,7 +301,7 @@ const ToolCallCapsule = memo(function ToolCallCapsule({
 				: waitingModel
 					? t("toolDoneWaitingModel")
 					: t("toolQueued");
-	const duration = (waitingModel || done) && durationMs !== undefined ? formatDuration(durationMs) : "";
+	const duration = (waitingModel || done) && durationMs !== undefined ? formatDurationShared(durationMs) : "";
 	if ((waitingModel || done) && duration) statusLabel = `${statusLabel} · ${duration}`;
 
 	const exitHint = waitingModel && view.status?.exitCode !== undefined ? `exit ${view.status.exitCode}` : "";
@@ -306,6 +316,8 @@ const ToolCallCapsule = memo(function ToolCallCapsule({
 		statusLabel,
 		duration,
 		durationMs,
+		startTimestamp: timeRange.start,
+		endTimestamp: timeRange.end,
 		exitHint,
 		isError,
 		isBash,
@@ -399,6 +411,8 @@ const ToolCallCapsule = memo(function ToolCallCapsule({
 			statusClass,
 			duration,
 			durationMs,
+			startTimestamp: timeRange.start,
+			endTimestamp: timeRange.end,
 			exitHint,
 			hints,
 			args: block.argumentsText || "",
@@ -605,6 +619,11 @@ const ToolCallCard = memo(function ToolCallCard({
 		if (typeof resultDuration === "number") durationMsRef.current = resultDuration;
 	}, [statusDuration, resultDuration]);
 	const durationMs = typeof resultDuration === "number" ? resultDuration : (statusDuration ?? durationMsRef.current);
+	const timeRange = resolveToolTimeRange(
+		view.result?.timestamp,
+		resultDuration,
+		statusDuration ?? durationMsRef.current,
+	);
 
 	const statusClass = isError ? "err" : done ? "ok" : running || waitingModel ? "run" : "idle";
 	let statusLabel = isError
@@ -616,7 +635,7 @@ const ToolCallCard = memo(function ToolCallCard({
 				: waitingModel
 					? t("toolDoneWaitingModel")
 					: t("toolQueued");
-	const duration = (waitingModel || done) && durationMs !== undefined ? formatDuration(durationMs) : "";
+	const duration = (waitingModel || done) && durationMs !== undefined ? formatDurationShared(durationMs) : "";
 	if ((waitingModel || done) && duration) statusLabel = `${statusLabel} · ${duration}`;
 
 	const exitHint = waitingModel && view.status?.exitCode !== undefined ? `exit ${view.status.exitCode}` : "";
@@ -638,6 +657,8 @@ const ToolCallCard = memo(function ToolCallCard({
 		statusLabel,
 		duration,
 		durationMs,
+		startTimestamp: timeRange.start,
+		endTimestamp: timeRange.end,
 		exitHint,
 		isError,
 		isBash,
@@ -728,6 +749,8 @@ const ToolCallCard = memo(function ToolCallCard({
 			statusClass,
 			duration,
 			durationMs,
+			startTimestamp: timeRange.start,
+			endTimestamp: timeRange.end,
 			exitHint,
 			hints,
 			args: block.argumentsText || "",
@@ -1000,6 +1023,24 @@ const ToolCallCard = memo(function ToolCallCard({
 					{waitingModel && output.length === 0 && (
 						<div className="toolcall-waiting">
 							<span className="cursor" /> {t("waitingModel")}
+						</div>
+					)}
+					{(timeRange.start !== undefined || timeRange.end !== undefined) && (
+						<div className="toolcall-time-footer">
+							<FiClock className="toolcall-time-icon" />
+							<span className="toolcall-time-text">
+								{timeRange.start !== undefined && timeRange.end !== undefined && timeRange.durationMs !== undefined
+									? t("toolTimeRange", {
+											start: formatTimeFull(timeRange.start),
+											end: formatTimeFull(timeRange.end),
+											duration: formatDurationShared(timeRange.durationMs),
+										})
+									: timeRange.end !== undefined
+										? formatTimeFull(timeRange.end)
+										: timeRange.start !== undefined
+											? formatTimeFull(timeRange.start)
+											: ""}
+							</span>
 						</div>
 					)}
 					{uiToolCardFooter && uiToolCardFooter.length > 0 && (

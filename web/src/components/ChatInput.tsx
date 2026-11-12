@@ -1,7 +1,15 @@
 import { Fragment, memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { appResourceCrossOrigin } from "../base-url";
 import { FiList, FiSquare, FiPaperclip, FiArrowUp, FiBookOpen, FiMic, FiCamera } from "react-icons/fi";
-import type { FileSearchResult, ModelInfo, ProviderKeyInfo, SlashCommandInfo, UiMessage, UiState } from "../types";
+import type {
+	FileSearchResult,
+	ModelInfo,
+	ProviderKeyInfo,
+	ProviderStatus,
+	SlashCommandInfo,
+	UiMessage,
+	UiState,
+} from "../types";
 import { isZhLocale, useT, useI18n } from "../i18n";
 import { appSend, useAppField, useIsDsh, useEngineCapabilities } from "../app-globals";
 import { mapCanvasHits, searchCanvasMentions } from "../canvas-mentions";
@@ -40,6 +48,7 @@ import { getPluginComposerProvider, listPluginComposerProviders } from "../plugi
 import { detectTouchFirstDevice } from "../touch-device";
 import { resolveEnterAction, useEffectiveSendKey } from "../composer-keys";
 import { resolveBackspaceMention } from "../chat-input-backspace";
+import { projectNameFromCwd } from "../title-settings";
 import { copyTextToClipboard } from "../use-copy-feedback";
 import { useImeCompositionGuard } from "../use-ime-composition-guard";
 import { groupByAlign } from "../ui-slots";
@@ -138,6 +147,7 @@ interface ChatInputProps {
 	onManageModels: () => void;
 	recallDrafts?: { text: string; seq: number }[];
 	providerKeys: Record<string, ProviderKeyInfo[]>;
+	providers?: ProviderStatus[];
 	defaultModel?: string | null;
 	quickPhrases: string[];
 	quickPhrasesEnabled: boolean;
@@ -182,6 +192,7 @@ export const ChatInput = memo(function ChatInput({
 	onSent,
 	onManageModels,
 	providerKeys,
+	providers,
 	defaultModel,
 	quickPhrases,
 	quickPhrasesEnabled,
@@ -210,6 +221,8 @@ export const ChatInput = memo(function ChatInput({
 	const { locale } = useI18n();
 	const effectiveSendKey = useEffectiveSendKey(IS_TOUCH);
 	const isModEnter = effectiveSendKey === "mod-enter";
+	const cwd = useAppField("cwd");
+	const idleProjectName = projectNameFromCwd(cwd || "") || "pi";
 	const { openPicker, templates } = useTemplates();
 	const commandTemplates = availableTemplateCommands(templates, slashCommands);
 	const allSlashCommands: SlashCommandInfo[] = [
@@ -1500,6 +1513,7 @@ export const ChatInput = memo(function ChatInput({
 				modelsLoading={modelsLoading}
 				onManageModels={onManageModels}
 				providerKeys={providerKeys}
+				providers={providers}
 				defaultModel={defaultModel}
 				compact
 			/>
@@ -1875,8 +1889,8 @@ export const ChatInput = memo(function ChatInput({
 									: effectivePlanMode
 										? t("placeholderPlanMode")
 										: isModEnter
-											? t("placeholderIdleMod")
-											: t("placeholderIdle")
+											? t("placeholderIdleMod", { name: idleProjectName })
+											: t("placeholderIdle", { name: idleProjectName })
 								: t("placeholderConnecting")
 					}
 					disabled={!connected}
@@ -2011,6 +2025,7 @@ export const ChatInput = memo(function ChatInput({
 									modelsLoading={modelsLoading}
 									onManageModels={onManageModels}
 									providerKeys={providerKeys}
+									providers={providers}
 									defaultModel={defaultModel}
 									compact
 								/>

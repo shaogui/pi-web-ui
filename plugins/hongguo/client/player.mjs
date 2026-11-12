@@ -101,6 +101,7 @@ export function createPlayer(host, options = {}) {
 		controls,
 		floatingButton,
 		splitButton,
+		sideFullscreenButton,
 		miniButton;
 	let lastFocus,
 		observer,
@@ -182,13 +183,39 @@ export function createPlayer(host, options = {}) {
 		padding("padding-inline-end", state.open ? box.reserveRight : 0);
 		padding("padding-block-end", state.open ? box.reserveBottom : 0);
 		floatingButton.setAttribute("aria-pressed", String(state.mode === "floating"));
-		splitButton.setAttribute("aria-pressed", String(state.mode === "split"));
+		splitButton.setAttribute("aria-pressed", String(state.mode === "split" && prefs.sideFullscreen !== true));
+		sideFullscreenButton?.setAttribute("aria-pressed", String(state.mode === "split" && prefs.sideFullscreen === true));
 		miniButton.disabled = state.mode === "split" || !state.current;
 	}
 	function setMode(mode) {
 		gestureCleanup?.();
 		state.mode = mode;
 		if (mode === "split") state.mini = false;
+		else prefs.sideFullscreen = false;
+		if (mode !== "split" && prefs.splitWidthBefore) {
+			prefs.splitWidth = prefs.splitWidthBefore;
+			prefs.splitWidthBefore = undefined;
+		}
+		savePrefs();
+		layout();
+	}
+	function toggleSideFullscreen() {
+		gestureCleanup?.();
+		if (state.mode !== "split") {
+			state.mode = "split";
+			state.mini = false;
+		}
+		const turningOn = prefs.sideFullscreen !== true;
+		prefs.sideFullscreen = turningOn;
+		const rect = app?.getBoundingClientRect?.();
+		const width = rect?.width || window.innerWidth;
+		if (turningOn) {
+			if (!prefs.splitWidthBefore) prefs.splitWidthBefore = prefs.splitWidth ?? 400;
+			prefs.splitWidth = Math.min(1200, Math.max(480, width * 0.82));
+		} else if (prefs.splitWidthBefore) {
+			prefs.splitWidth = prefs.splitWidthBefore;
+			prefs.splitWidthBefore = undefined;
+		}
 		savePrefs();
 		layout();
 	}
@@ -253,6 +280,7 @@ export function createPlayer(host, options = {}) {
 			gestureCleanup = null;
 			savePrefs();
 		};
+		root.classList.add("hg-dragging");
 		window.addEventListener("pointermove", move, true);
 		window.addEventListener("pointerup", stop, true);
 		window.addEventListener("pointercancel", stop, true);
@@ -263,7 +291,6 @@ export function createPlayer(host, options = {}) {
 		} catch {
 			/* synthetic events may have no active pointer */
 		}
-		root.classList.add("hg-dragging");
 		gestureCleanup = () => stop();
 	}
 
@@ -291,7 +318,11 @@ export function createPlayer(host, options = {}) {
 		state.preloadState = "loading";
 		renderControls();
 		try {
-			const data = await api(`preload?episode=${encodeURIComponent(next.id)}`, request.signal, {
+			const quality = prefs.quality ?? state.source?.definition ?? state.source?.quality ?? "";
+			const preloadPath = quality
+				? `preload?episode=${encodeURIComponent(next.id)}&quality=${encodeURIComponent(quality)}`
+				: `preload?episode=${encodeURIComponent(next.id)}`;
+			const data = await api(preloadPath, request.signal, {
 				method: "POST",
 				timeout: 360_000,
 			});
@@ -334,6 +365,11 @@ export function createPlayer(host, options = {}) {
 		root.append(el("style", { text: css }));
 		floatingButton = button(t("悬浮", "Float"), () => setMode("floating"), { "aria-pressed": "false" });
 		splitButton = button(t("分屏", "Split"), () => setMode("split"), { "aria-pressed": "false" });
+		sideFullscreenButton = button(t("侧边全屏", "Side fullscreen"), () => toggleSideFullscreen(), {
+			"aria-pressed": "false",
+			title: t("侧边全屏", "Side fullscreen"),
+			"aria-label": t("侧边全屏", "Side fullscreen"),
+		});
 		miniButton = button(
 			icon("mini"),
 			() => {
@@ -357,6 +393,7 @@ export function createPlayer(host, options = {}) {
 				{ class: "hg-modes", role: "group", "aria-label": t("播放布局", "Player layout") },
 				floatingButton,
 				splitButton,
+				sideFullscreenButton,
 			),
 			miniButton,
 			button(icon("close"), close, {
@@ -491,8 +528,18 @@ export function createPlayer(host, options = {}) {
 			const sources = el(
 				"select",
 				{
-					"aria-label": t("播放线路", "Video source"),
-					onchange: (event) => play(state.current, video.currentTime, Number(event.target.value)),
+					"aria-label": t("清晰度", "Quality"),
+					onchange: (event) => {
+						const index = Number(event.target.value);
+						const selected = state.sources[index];
+						if (selected) {
+							prefs.quality = selected.definition ?? selected.quality ?? prefs.quality;
+							savePrefs();
+						}
+						stopPreload();
+						play(state.current, video.currentTime, index);
+						if (prefs.preloadNext !== false) void prepareNext();
+					},
 				},
 				state.sources.map((source, i) => el("option", { value: i }, source.definition || `${source.kind} ${i + 1}`)),
 			);
@@ -575,7 +622,7 @@ export function createPlayer(host, options = {}) {
 			engine.initialize(video, url, false);
 		}
 	}
-	async function play(episode, position, sourceIndex = 0) {
+	async function play(episode, position, sourceIndex) {
 		if (!episode || destroyed || !state.open) return;
 		saveProgress();
 		const version = ++playVersion;
@@ -599,9 +646,20 @@ export function createPlayer(host, options = {}) {
 			const data = await api(`play?episode=${encodeURIComponent(episode.id)}`, playRequest.signal);
 			if (version !== playVersion || destroyed || !state.open) return;
 			state.sources = data.streams ?? [];
-			const source = state.sources[sourceIndex] ?? state.sources[0];
+			let resolvedIndex = typeof sourceIndex === "number" ? sourceIndex : -1;
+			if (resolvedIndex < 0 && prefs.quality) {
+				resolvedIndex = state.sources.findIndex(
+					(source) => (source.definition ?? source.quality ?? "") === prefs.quality,
+				);
+			}
+			if (resolvedIndex < 0) resolvedIndex = 0;
+			const source = state.sources[resolvedIndex] ?? state.sources[0];
 			if (!source) throw new Error(t("没有可用的视频线路", "No playable video source"));
 			state.source = source;
+			if (source?.definition || source?.quality) {
+				prefs.quality = source.definition ?? source.quality;
+				savePrefs();
+			}
 			await attach(source, version);
 			if (version !== playVersion || destroyed || !state.open) return;
 			video.playbackRate = prefs.speed ?? 1;

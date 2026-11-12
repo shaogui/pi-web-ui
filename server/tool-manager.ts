@@ -33,6 +33,7 @@ export const DELEGATE_TASK_TOOL_NAME = "delegate_task";
 export const ASK_USER_QUESTION_TOOL_NAME = "ask_user_question";
 export const BROWSER_PAGE_TOOL_NAME = "browser_page";
 export const BROWSER_SCRIPT_TOOL_NAME = "browser_script";
+export const PHONE_TOOL_NAME = "phone";
 export const CONVERSATION_READ_TOOL_NAME = CONVERSATION_TOOL_NAME;
 export const SKILL_TOOL_NAME = "skill";
 export const SCHEDULE_TOOL_NAME = "schedule";
@@ -52,6 +53,34 @@ export const CODEMODE_TOOL_NAME = "codemode";
 export const TOOL_SEARCH_TOOL_NAME = "tool_search";
 export const LOAD_TOOLS_TOOL_NAME = "load_tools";
 export const LAZY_CORE_TOOL_NAMES = ["bash", "read", "edit", "write"] as const;
+
+/**
+ * 工具名统一规则（架构单源）：内置 + 插件 + MCP + 未来工具共用。
+ * 内置在 `ALL_KNOWN_SET` 里；插件/MCP/未来工具按此正则收，不写死名单，自动包含插件。
+ * 与 `normalizeDisabledPluginTools`（client-state.ts）的 128/256 上限对齐。
+ */
+export const TOOL_NAME_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/;
+export const TOOL_NAME_MAX_LENGTH = 128;
+export const TOOL_LIST_MAX_ENTRIES = 256;
+
+export function isValidToolName(name: string): boolean {
+	if (!name || name.length > TOOL_NAME_MAX_LENGTH) return false;
+	return TOOL_NAME_PATTERN.test(name);
+}
+
+/** 旧别名统一折叠（禁用列表与按需名单共用，免得旧存档丢项）。 */
+export function foldLegacyToolName(name: string): string {
+	if ((LEGACY_TERMINAL_TOOL_NAMES as readonly string[]).includes(name)) return TERMINAL_TOOL_NAME;
+	if ((LEGACY_SUBAGENT_TOOL_NAMES as readonly string[]).includes(name)) return CONVERSATION_TOOL_NAME;
+	if (name === "conversation_read") return CONVERSATION_TOOL_NAME;
+	if ((LEGACY_SCHEDULE_TOOL_NAMES as readonly string[]).includes(name)) return SCHEDULE_TOOL_NAME;
+	return name;
+}
+
+/** 永不延迟：核心 4 件套 + load_tools 本体。前端置灰与后端过滤共用此语义（前端见 LAZY_CORE 注）。 */
+export function isNeverLazyTool(name: string): boolean {
+	return name === LOAD_TOOLS_TOOL_NAME || (LAZY_CORE_TOOL_NAMES as readonly string[]).includes(name);
+}
 
 export type AgentToolGroup = "core" | "terminal" | "subagent" | "other";
 
@@ -118,6 +147,15 @@ export const AGENT_TOOL_CATALOG: AgentToolEntry[] = [
 		dshVisible: false,
 		descKey: "browserScriptEnabledDesc",
 		offHintKey: "browserScriptOffHint",
+	},
+	{
+		// 让智能体操作手机（无障碍服务）。默认关：等于把整台手机交给模型，必须用户显式打开。
+		name: PHONE_TOOL_NAME,
+		group: "other",
+		defaultOn: false,
+		dshVisible: false,
+		descKey: "phoneEnabledDesc",
+		offHintKey: "phoneOffHint",
 	},
 	{
 		name: CLAIM_FILES_TOOL_NAME,
@@ -487,20 +525,78 @@ export function normalizeToolOnDemandList(v: unknown): string[] {
 	const out: string[] = [];
 	for (const x of v) {
 		if (typeof x !== "string") continue;
-		const name = x.trim();
-		if (!name || !ALL_KNOWN_SET.has(name) || out.includes(name)) continue;
-		out.push(name);
+		const name = foldLegacyToolName(x.trim());
+		if (!name || out.includes(name)) continue;
+		// 内置直接收；插件 / MCP / 未来工具按统一命名规则收，不写死名单，自动包含插件。
+		// 孤儿项（插件已卸载、跨设备同步）同样保留，UI 兜底展示， gating 按 live 库存解析。
+		if (ALL_KNOWN_SET.has(name) || isValidToolName(name)) {
+			out.push(name);
+			if (out.length >= TOOL_LIST_MAX_ENTRIES) break;
+		}
 	}
 	return out;
+}
+
+export function normalizeLazyOnDemandList(v: unknown): string[] {
+	return normalizeToolOnDemandList(v).filter(
+		(n) => n !== LOAD_TOOLS_TOOL_NAME && !(LAZY_CORE_TOOL_NAMES as readonly string[]).includes(n),
+	);
 }
 
 export function lazyLoadingDisabledTools(
 	allNames: readonly string[],
 	loaded: Iterable<string>,
 	core: readonly string[] = LAZY_CORE_TOOL_NAMES,
+	only?: Iterable<string>,
 ): string[] {
 	const keep = new Set<string>([...core, LOAD_TOOLS_TOOL_NAME, ...loaded]);
-	return allNames.filter((n) => !keep.has(n));
+	const onlySet = only ? new Set(only) : undefined;
+	return allNames.filter((n) => {
+		if (keep.has(n)) return false;
+		// 名单制：只延迟名单里的工具；名单外常驻。`only` 为空集合时等于都不延迟。
+		if (onlySet && !onlySet.has(n)) return false;
+		return true;
+	});
+}
+
+export interface LazyPartition {
+	/** 常驻：允许集里不在名单里的（天然含核心 + load_tools），stable，用于提示词基线与 guidelines */
+	resident: string[];
+	/** 待延迟：名单里允许、尚未加载的，用于门控禁用与 load_tools 可加载列表 */
+	pending: string[];
+	/** 已延迟加载：名单里已加载的，用于 forceActive */
+	loadedLazy: string[];
+}
+
+/**
+ * 延迟划分单源（架构级）：所有调用方（门控/目录/加载/JIT/提示词）共用同一划分，
+ * 避免各处手写 `allowed - onDemand` 导致分歧。输入均为 live 库存，孤儿名单项自动忽略。
+ */
+export function partitionLazyTools(args: {
+	all: readonly string[];
+	allowed: readonly string[] | Set<string>;
+	onDemand: readonly string[] | Set<string>;
+	loaded: readonly string[] | Set<string>;
+	core?: readonly string[];
+}): LazyPartition {
+	const allowedSet = args.allowed instanceof Set ? args.allowed : new Set(args.allowed);
+	const onDemandSet = args.onDemand instanceof Set ? args.onDemand : new Set(args.onDemand);
+	const loadedSet = args.loaded instanceof Set ? args.loaded : new Set(args.loaded);
+	// 名单里永不延迟的（核心/load）直接视为常驻，不进入 pending。
+	const lazyable = new Set([...onDemandSet].filter((n) => !isNeverLazyTool(n)));
+	const resident: string[] = [];
+	const pending: string[] = [];
+	const loadedLazy: string[] = [];
+	for (const n of args.all) {
+		if (!allowedSet.has(n)) continue;
+		if (!lazyable.has(n)) {
+			resident.push(n);
+			continue;
+		}
+		if (loadedSet.has(n)) loadedLazy.push(n);
+		else pending.push(n);
+	}
+	return { resident, pending, loadedLazy };
 }
 
 export const PI_AGENT_PRESETS: UiAgentPreset[] = [
@@ -644,7 +740,7 @@ export interface LegacyToolSwitches {
 	terminalToolsEnabled?: boolean;
 	questionnaireEnabled?: boolean;
 	disabledAgentTools?: unknown;
-	/** 按需列表：列内工具直接关闭（与 `disabledAgentTools` 取并集，只做减法）。 */
+	/** 按需名单：仅当 `toolLazyLoading` 开启时生效，列内工具走延迟加载（需 `load_tools` 拉取）。 */
 	toolOnDemandTools?: unknown;
 }
 
@@ -689,14 +785,7 @@ export function foldLegacyIntoDisabled(
 export function effectiveDisabledAgentTools(s: LegacyToolSwitches): string[] {
 	const next = new Set(legacyToDisabled({ ...s, disabledAgentTools: s.disabledAgentTools }));
 	if (s.questionnaireEnabled === false) next.add(ASK_USER_QUESTION_TOOL_NAME);
-	// 按需列表只会把工具从活跃集里拿掉：`disabledAgentTools` 的补集无法把列内工具复活。
-	for (const name of normalizeToolOnDemandList(s.toolOnDemandTools)) next.add(name);
+	// 按需名单不再是硬关闭：它只在 `toolLazyLoading` 开启时决定哪些工具延迟，
+	// 常驻/禁用只由 `disabledAgentTools`、预设与模式闸门决定。这里不并入名单。
 	return [...next];
-}
-
-export function isTerminalGuidanceOn(disabled: readonly string[], preset?: string): boolean {
-	const on = TERMINAL_TOOL_NAMES.filter((n) => !disabled.includes(n));
-	if (on.length === 0) return false;
-	if (!preset || preset === "standard") return true;
-	return filterToolsByPreset(on, preset).length > 0;
 }

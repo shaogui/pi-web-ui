@@ -36,7 +36,15 @@ React + Capacitor 手机客户端、Hub 账号隔离推送与设备切换见 [`m
 
 界面 `appSend` 为 prompt 附带只在前端传递的 `userInitiated` 上下文；`useChat.send` 在 WebSocket 发送成功后更新顺序，插件直接调用发送器或显式关闭该上下文时不置顶，空白或未连接发送也不置顶。原生 CLI 只消费 `native_cli_prompt_submitted` 窄事件（Claude/Codex `UserPromptSubmit`、Pi `input(source=interactive)`），按 session 与 eventId 去重；终端输出、普通按键、粘贴和 working 状态都不能替代用户提交信号。
 
-会话 ID、sessionId 与文件路径关联到同一位置，保证活动/历史表示切换、重新打开或过户后保留顺序。子代理保持父子树（含工作树子代理），向子代理直接发送消息时整体提升所属父树。顺序只保存在页面内存，不写入存储；项目排位沿用独立规则。相邻项目节点之间使用主题边框色分隔线与间距，分隔范围覆盖整个会话子树。
+会话 ID、sessionId 与文件路径关联到同一位置，保证活动/历史表示切换、重新打开或过户后保留顺序。子代理保持父子树（含工作树子代理），向子代理直接发送消息时整体提升所属父树。顺序只保存在页面内存，不写入存储；项目排位见「项目（工作区）排序」。
+
+## 项目（工作区）排序
+
+项目顺序与「最近对话」时间解耦，事实源：`server/client-state.ts` 的 `remember(clientId, cwd, { promote })` 与 `web/src/project-order-settings.ts`。
+
+- **时间只认真实对话**：`promote`（默认）只在真的发消息时调用（pi `ClientSession.prompt`、`dsh` 与 `universal` 的 `prompt`），刷新该项目 `lastUsed` 并推 `projects`。浏览/切换/恢复（`set_cwd`、`switchConversation`、打开历史对话、连接时恢复 `lastCwd`）一律 `{ promote: false }`：只写 `lastCwd`、清 tombstone，未登记的补一条 `lastUsed: 0`，不动时间；`withCurrentCwd()` 也不再给当前项目打时间戳。否则「只是点开看看」会把项目顶到最新，下次加载顺序就变了。
+- **客户端两种模式**（localStorage）：自动模式（默认）按 `lastUsed` 降序，`lastUsed === 0`（从没对话过）回退到「本浏览器首次出现时间」，所以新添加的项目天然在最上方；手动模式（设置「项目顺序全靠手动」）只认持久化的拖拽/添加顺序，新出现的项目置顶，聊天不再重排。拖拽或 Alt+↑/↓ 会自动切到手动模式。切模式不跳变：自动模式持续把当前顺序镜像进存储，手动模式直接接手眼前排列。
+- 项目行右侧时间只在 `lastUsed > 0` 时显示；验证：`tests/unit/left-panel-stage-d.test.ts`、`tests/unit/left-panel-actions.test.ts`、`tests/unit/left-panel-open-conv-order.test.ts`、`tests/unit/client-state-recent-projects.test.ts`。相邻项目节点之间使用主题边框色分隔线与间距，分隔范围覆盖整个会话子树。
 
 「运行中对话」（`conversations`）和「历史会话」（`sessions`）是两个通道，但常常指向同一批会话，左栏必须把它们认成同一条，否则同一条会话会渲染成两行。分工：**行归属由引擎裁定、身份由客户端归一**。
 
@@ -53,6 +61,12 @@ React + Capacitor 手机客户端、Hub 账号隔离推送与设备切换见 [`m
 刷新时会先恢复项目及展开状态，再建立连接。`LeftPanel` 只在 `ready` 且 `status === "open"` 后请求已展开项目的历史会话，且只有 `panelSend` 成功才登记已请求与加载状态；断线时清除请求记录，重连后自动补发。手动展开与自动恢复共用请求记录，避免重复请求。服务端返回空数组 `[]` 同样表示加载完成，应自动显示“暂无历史会话”，无需点击项目。
 
 删除历史会话后同时刷新当前项目与记录所属项目的列表；所属项目从删除前捕获的运行对话或转录头确定，SSH 本机缓存路径还原为逻辑工作区 URI。列表失效会递增扫描代次并解除旧扫描的复用；失效前启动的扫描不能回写文件或列表缓存，其调用方沿用原项目与分页参数重读，避免旧 `sessions` 消息重新显示已删条目。扫描结束只清理自身仍持有的在途记录。验证：`tests/unit/native-cli-conversation.test.ts` 与 `tests/unit/session-cache-bounds.test.ts`。
+
+会话跑完一轮（`turn_end`）后按**该会话自己的 cwd** 补推一次会话列表（`scheduleSessionsPush`：首轮立刻推，600ms 内的后续轮次合并成一次尾部推送；客户端没请求过列表不推，会话销毁时清定时器）。内容变化只做缓存失效而不推送时，前端「运行中」分组会随着会话结束把那一行移走，左栏又没有新列表填进来——用户看到的是「对话跑完就消失了，点一下项目才回来」；若改成推迟到节流窗口结束再推，中间的空窗就是可见的闪烁。推送前先删掉该 cwd 的 `sessionInfosCache`，否则 TTL 30s 的旧列表会被原样推回去。验证：`tests/unit/session-list-refresh.test.ts`。
+
+置顶归属由**会话文件 header 的 `cwd`** 决定，不是由「当前在哪个项目里点的钉住」决定：`pinSession()` 先 `readCwdFromSessionHeader()` 再记账，预打开置顶会话前再用 `pinnedPathsOwnedBy()` 按归属过滤一次。在项目 A 的视图下钉住属于 B 的会话，记录落在 B 名下；历史上钉错项目的脏数据（`client-state.json` 里同一路径挂在两个 cwd 键下）也会被这层过滤拦住，不会把 B 的会话预打开进 A。验证：`tests/unit/pin-session-cwd.test.ts`。
+
+钉住 / 取消钉住后要按**会话自己的 cwd 推一次 `sessions` 摘要**：历史行上的 📌 来自摘要里的 `pinned`（`isSessionPinned()` 现算），`emitConversations()` 只刷新运行中与活动行、不动摘要——不推的话取消钉住后图标得等点一下项目重新拉列表才消失。`setConversationPinned()` 推 `conv.cwd`；`pinSession()` 在记账用的 `pinCwd` 与当前 `cwd` 不同时改推 `pushSessionsForCwd(pinCwd)`。验证：`tests/unit/pin-badge-refresh.test.ts`。项目的展开/收起状态持久化在 `pi-web-ui:lp-expanded-projects`：刷新时**完全按记录恢复**，只有「首次使用、没有任何记录」才展开当前项目，`currentCwd` 变化的 effect 在首帧不动作（否则收起来的项目一刷新又自动弹开），之后切换项目才自动展开。钉住的历史行在项目收起时仍然显示（`isPinnedRowVisible()`；刷新后一直是收起状态、从没展开过的项目也要挂载子节点，并且不受 `maxVisible` 截断），否则一收起项目它就从左栏消失，钉住等于没钉。历史行的右键菜单按**该行自己的 `pinned`** 判断显示「钉住」还是「取消钉住」：跨项目的历史行不在当前项目的 `sessions` 列表里，只查列表会永远显示「钉住」（点下去还会再钉一次）。验证：`tests/unit/pin-badge-refresh.test.ts` 与 `tests/unit/left-panel-actions.test.ts`（跨项目历史行用例）。
 
 侧栏子代理树从一级开始每层缩进 12px，有无子代理的行使用相同标题基线，层级仅通过缩进表达，不绘制连接线。折叠按钮使用细描边箭头并随深度同步右移；图标为 12×12px，独立点击区域为 18×24px，与标题保持 2px 间隔，提供悬停及键盘焦点反馈。运行中和其他客户端的对话树共用同一布局，按钮通过 `aria-expanded` 表达展开状态。层内样式与 `styles.css` 末尾结构复位规则保持一致，避免主题或选中态覆盖缩进。
 
@@ -146,7 +160,38 @@ pi 的 `schedule` 创建任务时单独持久化创建来源（稳定 SDK 会话
 
 `send` 返回投递或排队状态，不等待接收方处理任务；`read` 分页读取并消费自己的收件箱，熔断期间消息仍保留。`request` 等待回答，服务端限制消息字节、队列与请求数量并拒绝请求循环；参数只收纯文本 `message`（`questionsFromMessage()` 折成单个内部问题），结构化 `questions` 仍照收。`reply` 仅允许原接收对话，`message` 按待答问题展开成 `custom` 回答，旧 `answers` 结构仍照收；`escalate` 将同一 PendingQuestion 交给用户，沿用原始截止时间。`wait_all` 为待当前对话处理的请求提前返回。旧 `handoff/consult/answer/escalate` 作为兼容入口转接通信服务；历史挂起问卷保持可结算。
 
-任务完成通过 `conversation(action="complete", summary)` 登记，与发送消息分开。`spawn.notifyOnDone` 保留布尔兼容并支持 `"manual"`。manual 本轮退出但还有运行中下级、问卷、通信或待投递子结果时保持 taskPending，禁止提前通知、消费结果或结算工作树；完成登记不能绕过这些条件。所有依赖收口后使用显式 summary，未登记则以最终正文兜底。错误与取消继续通知，自动唤醒不清除手动完成意图。当前 manual 和通信宿主为 pi 引擎，Universal 明确拒绝不支持的 manual 模式。
+任务完成通过 `conversation(action="complete", summary, evidence)` 登记，与发送消息分开；证据与转录对账的规则见下一节。`spawn.notifyOnDone` 保留布尔兼容并支持 `"manual"`。manual 本轮退出但还有运行中下级、问卷、通信或待投递子结果时保持 taskPending，禁止提前通知、消费结果或结算工作树；完成登记不能绕过这些条件。所有依赖收口后使用显式 summary，未登记则以最终正文兜底。错误与取消继续通知，自动唤醒不清除手动完成意图。当前 manual 和通信宿主为 pi 引擎，Universal 明确拒绝不支持的 manual 模式。
+
+## 子代理完成证据、结算边沿与派发预算
+
+子代理自述「做完了」不算证据。`conversation(action="complete")` 除 `summary` 外要求同时给 `evidence`：`{files:[], commands:[]}`（改过的文件、跑过的验证命令）、`{none:true}`（只读任务，声明没有文件改动）或 `{blocked:"原因"}`（做不完，如实报）。归一只在 `server/subagent-evidence.ts`：路径按 `/` 归一、命令压空白、去重并限量（50 文件 / 20 命令 / 单条 400 字符），空对象判非法。
+
+对账不接受自述：`collectTranscriptFacts()` 从子代理自己的转录里抽**真改过的文件**（写入类工具调用的 path/file_path/paths/files，名单复用 `subagent-security-gate.ts` 的 `SUBAGENT_WRITE_TOOL_NAMES`）与**真跑过的命令**（bash/powershell 调用的 command、`bashExecution` 的 command+exitCode、`toolResult.isError` 回落标失败）。只有可证伪的冲突才驳回：声称跑过的命令在转录里找不到 / 那条命令在转录里失败 / 声称 `none` 但转录有写入；改过但未声明的文件、声称改过却找不到写入调用的文件只记疑点并降级 `partial`（bash 里 `sed`/`mv` 也会改文件，不能一票否决）。驳回时 `complete` 抛错并把矛盾列给子代理，让它先修正再登记；通过后证据存到 `conv.subagentEvidence`，裁决 `pass / partial / unverified / blocked` 随 `wait_all`、`get_result`、`list`、完成通知（`subagent-notify.ts`）一并呈现；同一裁决经 `ConversationSummary.subagentVerdict` 进左栏，`unverified / partial / blocked` 显示证据角标（`pass` 不占位），别让「没验证」看起来像「已验证」。缺证据不阻塞收口，但状态必须显示 `unverified`，父代理据此决定是否复核——宁可显式未验证，不要假成功。
+
+`wait_all` 不再轮询。`server/subagent-settle.ts` 的 `SubagentSettleRegistry` 只提供**边沿**：运行 id 变化即唤醒订阅者，等待方醒来重算是否真的收口（并重扫新派生的后代与待交付请示）。`agent-service` 在回合结束、停止、移出、问卷队列变化、完成通知投递状态变化处 `notify/notifyAll`，`dispose` 时 `shutdown`。单次等待切片 30s，等待上限仍由看门狗 cap 决定；通用引擎（`universal-session.ts`）用自身的子代理监听实现同一接口，语义一致。判定「已收口」只有一条：拿不到快照（已移出/已结束回收）或显式终态，等待与「还剩谁」共用 `isSettled`，避免出现「全都完成了却报还有人在跑」。
+
+一次调用可以扇出：`spawn` 的 `tasks[]` 一次派多个，先整批校验（prompt、key 形状与唯一性、模板可用、思考档位、隔离模式）再启动，一个不合法就一个都不启动；单批上限 `SUBAGENT_FANOUT_MAX = 16`，启动并发窗口 4（不与并发上限抢名额）。每个 task 可带 `key`（字母数字与 `_.-`，≤40），工具把 `key → 运行身份` 记在**本对话工具实例**的有界表（256 项）里，`wait_all / get_result / steer / stop` 的 `runIds` 接受 key 或真实 id。`steer` 回执区分 `delivered`（送进当前回合）/ `queued`（排队等回合结束）/ `restarted`（本来空闲，同会话开新一轮）/ `missed`（没有可投递通道），父代理不必猜。
+
+并发与深度挡不住累计成本，所以加了第三道闸：`server/subagent-budget.ts` 按**运行树根**（沿 parent 走到最顶层会话的稳定执行身份）累计派发次数，默认 64（`PI_WEB_SUBAGENT_MAX_SPAWNS_PER_RUN`，`0` 关闭）。预留在启动路径同步完成，失败退还，运行树根移出时 `forget`。子代理用量（`getSessionStats().tokens`）进快照的 `usage`，在列表与等待结果里以 `输入↓输出↑` 呈现，配合上下文软上限一起看成本。
+
+## 运行账本与重启续跑
+
+子代理的工作不能因为重启就消失。`server/subagent-ledger.ts` 把每次派发落到 `<dataDir>/subagent-runs/<runId>/`：
+
+```
+status.json     机器可读的当前状态（原子替换，最后写者胜）
+events.jsonl    追加式生命周期流水（有字节上限，截断后只留一条标记）
+```
+
+写入纪律：所有写操作进每个 run 的**串行队列**，调用方一律 fire-and-forget；`status.json` 走 `writeAtomic`，事件用 `appendFile`；任何 IO 失败只记 `lastError()`，绝不让账本问题打断派发或回合结束（`dispose` 时 `flush()`）。有界：run 目录数默认 200（`PI_WEB_SUBAGENT_LEDGER_MAX_RUNS`，`0` 关闭整本账）、单 run 事件 256KB、`prompt` 8KB、`outputTail` 4KB、证据条目各 5 条。淘汰只挑已结束的 run，且要等该 run 的写队列排空再删目录——否则排队中的 `mkdir` 会把目录又建回来。
+
+重启对账只认 `bootId`：每条记录带本进程随机身份，`recover()` 只把**别的 boot** 留下的 `running` 判成 `interrupted`，本进程的活运行一律不动；重复调用幂等。`ClientSession.create()` 里 fire-and-forget 调用一次，命中时推一条 notice（列出前 5 个标题与 id），告诉用户/模型可以 `get_result` 取已产出的证据或 `resume` 续跑。**主对话的重启恢复与子代理分开**：`streamingSummaries()`（daemon 记录「重启时正在流式」的入口）跳过子代理与持久化子会话，避免把 child 当成普通标签页重新打开、丢掉父子关系。
+
+账本由运行态在各收口点同步：派发登记 `running`；回合结束、完成登记（含证据）、停止、移出、`steer` 重开一轮、工作树收尾分别 `upsert` + `event`（`spawned / turn_end / completion_requested / stopped / dismissed / steer_restart / worktree_finalized`）。读侧：`conversation(action="list")` 在活运行之后追加账本行（跳过已移出与仍在内存里的），`get_result` 在内存查不到时回落到账本，给出状态、证据、错误、工作树、`sessionFile` 与输出尾部。
+
+`conversation(action="resume", runId, message?)` 的语义必须诚实：进程内子代理会话不落盘，**接不上原转录**，所以续跑是「带已知进度重派」（`mode: "relaunch"`）——提示词由 `buildResumePrompt()` 拼：原任务 + 中断前输出尾部 + 账本证据 + 保留的工作树 + 旧转录路径，并要求「别重做已完成的部分、守住已有结论、按证据收口」。工作树仍保留时直接以它为 `cwd` 重派（复用未提交改动，不新建工作树）；`persist=true` 的子代理转录仍在历史里可回看。`resumedBy` 标记新 run，重复续跑直接拒绝；还在进程里跑着的 run 也拒绝（先 `wait_all`/`get_result`）。
+
+验证：`tests/unit/subagent-ledger.test.ts`（写入/重启读回/bootId 对账/事件截断/淘汰/关闭/续跑关系/提示词）、`tests/unit/subagent-ledger-tool.test.ts`（list 追加/get_result 回落/resume 成功与四类失败/无账本引擎降级）。
 
 ## 问卷队列与父代理请示
 
@@ -223,7 +268,7 @@ pi 的 `schedule` 创建任务时单独持久化创建来源（稳定 SDK 会话
 
 ## 随手问独立小窗
 
-**事实源**：`web/src/components/QuickAskPopover.tsx`、`QuickAskAttachments.tsx`、`web/src/use-draggable-popover.ts`、`web/src/quick-ask.ts`、`web/src/quick-ask-context.ts`、`server/quick-ask.ts`、`server/quick-ask-context.ts`；设置 UI 为 `web/src/components/QuickAskSettings.tsx`，独立设置单源为 `server/quick-ask-settings.ts`。
+**事实源**：`web/src/components/QuickAskPopover.tsx`、`QuickAskAttachments.tsx`、`web/src/use-draggable-popover.ts`、`web/src/quick-ask.ts`、`web/src/quick-ask-context.ts`、`server/quick-ask.ts`、`server/quick-ask-context.ts`、`server/model-session.ts`；设置 UI 为 `web/src/components/QuickAskSettings.tsx`，独立设置单源为 `server/quick-ask-settings.ts`。
 
 - 右下角常驻入口支持鼠标 / 触屏拖动，轻点或按 Enter / Space 打开默认位于右下角的轻量浮窗；拖动松手不会误触打开，窗口缩放后入口保持在视口内。在消息正文选中文字后的「解释 / 翻译」入口也打开同一小窗。标题栏空白、图标与标题支持鼠标 / 触屏拖动，按钮和语言选择器保留原有操作；拖动时收起更多菜单，入口与浮窗各自保存位置到当前页面内存，收起再打开及新话题沿用位置，刷新恢复默认。指针捕获保证移出标题栏后继续拖动；窗口缩放、浮窗内容展开或流式增高时重新约束位置，保持浮窗在视口内。采用「一句即懂」紧凑布局：宽度上限 320px，高度随内容变化，标题与选文合为一行；回答与小窗历史始终直接渲染完整 Markdown，长内容在回答区内滚动，不截断预览，也不提供「展开 / 收起回答」步骤。选文点击后展开，追问框按需出现；空白新话题自动显示输入框，手动追问保持输入框可用。标题栏直接显示「新话题」加号，一次点击清空当前问答并取消生成；完整回答复制、当前模型信息与独立对话说明收进「更多操作」浮层；菜单复用 `useFloatingPanel`，支持视口边界定位、点击外部与 Esc 关闭。完整回答阅读区最高 290px，流式、停止或错误时保留可直接阅读的正文，停止与重试均可直接操作。正文保持 14px 并使用主题令牌，窄屏不放大为全宽卡片。小窗无背景遮罩，点击或滚动主对话不会关闭，也不改变主对话草稿、消息和阅读位置；Esc 或关闭按钮收起。
 - 普通提问在小窗内连续追问，提供代码示例和一句话总结快捷追问；历史仅保留于当前页面内存。真实模型文本增量按动画帧合并渲染 Markdown；停止或失败保留已收到的文本，重试从当前问题重新生成。仅当用户停留在问答区底部时跟随新内容，上翻阅读不被拉回。收起后保留历史、草稿和阅读位置且请求可继续；完成后入口显示提示点。页面刷新清空。「新话题」清空历史并取消正在生成的请求；点击「解释」同样开启新话题，避免前次问答影响解释。
@@ -233,7 +278,7 @@ pi 的 `schedule` 创建任务时单独持久化创建来源（稳定 SDK 会话
 - `POST /api/quick-ask/context` 接收 `{source, scope?, clientId?}`：源可为文件、目录、显式会话，或 `{kind:"upload", name, data:base64, mimeType?}` 上传。返回 `{attachment}` 文本 / 图片快照；仅提取用户和助手正文，不包含 system、工具、预设或主会话提示词，读取不切换会话。会话默认最近 10 条，可选完整对话；目录默认清单，可选清单与文本，限制深度 2、100 项并跳过 symlink。源 ID 按规范来源稳定生成，重复引用去重；上传按名称与内容生成 ID。上下文读取支持取消和 15 秒超时；远程 SSH 工作区当前返回明确的不支持错误。
 - `POST /api/quick-ask` 接收小窗自己的 `messages: [{role: "user" | "assistant", content: string, attachments?: QuickAskAttachment[]}]` 与可选 `fallbackModel: "provider/id"`。附件仅允许挂在用户轮次；首次使用或内容改变时发送快照，未变化的追问引用不重复消耗预算。旧轮次快照保持不变，移除待引用标签不重写旧轮次。每个话题最多 8 项附件，单文本 32,768 字符、含来源边界的总文本 65,536 字符；单文件 / 图片 2 MiB、图片合计 6 MiB。文件编码和图片魔数统一在服务端校验，未知二进制、图片不受模型支持或超限均明确报错。
 - 这是主会话附件 path-only 规则的局部例外：随手问不创建 AgentSession、没有文件读取工具，因此仅对用户明确添加的引用读取有限快照，并作为对应用户消息中的不可信参考文本 / 图片块交给独立 ModelRuntime；绝不提升成 system，也不会自动扫描或附加当前主对话。
-- `/api/quick-ask` 默认返回 `{text, model}`；客户端以 `Accept: application/x-ndjson` 请求真实流式输出，事件单源为 `server/protocol.ts` 的 `QuickAskStreamEvent`：`start` 提供模型，`delta` 追加文本，`done` 提供权威最终文本，`error` 终止流并报告错误。响应带 `no-transform` 与 `X-Accel-Buffering: no`，防止压缩或代理缓存增量。客户端使用增量 UTF-8 解码，缺少终止事件视为失败；中途错误保留先前片段。服务端仅从独立设置读取系统提示词和模型参数，直接调用 ModelRuntime 的流式接口，不创建 AgentSession，不隐式读取主对话历史、预设、项目提示词或工具。客户端取消与超时均中止请求，包括已经发送响应头后的超时；被取消的旧响应不能写回新话题。
+- `/api/quick-ask` 默认返回 `{text, model}`；客户端以 `Accept: application/x-ndjson` 请求真实流式输出，事件单源为 `server/protocol.ts` 的 `QuickAskStreamEvent`：`start` 提供模型，`delta` 追加文本，`done` 提供权威最终文本，`error` 终止流并报告错误。响应带 `no-transform` 与 `X-Accel-Buffering: no`，防止压缩或代理缓存增量。客户端使用增量 UTF-8 解码，缺少终止事件视为失败；中途错误保留先前片段。服务端仅从独立设置读取系统提示词和模型参数，直接调用 ModelRuntime 的流式接口，不创建 AgentSession，不隐式读取主对话历史、预设、项目提示词或工具。因为绕过了宿主会话，`sessionId` 必须自带（`server/model-session.ts` 的 `modelSessionId()`：同一话题传首条用户消息作种子，跨轮保持同一路由与缓存；一次性调用不传种子），否则 opencode / opencode-go 网关缺 `x-opencode-session` 头会直接 400 `MissingSessionID`。客户端取消与超时均中止请求，包括已经发送响应头后的超时；被取消的旧响应不能写回新话题。
 - `GET /api/quick-ask/models` 从同一个独立模型运行时返回 `{models: [{provider, id, label}]}`，供所有主引擎下的小窗设置选择模型，避免依赖 Pi 专有的子代理模型列表。模型目录请求同样支持取消与超时。
 - 未显式添加引用时，主会话只提供默认模型 ID。选中文字入口通过 `openQuickAsk` 事件发送文本快照，按独立解释模板插值后作为首条用户消息，不携带消息 ID、工具结果元数据或主会话提示词。
 
@@ -297,6 +342,12 @@ pi 的 `schedule` 创建任务时单独持久化创建来源（稳定 SDK 会话
 
 - 每客户端 `convs: Map<convId, Conversation>`，**每个对话一个独立 `AgentSessionRuntime`**：`new_chat` 新建 runtime + 新 session 文件（旧对话继续在后台跑，不中断）；`switch_conversation` 只换 `activeId`（不碰其他 runtime）；`runtime`/`session` 访问器指向当前活动对话。**对话按项目归属**：`conv.cwd` 即所属项目，每个项目各自的活动对话互不干扰。
 - **`set_cwd` 不再重建当前对话**——改为切到目标项目自己的对话（该项目最近活动的那个；没有则新建一个并恢复该项目最近的持久会话）。
+- **工作区命令必须串行（#872）**：`cs.cwd`、活动对话、runtime 绑定是同一组可变状态，而改它们的命令（`set_cwd` / `new_chat` / `new_cli_chat` / `switch_session` / `switch_conversation` / `fork_session` / `rollback_session` / `make_dir(setAsCwd)` / 沙盒切换）都是异步重活（stat、恢复最近会话、挂载 runtime、复制沙盒）。ws 消息逐条派发，上一条还在 await，下一条已经在跑 —— 「先切项目再新建对话」抢跑时 `newChat()` 读到的还是旧 cwd，新对话就落进上一个项目（左栏里像「消失」了）。
+  - **唯一单源 `server/workspace-queue.ts`**：派发层对上述命令只做「同步认领 + 入队」，按会话实例 FIFO，后一条等前一条落定；空闲时只多一个微任务。新增工作区命令必须入队，且**不得**在 handler 里自己写「等一会儿再干」。
+  - **声明式目标目录**：`new_chat` 可带 `cwd`（`ClientMessage`），服务端在同一条队列任务里「切工作区 → 核验 → 建会话」；**切不过去就不建会话**（错误提示 + `new_chat_result ok:false`），绝不静默落到旧项目。`new_cli_chat` 自带 cwd，自验证、不受这条拦截。
+  - **客户端意图单源**：`web/src/pending-workspace.ts` 记住「已声明、未确认」的 `set_cwd` 目标，并自动挂到紧随其后的 `new_chat` 上（各入口不各自记一遍，禁逐处补 cwd）；快照落到目标目录或 cwd 过渡 `done`/`error` 即清理。
+  - **入队的命令必须自己是有界的**（自带超时 / 中止）：队列是 FIFO，一条永不落定的命令会堵住该客户端所有工作区操作。`prompt` 与文件类命令不进队（各走自己的路）。
+  - 回归：`tests/unit/workspace-queue.test.ts`、`tests/unit/pending-workspace.test.ts`。
 - **「运行的对话」列表生命周期**（每个对话 `listed` / `promptedSinceActive` / `lastActiveAt` 三字段）：
   - 入列：活动对话**正在流式输出时**被挤到后台（new_chat / switch_conversation / set_cwd，**跨项目切换同样入列**）→ `listed=true`；从历史显式恢复的会话在打开时即设 `listed=true` + `promptedSinceActive=true`，首次切走不发新消息也保留。
   - **临时对话防丢失（#793）**：已开始的 `isEphemeral` 对话切走时始终保留并设 `listed=true`，不依赖全局 `retainFinishedConversations`、原先的 `listed` 或本次是否发新消息；重复打开再切走同样保留。空白临时对话仍可自动回收，显式 ✕ 仍可销毁；保留不代表落盘，需「保存为正式对话」才能进入历史。

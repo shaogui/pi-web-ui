@@ -1,11 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { FiCheck, FiCheckCircle, FiCopy, FiCpu } from "react-icons/fi";
+import { FiCheck, FiCheckCircle, FiClock, FiCopy, FiCpu } from "react-icons/fi";
 import { useT } from "../i18n";
 import { useCopyFeedback } from "../use-copy-feedback";
-import { isFlowMode, openToolInspector } from "../tool-inspector-state";
+import {
+	getToolInspectorState,
+	isFlowMode,
+	openToolInspector,
+	retargetToolInspector,
+	updateToolInspectorLive,
+	type ToolInspectorState,
+} from "../tool-inspector-state";
 import { CollapsibleHead } from "./CollapsibleHead";
 import { HalfRingSpinner } from "./HalfRingSpinner";
 import { useSmoothStreamText } from "./StreamMarkdown";
+import { formatDuration, formatTimeFull, resolveThinkingTimeRange } from "../tool-time";
 
 const MAX_PREVIEW_LEN = 300;
 
@@ -77,9 +85,22 @@ interface ThinkingBlockProps {
 	streaming?: boolean;
 	wrap?: boolean;
 	forceOpen?: boolean;
+	startTimestamp?: number;
+	endTimestamp?: number;
+	durationMs?: number;
+	thinkingId?: string;
 }
 
-export function ThinkingBlock({ thinking, streaming, wrap = true, forceOpen = false }: ThinkingBlockProps) {
+export function ThinkingBlock({
+	thinking,
+	streaming,
+	wrap = true,
+	forceOpen = false,
+	startTimestamp,
+	endTimestamp,
+	durationMs: durationMsProp,
+	thinkingId,
+}: ThinkingBlockProps) {
 	const t = useT();
 	const [open, setOpen] = useState<boolean | null>(null);
 	const expanded = open ?? wrap;
@@ -120,17 +141,104 @@ export function ThinkingBlock({ thinking, streaming, wrap = true, forceOpen = fa
 	const rootRef = useRef<HTMLDivElement>(null);
 	const isFlow = isFlowMode(rootRef.current);
 
+	const timeRange = resolveThinkingTimeRange(
+		startTimestamp,
+		durationMsProp ??
+			(endTimestamp !== undefined && startTimestamp !== undefined ? endTimestamp - startTimestamp : undefined),
+	);
+	const displayDuration = timeRange.durationMs !== undefined ? formatDuration(timeRange.durationMs) : "";
+	// 流式思考：用本地 tick 显示已用时长（开始时间来自父消息 timestamp）
+	const [nowTick, setNowTick] = useState(() => Date.now());
+	useEffect(() => {
+		if (!activeStream || timeRange.start === undefined) return;
+		const id = window.setInterval(() => setNowTick(Date.now()), 1000);
+		return () => window.clearInterval(id);
+	}, [activeStream, timeRange.start]);
+	const liveElapsed =
+		activeStream && timeRange.start !== undefined ? Math.max(0, nowTick - timeRange.start) : undefined;
+
+	const settledStatus = displayDuration ? `${t("done")} (${displayDuration})` : t("done");
+	const livePatch: Partial<ToolInspectorState> = {
+		status: activeStream ? t("thinkingNow") : settledStatus,
+		statusClass: activeStream ? "run" : "ok",
+		duration: displayDuration,
+		durationMs: timeRange.durationMs,
+		startTimestamp: timeRange.start,
+		endTimestamp: timeRange.end,
+		output: bodyText || thinking,
+		thinking: displayedThinking || thinking,
+		streaming: activeStream,
+	};
+	const livePatchRef = useRef(livePatch);
+	livePatchRef.current = livePatch;
+	const settledStatusRef = useRef(settledStatus);
+	settledStatusRef.current = settledStatus;
+	const rawThinkingRef = useRef(thinking);
+	rawThinkingRef.current = thinking;
+	// 本实例用过的 thinkingId：流式消息落地成持久消息时 message.id 会换壳
+	const thinkingIdsRef = useRef<Set<string>>(new Set<string>());
+	if (thinkingId) thinkingIdsRef.current.add(thinkingId);
+
 	const handleOpenInspector = () => {
 		openToolInspector({
 			isThinking: true,
 			title: t("toolInspectorThinkingTitle"),
-			status: activeStream ? t("thinkingNow") : t("done"),
-			statusClass: activeStream ? "run" : "ok",
-			output: bodyText || thinking,
-			thinking,
-			streaming: activeStream,
+			...livePatch,
+			toolCallId: thinkingId,
 		});
 	};
+
+	// 思考弹窗打开后跟随流式增量。只接管属于自己这条思考的弹窗：
+	// 1) id 相同；2) 同一实例自己换过壳的旧 id；3) 同一条思考的续写（弹窗内容是自己内容的前缀）。
+	useEffect(() => {
+		if (!thinkingId) return;
+		const cur = getToolInspectorState();
+		if (!cur || !cur.isThinking) return;
+		const popupId = cur.toolCallId;
+		if (!popupId) return;
+		if (popupId !== thinkingId) {
+			const shown = formatThinkingBody(cur.thinking || cur.output || "");
+			const mine = bodyText || thinking;
+			const continues = !!shown && mine.startsWith(shown);
+			if (!thinkingIdsRef.current.has(popupId) && !continues) return;
+			retargetToolInspector(popupId, thinkingId);
+		}
+		updateToolInspectorLive(thinkingId, livePatchRef.current, "thinking");
+	}, [
+		thinkingId,
+		displayedThinking,
+		bodyText,
+		thinking,
+		activeStream,
+		displayDuration,
+		timeRange.start,
+		timeRange.end,
+		timeRange.durationMs,
+		t,
+	]);
+
+	// 折叠 / 虚拟化 / 换壳把本实例卸载时，别让弹窗永远停在「思考中」
+	useEffect(() => {
+		return () => {
+			const cur = getToolInspectorState();
+			if (!cur || !cur.isThinking || !cur.streaming) return;
+			const popupId = cur.toolCallId;
+			if (!popupId || !thinkingIdsRef.current.has(popupId)) return;
+			const settledText = formatThinkingBody(rawThinkingRef.current);
+			updateToolInspectorLive(
+				popupId,
+				{
+					...livePatchRef.current,
+					thinking: rawThinkingRef.current || livePatchRef.current.thinking,
+					output: settledText || livePatchRef.current.output,
+					status: settledStatusRef.current,
+					statusClass: "ok",
+					streaming: false,
+				},
+				"thinking",
+			);
+		};
+	}, []);
 
 	const handleToggle = () => {
 		if (isFlowMode(rootRef.current)) {
@@ -165,7 +273,7 @@ export function ThinkingBlock({ thinking, streaming, wrap = true, forceOpen = fa
 					<span className="thinking-icon chead-icon">
 						<FiCpu />
 					</span>
-					<span className="thinking-name chead-title">think</span>
+					<span className="thinking-name chead-title">{t("thinking")}</span>
 					<span
 						className="thinking-status toolcall-status"
 						title={activeStream ? t("thinkingNow") : t("done")}
@@ -227,7 +335,6 @@ export function ThinkingBlock({ thinking, streaming, wrap = true, forceOpen = fa
 					</>
 				}
 			>
-				<span className="thinking-name">think</span>
 				{activeStream && shown ? (
 					<span className="thinking-live-label">
 						{t("thinkingNow")}
@@ -236,7 +343,6 @@ export function ThinkingBlock({ thinking, streaming, wrap = true, forceOpen = fa
 				) : activeStream ? (
 					preview ? (
 						<span className="thinking-preview-live">
-							<span className="thinking-preview-prefix"> · </span>
 							<span className="thinking-preview-viewport">
 								<span className="thinking-preview-track">
 									{preview}
@@ -251,14 +357,35 @@ export function ThinkingBlock({ thinking, streaming, wrap = true, forceOpen = fa
 						</span>
 					)
 				) : preview ? (
-					<span className="thinking-summary-text"> · {preview}</span>
+					<span className="thinking-summary-text">{preview}</span>
 				) : null}
 			</CollapsibleHead>
 			{!isFlow && shown && (
-				<div className="thinking-body">
-					{bodyText}
-					{activeStream && <span className="stream-cursor" />}
-				</div>
+				<>
+					<div className="thinking-body">
+						{bodyText}
+						{activeStream && <span className="stream-cursor" />}
+					</div>
+					<div className="toolcall-time-footer thinking-time-footer">
+						<FiClock className="toolcall-time-icon" />
+						<span className="toolcall-time-text">
+							{timeRange.start !== undefined && timeRange.end !== undefined && timeRange.durationMs !== undefined
+								? t("toolTimeRange", {
+										start: formatTimeFull(timeRange.start),
+										end: formatTimeFull(timeRange.end),
+										duration: formatDuration(timeRange.durationMs),
+									})
+								: activeStream && timeRange.start !== undefined && liveElapsed !== undefined
+									? t("toolTimeRunning", {
+											start: formatTimeFull(timeRange.start),
+											duration: formatDuration(liveElapsed),
+										})
+									: timeRange.start !== undefined
+										? formatTimeFull(timeRange.start)
+										: ""}
+						</span>
+					</div>
+				</>
 			)}
 		</div>
 	);
