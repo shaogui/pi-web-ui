@@ -10,6 +10,14 @@ import {
 	type ReactNode,
 } from "react";
 import { loadProjectClickSwitch } from "../project-click-settings";
+import {
+	loadProjectOrder,
+	loadProjectOrderManual,
+	projectFirstSeen,
+	saveProjectOrder,
+	saveProjectOrderManual,
+	useProjectOrderManual,
+} from "../project-order-settings";
 import { DeviceGroupSection } from "./DeviceGroupSection";
 import { NativeCliCreateEntry } from "./NativeCliCreateModal";
 import {
@@ -90,7 +98,7 @@ interface LeftPanelProps {
 	unreadConvKeys?: ReadonlySet<string>;
 	panelSend: (
 		msg:
-			| { type: "new_chat" }
+			| { type: "new_chat"; cwd?: string }
 			| { type: "list_sessions"; path?: string; limit?: number }
 			| { type: "list_projects" }
 			| { type: "switch_session"; path: string }
@@ -194,12 +202,28 @@ function formatModified(ts: number): string {
 	return `${d.getMonth() + 1}/${d.getDate()}`;
 }
 
+/**
+ * 项目收起时，钉住的历史行仍然保持展开：钉住就是让它常驻，
+ * 否则一收起项目它就从左栏消失，和没钉一样。
+ */
+export function isPinnedRowVisible(
+	isCollapsed: boolean,
+	block: { kind: "conversation" | "session"; target: { pinned?: boolean } },
+): boolean {
+	return isCollapsed && block.kind === "session" && Boolean(block.target.pinned);
+}
+
 type SessionMenuTarget = {
 	id: string;
 	kind: "running" | "history" | "section" | "elsewhere";
 	label: string;
 	owner?: string;
 	pseudo?: boolean;
+	/**
+	 * 该行自己的钉住状态。跨项目的历史行不在「当前项目的 sessions」里，
+	 * 菜单只能靠它判断该显示「钉住」还是「取消钉住」（否则永远显示「钉住」）。
+	 */
+	pinned?: boolean;
 };
 
 function isEditableTarget(el: EventTarget | null): boolean {
@@ -282,8 +306,21 @@ function usePluginSectionCollapse(): [ReadonlySet<string>, (key: string) => void
 	}, []);
 	return [collapsed, toggle];
 }
-const LS_VISIBLE_COUNTS = "pi-web-ui:lp-visible-counts";
-const SESSION_LIST_DEFAULT = 200;
+/** 每个项目默认先渲染这么多条历史会话，其余靠「显示更多」逐页展开。 */
+const SESSION_ROWS_DEFAULT = 5;
+/** 「显示更多」每点一次多渲染的条数。 */
+const SESSION_ROWS_STEP = 10;
+/**
+ * 首屏向服务端要的条数（服务端下限 `SESSION_LIST_MIN` 同值）。
+ * 比首屏渲染的 5 条多要一些，多出来的当本地余量：下一次「显示更多」不用再跑一轮网络 + 磁盘扫描。
+ * 服务端也只按这个数向前解析（约 80 个文件），不再无脑扫最新的 260 个。
+ */
+const SESSION_LIST_FIRST_PAGE = 20;
+// 旧版本把展开条数写进 localStorage，刷新后会把上次展开的几十上百条原样恢复（阅读压力大）。
+// 展开条数现在只活在本页内存里，刷新一律回到 SESSION_ROWS_DEFAULT；顺手清掉历史键。
+try {
+	if (typeof localStorage !== "undefined") localStorage.removeItem("pi-web-ui:lp-visible-counts");
+} catch {}
 
 const LS_PROJECTS_ORDER_KEY = "pi-web-ui:projects-order";
 try {
@@ -374,6 +411,26 @@ function groupSessionsByTime(
 	if (week.length > 0) groups.push({ label: labels.pastWeek, key: "week", items: week });
 	if (earlier.length > 0) groups.push({ label: labels.earlier, key: "earlier", items: earlier });
 	return groups;
+}
+
+/**
+ * 完成证据角标：只标「没核对通过」的三种裁决，`pass` 不占位（免噪声）。
+ * 详情（哪些文件/命令没对上）在完成通知与 get_result 里，这里只负责别让未验证看起来像已验证。
+ */
+function subagentVerdictBadge(c: ConversationSummary, t: Translate) {
+	const verdict = c.subagentVerdict;
+	if (!verdict || verdict === "pass") return null;
+	const meta =
+		verdict === "blocked"
+			? { kind: "blocked", label: t("subagentVerdictBlocked") }
+			: verdict === "partial"
+				? { kind: "partial", label: t("subagentVerdictPartial") }
+				: { kind: "unverified", label: t("subagentVerdictUnverified") };
+	return (
+		<span className={`category-badge-pill evidence-${meta.kind}`} title={t("subagentVerdictHint")}>
+			{meta.label}
+		</span>
+	);
 }
 
 function ConversationRowIndicator({ children, time }: { children: ReactNode; time?: string }) {
@@ -665,7 +722,6 @@ export const LeftPanel = memo(function LeftPanel({
 	});
 
 	const deduplicatedProjects = useMemo(() => {
-		const discoveredAt = Date.now();
 		const seen = new Set<string>();
 		const list: ProjectSummary[] = [];
 		for (const p of projects) {
@@ -678,7 +734,7 @@ export const LeftPanel = memo(function LeftPanel({
 			const normCur = normalizeSessionPathKey(currentCwd);
 			if (!seen.has(normCur)) {
 				seen.add(normCur);
-				list.push({ path: currentCwd, lastUsed: discoveredAt });
+				list.push({ path: currentCwd, lastUsed: 0 });
 			}
 		}
 		for (const group of groupConversations(conversations, currentCwd, activeConversationId)) {
@@ -686,7 +742,7 @@ export const LeftPanel = memo(function LeftPanel({
 			const normC = normalizeSessionPathKey(group.cwd);
 			if (!seen.has(normC)) {
 				seen.add(normC);
-				list.push({ path: group.cwd, lastUsed: discoveredAt });
+				list.push({ path: group.cwd, lastUsed: 0 });
 			}
 		}
 		for (const e of elsewhere) {
@@ -694,28 +750,47 @@ export const LeftPanel = memo(function LeftPanel({
 			const normC = normalizeSessionPathKey(e.cwd);
 			if (!seen.has(normC)) {
 				seen.add(normC);
-				list.push({ path: e.cwd, lastUsed: discoveredAt });
+				list.push({ path: e.cwd, lastUsed: 0 });
 			}
 		}
 		return list;
 	}, [projects, currentCwd, conversations, elsewhere, activeConversationId]);
 
-	const projectRankMapRef = useRef<Map<string, number>>(new Map());
+	const projectOrderManual = useProjectOrderManual();
 	const [projectOrderVersion, setProjectOrderVersion] = useState(0);
 
+	/**
+	 * 项目排序两条路径：
+	 * - 手动模式：只认持久化的拖拽/添加顺序，新出现的项目置顶。
+	 * - 自动模式：按最近真实对话时间（`lastUsed`）降序；从没对话过的项目用「本浏览器首次出现时间」，
+	 *   所以新添加的项目同样在最上方，而查看/切换项目不会改变它们的时间（服务端不再在切项目时刷 lastUsed）。
+	 */
 	const stableProjects = useMemo(() => {
-		const rankMap = projectRankMapRef.current;
-		let maxRank = 0;
-		for (const r of rankMap.values()) if (r > maxRank) maxRank = r;
-		const newcomers = deduplicatedProjects.filter((p) => !rankMap.has(normalizeSessionPathKey(p.path)));
-		newcomers.sort((a, b) => (b.lastUsed ?? 0) - (a.lastUsed ?? 0));
-		for (const p of newcomers) rankMap.set(normalizeSessionPathKey(p.path), ++maxRank);
-		return [...deduplicatedProjects].sort(
-			(a, b) =>
-				(rankMap.get(normalizeSessionPathKey(a.path)) ?? 0) - (rankMap.get(normalizeSessionPathKey(b.path)) ?? 0),
-		);
+		const keyOf = (p: ProjectSummary) => normalizeSessionPathKey(p.path);
+		const firstSeen = projectFirstSeen(deduplicatedProjects.map(keyOf));
+		const sortKey = (p: ProjectSummary) => {
+			return p.lastUsed > 0 ? p.lastUsed : (firstSeen.get(keyOf(p)) ?? 0);
+		};
+		let ordered: ProjectSummary[];
+		if (projectOrderManual) {
+			const byKey = new Map(deduplicatedProjects.map((p) => [keyOf(p), p]));
+			const known: ProjectSummary[] = [];
+			for (const key of loadProjectOrder()) {
+				const project = byKey.get(key);
+				if (!project) continue;
+				known.push(project);
+				byKey.delete(key);
+			}
+			// 新出现的项目置顶，其余保持用户排列
+			ordered = [...byKey.values(), ...known];
+		} else {
+			ordered = [...deduplicatedProjects].sort((a, b) => sortKey(b) - sortKey(a) || keyOf(a).localeCompare(keyOf(b)));
+		}
+		// 镜像当前顺序：切到手动模式时沿用眼前看到的排列，不会突然重排
+		saveProjectOrder(ordered.map(keyOf));
+		return ordered;
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [deduplicatedProjects, projectOrderVersion]);
+	}, [deduplicatedProjects, projectOrderManual, projectOrderVersion]);
 
 	const moveProject = useCallback(
 		(fromPath: string, toPath: string, after: boolean) => {
@@ -726,10 +801,9 @@ export const LeftPanel = memo(function LeftPanel({
 			const idx = keys.indexOf(to);
 			if (idx < 0) return;
 			keys.splice(after ? idx + 1 : idx, 0, from);
-			const rankMap = projectRankMapRef.current;
-			let r = 0;
-			for (const k of keys) rankMap.set(k, ++r);
-			for (const [k, v] of rankMap) if (!keys.includes(k)) rankMap.set(k, r + v);
+			saveProjectOrder(keys);
+			// 手动拖过就算要自己排：切到手动模式，别让下一次对话把顺序抢回去
+			if (!loadProjectOrderManual()) saveProjectOrderManual(true);
 			setProjectOrderVersion((v) => v + 1);
 		},
 		[stableProjects],
@@ -739,23 +813,22 @@ export const LeftPanel = memo(function LeftPanel({
 
 	const effectiveProjects = stableProjects;
 
+	// 本地有没有「上次的展开/收起记录」：有就按记录恢复（刷新不该自己弹开），
+	// 没有就是首次使用（当前项目要展开）。这个判断必须在挂载时定下来 ——
+	// `cwd` 来自 websocket 快照，挂载那一刻通常还没到，不能拿它当判据。
+	const persistedExpandedRef = useRef<Set<string> | null>(null);
 	const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => {
 		try {
 			const raw = localStorage.getItem("pi-web-ui:lp-expanded-projects");
 			if (raw) {
 				const arr = JSON.parse(raw);
 				if (Array.isArray(arr)) {
-					const s = new Set<string>(arr);
-					const norm = normalizeSessionPathKey(currentCwd);
-					if (norm) s.add(norm);
-					return s;
+					persistedExpandedRef.current = new Set<string>(arr);
+					return persistedExpandedRef.current;
 				}
 			}
 		} catch {}
-		const s = new Set<string>();
-		const norm = normalizeSessionPathKey(currentCwd);
-		if (norm) s.add(norm);
-		return s;
+		return new Set<string>();
 	});
 
 	useEffect(() => {
@@ -764,29 +837,13 @@ export const LeftPanel = memo(function LeftPanel({
 		} catch {}
 	}, [expandedProjects]);
 
-	const [projectVisibleCounts, setProjectVisibleCounts] = useState<Record<string, number>>(() => {
-		try {
-			const raw = localStorage.getItem(LS_VISIBLE_COUNTS);
-			const parsed = raw ? (JSON.parse(raw) as unknown) : null;
-			if (parsed && typeof parsed === "object") {
-				const out: Record<string, number> = {};
-				for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-					if (typeof v === "number" && v > 8) out[k] = Math.min(v, 5000);
-				}
-				return out;
-			}
-		} catch {}
-		return {};
-	});
-	useEffect(() => {
-		try {
-			localStorage.setItem(LS_VISIBLE_COUNTS, JSON.stringify(projectVisibleCounts));
-		} catch {}
-	}, [projectVisibleCounts]);
+	// 只记在内存里：刷新页面回到 SESSION_ROWS_DEFAULT，不会把上次展开到的大条数带回来。
+	const [projectVisibleCounts, setProjectVisibleCounts] = useState<Record<string, number>>({});
 	const serverListLimit = useCallback(
-		(projectPath: string): number | undefined => {
-			const n = projectVisibleCounts[normalizeSessionPathKey(projectPath)];
-			return n && n > SESSION_LIST_DEFAULT ? Math.ceil(n / SESSION_LIST_DEFAULT) * SESSION_LIST_DEFAULT : undefined;
+		(projectPath: string): number => {
+			const visible = projectVisibleCounts[normalizeSessionPathKey(projectPath)] ?? SESSION_ROWS_DEFAULT;
+			// 已经展开到很多条的项目重挂载时一次要够，别让列表缩回去。
+			return Math.max(SESSION_LIST_FIRST_PAGE, visible + SESSION_ROWS_STEP);
 		},
 		[projectVisibleCounts],
 	);
@@ -812,9 +869,16 @@ export const LeftPanel = memo(function LeftPanel({
 		});
 	}, [projectSessions]);
 
+	const expandedSeededRef = useRef(false);
 	useEffect(() => {
 		const normCur = normalizeSessionPathKey(currentCwd);
 		if (normCur) {
+			// 首个拿到的 cwd：刷新场景保留用户收起的状态（有记录就不动），
+			// 首次使用（没有记录）要展开当前项目；之后再切项目一律自动展开。
+			if (!expandedSeededRef.current) {
+				expandedSeededRef.current = true;
+				if (persistedExpandedRef.current) return;
+			}
 			setExpandedProjects((prev) => {
 				if (prev.has(normCur)) return prev;
 				const next = new Set(prev);
@@ -843,13 +907,7 @@ export const LeftPanel = memo(function LeftPanel({
 			});
 			if (willExpand) {
 				const limit = serverListLimit(projectPath);
-				if (
-					ready &&
-					status === "open" &&
-					panelSend(
-						limit ? { type: "list_sessions", path: projectPath, limit } : { type: "list_sessions", path: projectPath },
-					)
-				) {
+				if (ready && status === "open" && panelSend({ type: "list_sessions", path: projectPath, limit })) {
 					initialRequestedRef.current.add(normP);
 					setLoadingProjects((lp) => new Set(lp).add(normP));
 				}
@@ -877,9 +935,7 @@ export const LeftPanel = memo(function LeftPanel({
 			if (pNorm === curNorm) continue;
 			if (expandedProjects.has(pNorm) && !initialRequestedRef.current.has(pNorm)) {
 				const limit = serverListLimit(p.path);
-				const sent = panelSend(
-					limit ? { type: "list_sessions", path: p.path, limit } : { type: "list_sessions", path: p.path },
-				);
+				const sent = panelSend({ type: "list_sessions", path: p.path, limit });
 				if (sent) {
 					initialRequestedRef.current.add(pNorm);
 					setLoadingProjects((lp) => (lp.has(pNorm) ? lp : new Set(lp).add(pNorm)));
@@ -1027,7 +1083,7 @@ export const LeftPanel = memo(function LeftPanel({
 						: { ...entry, hidden: true };
 				if (entry.id === "host:conv-pin") {
 					if (target.kind === "history") {
-						const isPinned = sessions.find((s) => s.path === target.id)?.pinned;
+						const isPinned = target.pinned ?? sessions.find((s) => s.path === target.id)?.pinned;
 						return isPinned ? { ...entry, label: t("unpinConversation") } : entry;
 					}
 					if (!scopeId) return { ...entry, hidden: true };
@@ -1134,8 +1190,9 @@ export const LeftPanel = memo(function LeftPanel({
 			}
 			if (entry.id === "host:conv-pin") {
 				if (target.kind === "history") {
-					const cur = sessions.find((s) => s.path === target.id);
-					panelSend({ type: "pin_session", path: target.id, pinned: !cur?.pinned });
+					// 这里的 target 是右键系统的精简对象（没有 pinned），完整目标在 sessionMenuRef 里。
+					const pinned = sessionMenuRef.current?.target.pinned ?? sessions.find((s) => s.path === target.id)?.pinned;
+					panelSend({ type: "pin_session", path: target.id, pinned: !pinned });
 					return;
 				}
 				if (scopeId) {
@@ -1535,7 +1592,7 @@ export const LeftPanel = memo(function LeftPanel({
 				checkUnread({ sessionId: s.sessionId, sessionFile: s.path, path: s.path }),
 			).length;
 
-			const maxVisible = projectVisibleCounts[pNorm] ?? 8;
+			const maxVisible = projectVisibleCounts[pNorm] ?? SESSION_ROWS_DEFAULT;
 			const blocks: (
 				| { kind: "conversation"; target: ConversationSummary; rows: ConvRowItem[] }
 				| { kind: "session"; target: SessionSummary }
@@ -1555,7 +1612,6 @@ export const LeftPanel = memo(function LeftPanel({
 			const serverHasMore = Boolean(projectSessionsHasMore?.[pNorm]);
 			return {
 				serverHasMore,
-				loadedCount: pRawSessions.length,
 				p,
 				pNorm,
 				active,
@@ -1589,6 +1645,7 @@ export const LeftPanel = memo(function LeftPanel({
 	]);
 	const sectionPlan = withDeviceGroupSection(planLeftSections(uiSections));
 	const shownPlan = sectionPlan.filter((p) => p.shown);
+	const hasGroupsSection = shownPlan.some((p) => p.key === "groups");
 
 	const effectivePlan = useMemo(() => {
 		return shownPlan.filter((p) => {
@@ -1599,6 +1656,12 @@ export const LeftPanel = memo(function LeftPanel({
 			return true;
 		});
 	}, [shownPlan, workspaceTab]);
+
+	// 群组分区被隐藏后，「群组」tab 不再渲染；此时若记忆的模式仍停在 groups，
+	// 左栏会落在没有任何 tab 高亮的空态，故把模式归一化回 projects。
+	useEffect(() => {
+		if (!hasGroupsSection && workspaceTab === "groups") setWorkspaceTab("projects");
+	}, [hasGroupsSection, workspaceTab]);
 
 	const collapsedOf = useCallback(
 		(k: LpSectionKey): boolean =>
@@ -1718,7 +1781,7 @@ export const LeftPanel = memo(function LeftPanel({
 		if (!active || !ready || status !== "open") return;
 		if (!cwd) return;
 		const limit = serverListLimit(cwd);
-		panelSend(limit ? { type: "list_sessions", limit } : { type: "list_sessions" });
+		panelSend({ type: "list_sessions", limit });
 		panelSend({ type: "list_projects" });
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [active, ready, status, cwd, panelSend]);
@@ -1967,7 +2030,7 @@ export const LeftPanel = memo(function LeftPanel({
 				key={s.path}
 				data-session-key={sessionKey}
 				onMouseLeave={() => setConfirmDel((k) => (k === `sess:${s.path}` ? null : k))}
-				onContextMenu={(e) => openSessionMenu(e, { id: s.path, kind: "history", label: rawTitle })}
+				onContextMenu={(e) => openSessionMenu(e, { id: s.path, kind: "history", label: rawTitle, pinned: s.pinned })}
 			>
 				<RowMain
 					editing={renaming === s.path}
@@ -2300,6 +2363,8 @@ export const LeftPanel = memo(function LeftPanel({
 								</span>
 							)}
 
+							{subagentVerdictBadge(c, t)}
+
 							<ConversationRowIndicator time={convTime ? formatModified(convTime) : undefined}>
 								{c.hasQuestion ? (
 									<span
@@ -2496,6 +2561,8 @@ export const LeftPanel = memo(function LeftPanel({
 							</span>
 						)}
 
+						{subagentVerdictBadge(c, t)}
+
 						<ConversationRowIndicator time={convTime ? formatModified(convTime) : undefined}>
 							{hasQuestion || c.hasQuestion || isCliWaiting ? (
 								<span
@@ -2640,8 +2707,7 @@ export const LeftPanel = memo(function LeftPanel({
 							onContextMenu={(e) => openProjectMenu(e, { path: g.cwd, lastUsed: 0 })}
 							onDoubleClick={(e) => {
 								e.stopPropagation();
-								panelSend({ type: "set_cwd", path: g.cwd });
-								panelSend({ type: "new_chat" });
+								panelSend({ type: "new_chat", cwd: g.cwd });
 								focusComposer();
 							}}
 						>
@@ -2706,27 +2772,29 @@ export const LeftPanel = memo(function LeftPanel({
 										<span>{t("tabProjects")}</span>
 										<span style={{ fontSize: "11px", opacity: 0.85 }}>({projects.length})</span>
 									</span>
-									<span
-										role="button"
-										tabIndex={0}
-										className={`lp-conv-tab ${workspaceTab === "groups" ? "active" : ""}`}
-										onClick={(e) => {
-											e.stopPropagation();
-											setWorkspaceTab("groups");
-										}}
-										onKeyDown={(e) => {
-											if (e.key === "Enter" || e.key === " ") {
-												e.preventDefault();
+									{hasGroupsSection && (
+										<span
+											role="button"
+											tabIndex={0}
+											className={`lp-conv-tab ${workspaceTab === "groups" ? "active" : ""}`}
+											onClick={(e) => {
 												e.stopPropagation();
 												setWorkspaceTab("groups");
-											}
-										}}
-										title={t("deviceGroups")}
-									>
-										<FiUsers style={{ fontSize: "12.5px" }} />
-										<span>{t("deviceGroups")}</span>
-										{groupCount > 0 && <span style={{ fontSize: "11px", opacity: 0.85 }}>({groupCount})</span>}
-									</span>
+											}}
+											onKeyDown={(e) => {
+												if (e.key === "Enter" || e.key === " ") {
+													e.preventDefault();
+													e.stopPropagation();
+													setWorkspaceTab("groups");
+												}
+											}}
+											title={t("deviceGroups")}
+										>
+											<FiUsers style={{ fontSize: "12.5px" }} />
+											<span>{t("deviceGroups")}</span>
+											{groupCount > 0 && <span style={{ fontSize: "11px", opacity: 0.85 }}>({groupCount})</span>}
+										</span>
+									)}
 								</span>
 							</span>
 						</button>
@@ -2829,7 +2897,7 @@ export const LeftPanel = memo(function LeftPanel({
 						</div>
 					</div>
 					{!collapseProjects &&
-						(workspaceTab === "groups" ? (
+						(workspaceTab === "groups" && hasGroupsSection ? (
 							<DeviceGroupSection
 								entry={uiSections?.find((entry) => entry.id === "host:lp-groups")}
 								active={active}
@@ -2881,7 +2949,11 @@ export const LeftPanel = memo(function LeftPanel({
 										transition?.kind === "cwd" ? normalizeSessionPathKey(transition.target) : null;
 									const q = filterText.trim().toLowerCase();
 									const views = projectTreeModel.map((m) => {
-										const visibleIdle = new Set(m.idleSessions.slice(0, m.maxVisible));
+										// 钉住的行不受 maxVisible 截断：它常驻，翻页也不能把它藏起来。
+										const visibleIdle = new Set([
+											...m.idleSessions.slice(0, m.maxVisible),
+											...m.idleSessions.filter((s) => s.pinned),
+										]);
 										const visibleModel = {
 											...m,
 											orderedBlocks: m.orderedBlocks.filter(
@@ -2935,7 +3007,6 @@ export const LeftPanel = memo(function LeftPanel({
 											actuallyRunningCount,
 											unreadCount,
 											serverHasMore,
-											loadedCount,
 										} = m;
 										const switching = transitionCwdNorm !== null && transitionCwdNorm === pNorm;
 										const sbx = p.sandbox;
@@ -2947,11 +3018,15 @@ export const LeftPanel = memo(function LeftPanel({
 										if (!isCollapsed) {
 											everExpandedRef.current.add(pNorm);
 										}
+										const hasPinnedHistory = idleSessions.some((s) => s.pinned);
 										const shouldMountChildren =
 											!isCollapsed ||
 											pRunningRows.length > 0 ||
 											hasUnread ||
 											active ||
+											// 刷新后一直是收起状态、也没展开过的项目：只要里面有钉住的行，
+											// 子节点就得挂上，否则那行永远不出现（要手动展开再收才看得到）。
+											hasPinnedHistory ||
 											everExpandedRef.current.has(pNorm);
 
 										const dropClass =
@@ -3032,12 +3107,9 @@ export const LeftPanel = memo(function LeftPanel({
 														onDoubleClick={(e) => {
 															e.stopPropagation();
 															if (switching) return;
-															if (active) {
-																panelSend({ type: "new_chat" });
-															} else {
-																panelSend({ type: "set_cwd", path: p.path });
-																panelSend({ type: "new_chat" });
-															}
+															// 目标项目直接写在 new_chat 上：服务端先切工作区、核验后再建会话（#872），
+															// 不再发「set_cwd + new_chat」两条各自竞速的消息。
+															panelSend({ type: "new_chat", cwd: p.path });
 															focusComposer();
 														}}
 													>
@@ -3084,7 +3156,11 @@ export const LeftPanel = memo(function LeftPanel({
 																</span>
 															)}
 															<span className={`project-time ${switching ? "switching-pct" : ""}`}>
-																{switching ? `${transition?.progress ?? 0}%` : formatModified(p.lastUsed)}
+																{switching
+																	? `${transition?.progress ?? 0}%`
+																	: p.lastUsed > 0
+																		? formatModified(p.lastUsed)
+																		: ""}
 															</span>
 														</span>
 													</button>
@@ -3097,8 +3173,7 @@ export const LeftPanel = memo(function LeftPanel({
 																title={t("newChat") || "新建对话"}
 																onClick={(e) => {
 																	e.stopPropagation();
-																	if (!active) panelSend({ type: "set_cwd", path: p.path });
-																	panelSend({ type: "new_chat" });
+																	panelSend({ type: "new_chat", cwd: p.path });
 																	focusComposer();
 																}}
 															>
@@ -3149,19 +3224,26 @@ export const LeftPanel = memo(function LeftPanel({
 														className={`lp-project-tree-children${isCollapsed ? " is-collapsed" : " is-expanded"}${pRunningRows.length > 0 ? " has-running-rows" : ""}`}
 													>
 														{}
-														{orderedBlocks.map((block) => (
-															<Fragment key={block.key}>
-																{block.kind === "conversation" ? (
-																	block.rows.map((row) => renderSingleConvRow(row, p.path))
-																) : (
-																	<div className={`lp-history-collapsible${isCollapsed ? " collapsed" : " expanded"}`}>
-																		<div className="lp-history-collapsible-inner">
-																			{renderHistorySessionRow(block.target, p.path)}
+														{orderedBlocks.map((block) => {
+															// 钉住的历史行在项目收起时仍然显示 —— 钉住就是让它常驻，
+															// 否则一收起项目它就从左栏消失了，跟没钉一样。
+															const pinnedVisible = isPinnedRowVisible(isCollapsed, block);
+															return (
+																<Fragment key={block.key}>
+																	{block.kind === "conversation" ? (
+																		block.rows.map((row) => renderSingleConvRow(row, p.path))
+																	) : (
+																		<div
+																			className={`lp-history-collapsible${isCollapsed && !pinnedVisible ? " collapsed" : " expanded"}${pinnedVisible ? " is-pinned-visible" : ""}`}
+																		>
+																			<div className="lp-history-collapsible-inner">
+																				{renderHistorySessionRow(block.target, p.path)}
+																			</div>
 																		</div>
-																	</div>
-																)}
-															</Fragment>
-														))}
+																	)}
+																</Fragment>
+															);
+														})}
 
 														{}
 														<div className={`lp-history-collapsible${isCollapsed ? " collapsed" : " expanded"}`}>
@@ -3186,15 +3268,17 @@ export const LeftPanel = memo(function LeftPanel({
 																		disabled={loadingMore.has(pNorm)}
 																		onClick={(e) => {
 																			e.stopPropagation();
-																			const nextVisible = maxVisible + 20;
+																			const nextVisible = maxVisible + SESSION_ROWS_STEP;
 																			setProjectVisibleCounts((prev) => ({
 																				...prev,
 																				[pNorm]: nextVisible,
 																			}));
 																			if (serverHasMore && nextVisible >= idleSessions.length) {
-																				const limit =
-																					Math.ceil((loadedCount + 1) / SESSION_LIST_DEFAULT) * SESSION_LIST_DEFAULT +
-																					SESSION_LIST_DEFAULT;
+																				// 多要一页当本地余量；服务端按这个数决定解析多少个文件
+																				const limit = Math.max(
+																					SESSION_LIST_FIRST_PAGE,
+																					nextVisible + SESSION_ROWS_STEP,
+																				);
 																				panelSend({ type: "list_sessions", path: p.path, limit });
 																				setLoadingMore((prev) => new Set(prev).add(pNorm));
 																			}

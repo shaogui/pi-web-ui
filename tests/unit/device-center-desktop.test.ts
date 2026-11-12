@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import express from "express";
 import { chromium } from "playwright-core";
-import { CHROME_PATH } from "../lib/chrome.mjs";
+import { BROWSER_LAUNCH_TIMEOUT_MS, BROWSER_TEST_TIMEOUT_MS, CHROME_PATH } from "../lib/chrome.mjs";
 import { createServer, request, type Server } from "node:http";
 import { once } from "node:events";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
@@ -592,7 +592,7 @@ describe("device desktop native route", () => {
 			const browser = await chromium.launch({
 				executablePath: CHROME_PATH,
 				headless: true,
-				timeout: 15_000,
+				timeout: BROWSER_LAUNCH_TIMEOUT_MS,
 				args: ["--no-sandbox"],
 			});
 			cleanups.push(() => browser.close());
@@ -630,6 +630,6 @@ describe("device desktop native route", () => {
 			expect(await page.locator("#connect").isEnabled()).toBe(true);
 			expect(errors).toEqual([]);
 		},
-		30_000,
+		BROWSER_TEST_TIMEOUT_MS,
 	);
 });

@@ -82,5 +82,9 @@ capsule-palettes.html
 
 # 手机调试包（构建产物，不入库）
 /pi-web-ui-mobile-debug.apk
+<<<<<<< HEAD
 tests/
 update.sh
+=======
+/pi-web-ui-mobile-*.apk
+>>>>>>> 14ec4a3adfa166d0fc4e47785dccb562565c8072

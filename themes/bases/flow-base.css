@@ -269,7 +269,7 @@
 	margin: 0;
 	padding: 0 8px;
 	background: color-mix(in srgb, var(--text) 5%, transparent);
-	border: 1px solid var(--border);
+	border: 1px solid transparent;
 	border-radius: 999px;
 	font-family: var(--mono, monospace);
 	font-size: 11px;
@@ -279,8 +279,11 @@
 	box-shadow:
 		inset 0 0.5px 0.5px color-mix(in srgb, var(--text) 22%, transparent),
 		0 2px 5px color-mix(in srgb, var(--flow-shadow) 35%, transparent);
-	backdrop-filter: blur(12px) saturate(140%);
-	-webkit-backdrop-filter: blur(12px) saturate(140%);
+	/* 不给胶囊上 backdrop-filter：带它的元素各自一个合成表面，胶囊是行内重复项，
+	   一个回合几十上百颗 = 几十上百个合成层（300 颗实测 310 层 vs 11 层）。
+	   何况 --bg-image: none 的纯色底上，模糊均匀色不产生任何毛玻璃信息。 */
+	backdrop-filter: none;
+	-webkit-backdrop-filter: none;
 	transition:
 		background 0.15s cubic-bezier(0.16, 1, 0.3, 1),
 		border-color 0.15s cubic-bezier(0.16, 1, 0.3, 1),
@@ -294,7 +297,6 @@
 .toolcall:hover,
 .thinking:hover {
 	background: var(--border);
-	border-color: color-mix(in srgb, var(--text) 22%, transparent);
 	box-shadow:
 		inset 0 1px 1px color-mix(in srgb, var(--text) 35%, transparent),
 		0 4px 10px color-mix(in srgb, var(--flow-shadow) 45%, transparent);
@@ -307,29 +309,18 @@
 }
 
 .toolcall.run {
-	border-color: rgba(245, 158, 11, 0.45);
 	box-shadow:
 		inset 0 0.5px 0.5px color-mix(in srgb, var(--text) 25%, transparent),
 		0 0 10px rgba(245, 158, 11, 0.25);
 }
-.toolcall.ok {
-	border-color: rgba(52, 211, 153, 0.25);
-}
 .toolcall.err {
-	border-color: rgba(248, 113, 113, 0.45);
+	background: color-mix(in srgb, var(--red) 12%, transparent);
 	box-shadow:
 		inset 0 0.5px 0.5px color-mix(in srgb, var(--text) 25%, transparent),
 		0 0 10px rgba(239, 68, 68, 0.25);
 }
 
-.thinking {
-	border-color: rgba(192, 132, 252, 0.25);
-}
-.thinking:hover {
-	border-color: rgba(192, 132, 252, 0.45);
-}
 .thinking.run {
-	border-color: rgba(192, 132, 252, 0.5);
 	box-shadow:
 		inset 0 0.5px 0.5px color-mix(in srgb, var(--text) 25%, transparent),
 		0 0 10px rgba(192, 132, 252, 0.25);

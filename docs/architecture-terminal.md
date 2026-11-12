@@ -113,7 +113,7 @@
 
 `terminals.ts` 的 `noteAgentActivity` / `armIdleWatch` + agent-service 的 `notifyTerminalIdle`：agent 工具路径的 terminal(action=create/input/key) 会启动一个「静默纪元」——该终端连续 `PI_WEB_TERMINAL_IDLE_MS`（默认 15s）无输出且**该对话正在流式运行**时，经 onAgentIdle 回调由宿主 `sendUserMessage` 注入一条 steer 提醒唤醒 AI 去检查（等输入/已挂起）。
 
-防骚扰设计：①用户手开的终端永不参与（只有工具包装层调 noteAgentActivity，浏览器路径不调）；②一次性——触发后解除武装，agent 再次触碰才重新计时；③纪元内任何输出/输入都重置倒计时；④退出/关闭即拆钟。系统提示词引导 TERMINAL_TOOLS_GUIDANCE 已告知模型该机制。回归：`tests/terminal-idle-test.mjs`（直接实例化 TerminalManager + 小阈值，零 token 不起 server；win32 未验证）。
+防骚扰设计：①用户手开的终端永不参与（只有工具包装层调 noteAgentActivity，浏览器路径不调）；②一次性——触发后解除武装，agent 再次触碰才重新计时；③纪元内任何输出/输入都重置倒计时；④退出/关闭即拆钟。提醒文案本身就是自包含的 steer 消息（含终端的 id、最近输出、建议的 read/input/key/close 动作），它已告知模型该怎么做；全局终端引导段已下线，不再另占系统提示词。回归：`tests/terminal-idle-test.mjs`（直接实例化 TerminalManager + 小阈值，零 token 不起 server；win32 未验证）。
 
 ## 终端接管 bash（terminal-backed bash）
 
@@ -186,3 +186,5 @@ macOS 下若服务由 launchd 拉起（`process.ppid === 1`，LaunchAgent/孤儿
 ## Windows shell 解析
 
 `terminals.ts` 的 `resolveShell()` 每次创建终端时解析，优先 bash——`PI_WEB_SHELL` 显式 → `$SHELL` → Git Bash（ProgramFiles）→ busybox 兜底（`~/.pi-web/bin/bash.exe`，`ensure-bash.ts` 无 Git Bash 时自动下载 busybox-w32）→ `$COMSPEC` → powershell。与 SDK bash 工具（Git Bash / PATH 上的 bash）保持一致，避免 PowerShell/bash 混用挂死。
+
+bash 工具本身与 pi CLI 同源：`server/bash-tool.ts` 把 `settings.json` 的 `shellPath`（全局 agent 目录 + 项目 `.pi/settings.json`，`SettingsManager.getShellPath()`）透传给 `createLocalBashOperations`，缺失时才是上面那套 Git Bash / PATH 探测（issue #866）。终端面板不读该配置——它只认 `PI_WEB_SHELL`，两者的差异是故意的：终端是给用户看一眼的可见 shell，bash 工具要跟 CLI 行为对齐。

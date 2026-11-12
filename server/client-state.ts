@@ -552,7 +552,7 @@ export const DEFAULT_DARK_MINIMAL_SETTINGS: ClientSettings = Object.freeze({
 		append:
 			"使用gh fnm uv\npr和issue处理完要回复 并且关闭, 分支合并之后就删除\n处理问题时 跳出“修补表象、头痛医头”的打地鼠视角 寻找根本的解决办法",
 	},
-	promptDisabled: ["persona", "plugin_dev"],
+	promptDisabled: ["plugin_dev"],
 	_promptPluginDevConfigured: false,
 	toolPromptOverrides: {},
 	disabledSkills: [],
@@ -602,10 +602,14 @@ export const DEFAULT_DARK_MINIMAL_SETTINGS: ClientSettings = Object.freeze({
 		"db_tables",
 		"image_services",
 		"image_generate",
+		"browser_use",
+		"live2d",
 		"live_preview",
 		"matrix",
+		"music_control",
 		"pm2",
 		"qq",
+		"quota_status",
 		"session_migrate_import",
 		"session_migrate_scan",
 		"slack",
@@ -621,11 +625,17 @@ export const DEFAULT_DARK_MINIMAL_SETTINGS: ClientSettings = Object.freeze({
 		"imessage",
 		"legado_source_probe",
 		"legado_run_rule",
+		"bili_ask",
 		"bili_comments",
+		"bili_deepen",
+		"bili_delivery",
+		"bili_dm_messages",
+		"bili_dm_sessions",
 		"bili_duty_run",
 		"bili_fav_add",
 		"bili_fav_folders",
 		"bili_hot_videos",
+		"bili_index",
 		"bili_login_poll",
 		"bili_login_start",
 		"bili_rank",
@@ -636,20 +646,51 @@ export const DEFAULT_DARK_MINIMAL_SETTINGS: ClientSettings = Object.freeze({
 		"bili_send_message",
 		"bili_status",
 		"bili_subtitle",
+		"bili_taste",
 		"bili_up_videos",
+		"bili_video_content",
 		"bili_video_info",
 		"bili_whoami",
+		"stroll_ask",
+		"stroll_comments",
+		"stroll_deepen",
+		"stroll_delivery",
+		"stroll_dm_messages",
+		"stroll_dm_sessions",
+		"stroll_duty_run",
+		"stroll_fav_add",
+		"stroll_fav_folders",
+		"stroll_hot_videos",
+		"stroll_index",
+		"stroll_login_poll",
+		"stroll_login_start",
+		"stroll_rank",
+		"stroll_related",
+		"stroll_reply",
+		"stroll_resolve_uid",
+		"stroll_search",
+		"stroll_send_message",
+		"stroll_status",
+		"stroll_subtitle",
+		"stroll_taste",
+		"stroll_up_videos",
+		"stroll_video_content",
+		"stroll_video_info",
+		"stroll_whoami",
 		"tts",
 		"office",
 		"desktop_click",
+		"desktop_drag",
 		"desktop_elements",
 		"desktop_key",
 		"desktop_screenshot",
+		"desktop_scroll",
 		"desktop_type",
 		"desktop_window",
 		"wechat_send",
 		"remote_term",
 		"notes",
+		"frp",
 	],
 	nativeCliInheritModel: {},
 	terminalToolsEnabled: false,
@@ -851,7 +892,7 @@ export function normalizeWorkspaceRoots(v: unknown): string[] {
 }
 
 export interface MarkerSettings {
-	markersEnabled: boolean;
+	/** 已关闭的标记名。全局状态由此派生：任意一个标记开着 = 全局启用，全部关闭 = 全局关闭。 */
 	disabledMarkers: string[];
 }
 
@@ -897,7 +938,9 @@ export function normalizePathKey(p: string): string {
 		}
 		if (/^[a-zA-Z]:[\\/]/.test(p)) {
 			const drive = p.slice(0, 2).toLowerCase();
-			const rest = p.slice(2).replace(/\\/g, "/").replace(/\/+/g, "/");
+			// 尾部斜杠也要归一：win32 走 resolve() 已经去掉了，这条非 win32 分支是自己拼的，
+			// 留着会让 "e:/work/p" 与 "E:\\work\\p\\" 被当成两个目录（cwd 比对 / 缓存键 / 去重全分叉）。
+			const rest = p.slice(2).replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/+$/, "");
 			return (drive + rest).toLowerCase();
 		}
 		return resolve(p);
@@ -1060,23 +1103,43 @@ export class ClientStateStore {
 		return this.load()[clientId] ?? { projects: [] };
 	}
 
-	remember(clientId: string, cwd: string): void {
+	/**
+	 * 记录一个项目。
+	 * - `promote`（默认）= 真实对话活动，把 `lastUsed` 顶到当前时间；项目排序只认这个。
+	 * - `promote: false` = 浏览/切换/恢复，只记 `lastCwd`、清 tombstone、缺省登记（`lastUsed: 0`），
+	 *   不刷新时间，所以只是点开看看不会把项目顶到最新。
+	 */
+	remember(clientId: string, cwd: string, opts?: { promote?: boolean }): void {
 		const all = this.load();
 		const state = (all[clientId] ??= { projects: [] });
 		this.touchClient(all, clientId);
 		state.lastCwd = cwd;
 		const now = Date.now();
 		const targetKey = normalizePathKey(cwd);
-		state.projects = [
-			{ path: cwd, lastUsed: now },
-			...state.projects.filter((p) => normalizePathKey(p.path) !== targetKey),
-		].slice(0, RECENT_PROJECTS_MAX);
+		const promote = opts?.promote !== false;
 		// Also persist in global settings so new tabs and sessions inherit it immediately
 		const globalState = (all[ClientStateStore.GLOBAL_SETTINGS_KEY] ??= { projects: [] });
-		globalState.projects = [
-			{ path: cwd, lastUsed: now },
-			...(globalState.projects ?? []).filter((p) => normalizePathKey(p.path) !== targetKey),
-		].slice(0, RECENT_PROJECTS_MAX);
+		if (promote) {
+			state.projects = [
+				{ path: cwd, lastUsed: now },
+				...state.projects.filter((p) => normalizePathKey(p.path) !== targetKey),
+			].slice(0, RECENT_PROJECTS_MAX);
+			globalState.projects = [
+				{ path: cwd, lastUsed: now },
+				...(globalState.projects ?? []).filter((p) => normalizePathKey(p.path) !== targetKey),
+			].slice(0, RECENT_PROJECTS_MAX);
+		} else {
+			// 浏览不算「最近对话」：已登记的不动时间，没登记的补一条 lastUsed: 0 留着位置
+			if (!state.projects.some((p) => normalizePathKey(p.path) === targetKey)) {
+				state.projects = [{ path: cwd, lastUsed: 0 }, ...state.projects].slice(0, RECENT_PROJECTS_MAX);
+			}
+			if (!(globalState.projects ?? []).some((p) => normalizePathKey(p.path) === targetKey)) {
+				globalState.projects = [{ path: cwd, lastUsed: 0 }, ...(globalState.projects ?? [])].slice(
+					0,
+					RECENT_PROJECTS_MAX,
+				);
+			}
+		}
 		// Opening the workspace again clears its removal tombstone across all clients and global settings.
 		for (const cState of Object.values(all)) {
 			if (cState.removedProjects?.length) {
@@ -1927,17 +1990,26 @@ export class ClientStateStore {
 	getMarkerSettings(_clientId: string): MarkerSettings {
 		const s = this.load()[ClientStateStore.GLOBAL_SETTINGS_KEY]?.markers;
 		return {
-			markersEnabled: s?.markersEnabled ?? true,
 			disabledMarkers: s?.disabledMarkers ?? [...DEFAULT_DISABLED_MARKERS],
 		};
+	}
+
+	/**
+	 * 【一次性迁移】旧版独立的「启用标记工具（全局）」开关是否被关掉。
+	 * `undefined` = 旧数据里没有这个字段。新语义「全关即全局关闭」由 MarkerService 从 disabledMarkers 派生。
+	 */
+	getLegacyMarkersGlobalOff(): boolean | undefined {
+		const markers = this.load()[ClientStateStore.GLOBAL_SETTINGS_KEY]?.markers as unknown as
+			{ markersEnabled?: unknown } | undefined;
+		return typeof markers?.markersEnabled === "boolean" ? !markers.markersEnabled : undefined;
 	}
 
 	saveMarkerSettings(_clientId: string, settings: Partial<MarkerSettings>): void {
 		const all = this.load();
 		const state = (all[ClientStateStore.GLOBAL_SETTINGS_KEY] ??= { projects: [] });
-		const cur = state.markers ?? { markersEnabled: true, disabledMarkers: [...DEFAULT_DISABLED_MARKERS] };
+		const cur = state.markers ?? { disabledMarkers: [...DEFAULT_DISABLED_MARKERS] };
+		// 只落盘 per-marker 黑名单：整块覆盖会顺带清掉旧数据里已下线的 markersEnabled 字段
 		state.markers = {
-			markersEnabled: settings.markersEnabled ?? cur.markersEnabled ?? true,
 			disabledMarkers: settings.disabledMarkers ?? cur.disabledMarkers ?? [...DEFAULT_DISABLED_MARKERS],
 		};
 		this.save();

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { openImageLightbox } from "../image-lightbox-bridge";
 import { useCopyFeedback } from "../use-copy-feedback";
@@ -50,6 +50,43 @@ import { CodemodeCard, DelegateBrief, TerminalCommand, ToolSearchDetails } from 
 import { Markdown } from "./Markdown";
 import { SplitDiffView, UnifiedDiffView, WriteCodeView } from "./FileChangeCard";
 import { SubagentInspectorView } from "./SubagentInspectorView";
+import { formatDuration, formatTimeFull } from "../tool-time";
+
+function InspectorTimeText({ state }: { state: ToolInspectorState }): ReactNode {
+	const t = useT();
+	const start =
+		state.startTimestamp ??
+		(state.resultTimestamp !== undefined && state.durationMs !== undefined
+			? state.resultTimestamp - state.durationMs
+			: undefined);
+	const end = state.endTimestamp ?? state.resultTimestamp;
+	const dur = state.durationMs;
+	let text = "";
+	if (start !== undefined && end !== undefined && dur !== undefined) {
+		try {
+			text = t("toolTimeRange", {
+				start: formatTimeFull(start),
+				end: formatTimeFull(end),
+				duration: formatDuration(dur),
+			});
+		} catch {
+			text = "";
+		}
+	} else if (end !== undefined) {
+		text = formatTimeFull(end);
+	} else if (start !== undefined) {
+		text = formatTimeFull(start);
+	}
+	if (!text) return null;
+	return (
+		<>
+			<span className="inspector-time" title={text}>
+				{text}
+			</span>
+			<span className="meta-sep">|</span>
+		</>
+	);
+}
 
 const TOOL_ICONS: Record<string, ReactNode> = {
 	bash: <FiTerminal />,
@@ -185,6 +222,18 @@ function ThinkingInspectorDialog({
 	const text = state.thinking || state.output || "";
 	const chars = text.length;
 	const lines = text ? text.split("\n").length : 0;
+	// 流式时自动跟随到底部；用户手动上翻后不再强行拉回
+	const bodyRef = useRef<HTMLDivElement>(null);
+	const stickRef = useRef(true);
+	useEffect(() => {
+		stickRef.current = true;
+	}, [state.toolCallId]);
+	useEffect(() => {
+		if (!state.streaming) return;
+		const el = bodyRef.current;
+		if (!el || !stickRef.current) return;
+		el.scrollTop = el.scrollHeight;
+	}, [text, state.streaming]);
 
 	return (
 		<div
@@ -204,7 +253,7 @@ function ThinkingInspectorDialog({
 						<span className="file-diff-path">{t("toolInspectorThinkingSection").replace(/^💭\s*/, "")}</span>
 						<span className="file-diff-lang">{t("toolInspectorStats", { chars, lines })}</span>
 						<span className={`file-diff-status-pill ${state.streaming ? "run" : "ok"}`}>
-							{state.streaming ? "⚡ 思考中..." : "✓ 完成"}
+							{state.streaming ? t("toolInspectorThinkingStatusRunning") : t("toolInspectorThinkingStatusDone")}
 						</span>
 					</div>
 
@@ -245,11 +294,26 @@ function ThinkingInspectorDialog({
 					</div>
 				</div>
 
-				<div className="file-diff-inspector-body">
+				<div
+					className="file-diff-inspector-body"
+					ref={bodyRef}
+					onWheel={(e) => {
+						if (e.deltaY < 0) stickRef.current = false;
+						else if (e.deltaY > 0 && bodyRef.current) {
+							const el = bodyRef.current;
+							if (el.scrollHeight - el.scrollTop - el.clientHeight < 32) stickRef.current = true;
+						}
+					}}
+					onScroll={(e) => {
+						const el = e.currentTarget;
+						if (el.scrollHeight - el.scrollTop - el.clientHeight < 24) stickRef.current = true;
+					}}
+				>
 					<div className="thinking-inspector-content">
 						{text ? (
 							<div className="markdown thinking-markdown">
 								<Markdown text={text} />
+								{state.streaming && <span className="stream-cursor" />}
 							</div>
 						) : (
 							<div className="diff-empty-tip">{t("toolInspectorEmptyThinking")}</div>
@@ -261,14 +325,14 @@ function ThinkingInspectorDialog({
 					<div className="file-diff-footer-status">
 						<span className="file-diff-status-icon">💭</span>
 						<span className="file-diff-status-text">
-							{state.streaming ? "思考分析链路生成中..." : `分析记录共 ${lines} 行`}
+							{state.streaming
+								? t("toolInspectorThinkingFooterRunning")
+								: t("toolInspectorThinkingFooterLines", { lines })}
 						</span>
 					</div>
-					{state.duration && (
-						<div className="file-diff-footer-meta">
-							<span>耗时: {state.duration}</span>
-						</div>
-					)}
+					<div className="file-diff-footer-meta">
+						<InspectorTimeText state={state} />
+					</div>
 				</div>
 			</div>
 		</div>
@@ -541,10 +605,11 @@ function BashInspectorDialog({
 							{statusMeta.statusIcon}
 						</span>
 						<span className="file-diff-status-text">
-							{statusMeta.footerText} · {lines} 行输出 · {output.length} 字符
+							{statusMeta.footerText} · {t("toolInspectorOutputStats", { lines, chars: output.length })}
 						</span>
 					</div>
 					<div className="file-diff-footer-meta">
+						<InspectorTimeText state={state} />
 						{detailsKeysCount > 0 && <span>details: {detailsKeysCount} keys</span>}
 						{detailsKeysCount > 0 && <span className="meta-sep">|</span>}
 						<button
@@ -671,7 +736,10 @@ function ReadInspectorDialog({
 							<span className="file-diff-lang">{targetPath.split(".").pop()?.toUpperCase() || "FILE"}</span>
 						)}
 						{startLine > 1 && (
-							<span className="file-diff-lang" title={`起始偏移量: 第 ${startLine} 行`}>
+							<span
+								className="file-diff-lang"
+								title={isZh ? `起始偏移量: 第 ${startLine} 行` : `Start offset: line ${startLine}`}
+							>
 								L{startLine}~L{startLine + lines - 1}
 							</span>
 						)}
@@ -813,6 +881,7 @@ function ReadInspectorDialog({
 						</span>
 					</div>
 					<div className="file-diff-footer-meta">
+						<InspectorTimeText state={state} />
 						{detailsKeysCount > 0 && <span>details: {detailsKeysCount} keys</span>}
 						{detailsKeysCount > 0 && <span className="meta-sep">|</span>}
 						<button
@@ -1039,6 +1108,7 @@ function FileDiffInspectorDialog({
 						</span>
 					</div>
 					<div className="file-diff-footer-meta">
+						<InspectorTimeText state={state} />
 						{detailsKeysCount > 0 && <span>details: {detailsKeysCount} keys</span>}
 						{detailsKeysCount > 0 && <span className="meta-sep">|</span>}
 						<button
@@ -1309,11 +1379,12 @@ function GenericInspectorDialog({
 							{statusMeta.isRunning
 								? statusMeta.footerText
 								: output
-									? `${output.split("\n").length} 行输出 · ${output.length} 字符`
+									? t("toolInspectorOutputStats", { lines: output.split("\n").length, chars: output.length })
 									: statusMeta.footerText}
 						</span>
 					</div>
 					<div className="file-diff-footer-meta">
+						<InspectorTimeText state={state} />
 						{detailsKeysCount > 0 && <span>details: {detailsKeysCount} keys</span>}
 						{detailsKeysCount > 0 && <span className="meta-sep">|</span>}
 						<button

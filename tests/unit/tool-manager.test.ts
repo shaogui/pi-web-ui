@@ -33,9 +33,9 @@ import {
 	isHostManagedTool,
 	isConfigurableAgentTool,
 	lazyLoadingDisabledTools,
-	isTerminalGuidanceOn,
 	legacyToDisabled,
 	normalizeDisabledAgentTools,
+	normalizeLazyOnDemandList,
 	normalizeToolOnDemandList,
 	filterToolsByPreset,
 	presetAllowsPluginTools,
@@ -45,6 +45,10 @@ import {
 	setAgentToolsEnabled,
 	TERMINAL_TOOL_NAMES,
 	LEGACY_TERMINAL_TOOL_NAMES,
+	isValidToolName,
+	isNeverLazyTool,
+	foldLegacyToolName,
+	partitionLazyTools,
 	resolveDisabledAgentToolsFromEnabled,
 	resolveEnabledAgentTools,
 	TOOL_SEARCH_TOOL_NAME,
@@ -215,25 +219,55 @@ describe("legacy sync", () => {
 		expect(effectiveDisabledAgentTools({ disabledAgentTools: [] })).not.toContain(ASK_USER_QUESTION_TOOL_NAME);
 	});
 
-	it("按需列表：列内工具直接关闭（与开关取并集，只做减法）", () => {
-		expect(normalizeToolOnDemandList(["canvas", "canvas", " nope ", 7, "sandbox"])).toEqual(["canvas", "sandbox"]);
+	it("按需名单：只决定延迟范围，不再硬关闭", () => {
+		// 架构级：内置 + 插件/MCP/未来工具按统一命名规则收，不写死名单；孤儿项保留。
+		expect(normalizeToolOnDemandList(["canvas", "canvas", "sftp", "mcp__gh__search", 7, ""])).toEqual([
+			"canvas",
+			"sftp",
+			"mcp__gh__search",
+		]);
+		expect(normalizeToolOnDemandList(["  patch  ", "a b", "x".repeat(200), "ok-name.v2"])).toEqual([
+			"patch",
+			"ok-name.v2",
+		]);
 		expect(normalizeToolOnDemandList(undefined)).toEqual([]);
+		// 旧别名折叠：终端旧名收敛到 terminal，保证旧存档不丢项。
+		expect(normalizeToolOnDemandList(["terminal_create"])).toEqual(["terminal"]);
+		// 名单不再并入禁用集：开关关闭时名单无效果。
 		const merged = effectiveDisabledAgentTools({ disabledAgentTools: [], toolOnDemandTools: ["canvas"] });
-		expect(merged).toContain("canvas");
-		// 开关里没关的工具，不能因为“不在按需列表里”而被复活或剔除
+		expect(merged).not.toContain("canvas");
 		expect(merged).not.toContain("sandbox");
-		// 两处重复只会出现一次
-		const both = effectiveDisabledAgentTools({
-			disabledAgentTools: ["canvas"],
-			toolOnDemandTools: ["canvas"],
-		});
-		expect(both.filter((n) => n === "canvas")).toHaveLength(1);
+		// 核心工具进名单会被过滤（永不延迟）。
+		expect(normalizeLazyOnDemandList(["bash", "canvas", "load_tools"])).toEqual(["canvas"]);
+		// 名单制门控：只延迟名单里的，未加载且不在名单里的常驻。
+		expect(lazyLoadingDisabledTools(["bash", "patch", "canvas"], [], undefined, ["canvas"])).toEqual(["canvas"]);
+		expect(lazyLoadingDisabledTools(["bash", "patch", "canvas"], ["canvas"], undefined, ["canvas"])).toEqual([]);
+		expect(lazyLoadingDisabledTools(["bash", "patch"], [], undefined, [])).toEqual([]);
 	});
 
-	it("终端引导只在组内有启用工具时注入", () => {
-		expect(isTerminalGuidanceOn([])).toBe(true);
-		expect(isTerminalGuidanceOn([...TERMINAL_TOOL_NAMES])).toBe(false);
-		expect(isTerminalGuidanceOn([TERMINAL_TOOL_NAMES[0]])).toBe(false);
+	it("工具名架构单源：校验/别名/永不延迟/划分共用同一口径", () => {
+		expect(isValidToolName("canvas")).toBe(true);
+		expect(isValidToolName("mcp__gh__search")).toBe(true);
+		expect(isValidToolName("sftp")).toBe(true);
+		expect(isValidToolName("a b")).toBe(false);
+		expect(isValidToolName("")).toBe(false);
+		expect(isValidToolName("x".repeat(200))).toBe(false);
+		expect(foldLegacyToolName("terminal_create")).toBe("terminal");
+		expect(foldLegacyToolName("canvas")).toBe("canvas");
+		expect(isNeverLazyTool("bash")).toBe(true);
+		expect(isNeverLazyTool("load_tools")).toBe(true);
+		expect(isNeverLazyTool("canvas")).toBe(false);
+		expect(isNeverLazyTool("sftp")).toBe(false);
+		// 划分单源：常驻/待延迟/已加载三态一次算出，孤儿名单项自动忽略。
+		const part = partitionLazyTools({
+			all: ["bash", "patch", "canvas", "sftp"],
+			allowed: ["bash", "patch", "canvas", "sftp"],
+			onDemand: ["canvas", "sftp", "ghost-plugin-tool"],
+			loaded: ["canvas"],
+		});
+		expect(part.resident).toEqual(["bash", "patch"]);
+		expect(part.pending).toEqual(["sftp"]);
+		expect(part.loadedLazy).toEqual(["canvas"]);
 	});
 });
 
@@ -368,16 +402,5 @@ describe("预设语义总表（见 tool-manager.ts 语义注释）", () => {
 		expect(presetHasQuestionnaire("reader")).toBe(true);
 		for (const p of ["minimal", "code", "ask"]) expect(presetHasQuestionnaire(p)).toBe(false);
 		expect(presetHasQuestionnaire("nope")).toBe(true);
-	});
-
-	it("终端引导：开关全关不教；预设拿掉终端工具也不教（不教不存在的工具）", () => {
-		expect(isTerminalGuidanceOn([])).toBe(true);
-		expect(isTerminalGuidanceOn([], "minimal")).toBe(false);
-		expect(isTerminalGuidanceOn([], "code")).toBe(false);
-		expect(isTerminalGuidanceOn([], "ask")).toBe(false);
-		expect(isTerminalGuidanceOn([], "reader")).toBe(true);
-		expect(isTerminalGuidanceOn([...TERMINAL_TOOL_NAMES], "standard")).toBe(false);
-		expect(isTerminalGuidanceOn([...TERMINAL_TOOL_NAMES], "reader")).toBe(false);
-		expect(isTerminalGuidanceOn([TERMINAL_TOOL_NAMES[0]])).toBe(false);
 	});
 });

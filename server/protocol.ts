@@ -849,6 +849,7 @@ export interface UiMessage {
 	role: string;
 	content: UiContentBlock[];
 	timestamp?: number;
+	durationMs?: number;
 	model?: string;
 	provider?: string;
 	usageCost?: number;
@@ -1399,7 +1400,15 @@ export type ClientMessage =
 	| { type: "scm_filediff"; reqId: number; path: string }
 	| { type: "scm_commit"; reqId: number; hash: string }
 	| { type: "scm_commitmsg"; reqId: number }
-	| { type: "new_chat"; preset?: string; ephemeral?: boolean; requestId?: string; independent?: boolean }
+	| {
+			type: "new_chat";
+			preset?: string;
+			ephemeral?: boolean;
+			requestId?: string;
+			independent?: boolean;
+			/** 目标工作目录：服务端先切到该目录并核验，再建会话；切不过去就不建（`ok:false`）。 */
+			cwd?: string;
+	  }
 	| { type: "new_cli_chat"; config: NativeCliConfig; cwd?: string; requestId?: string }
 	| { type: "open_shared_conversation"; owner: string; id: string; readOnly?: boolean }
 	| { type: "delete_message"; messageId: string; conversationId?: string }
@@ -1608,7 +1617,6 @@ export type ClientMessage =
 			softCapTokens?: number;
 			softCapByModel?: Record<string, number>;
 			autoCompactionInstructions?: string;
-			markersEnabled?: boolean;
 			disabledMarkers?: string[];
 			uiLayout?: UiLayoutPrefs;
 			quickPhrases?: string[];
@@ -1767,6 +1775,13 @@ export type ClientMessage =
 	| { type: "set_delegate_mode"; enabled: boolean; conversationId?: string }
 	| {
 			type: "page_response";
+			id: string;
+			ok: boolean;
+			result?: unknown;
+			error?: string;
+	  }
+	| {
+			type: "phone_response";
 			id: string;
 			ok: boolean;
 			result?: unknown;
@@ -2738,6 +2753,11 @@ export interface ConversationSummary {
 	presetLocked?: boolean;
 	error?: string;
 	canceled?: boolean;
+	/**
+	 * 子代理完成证据的裁决：服务端已经用子代理自己的转录核对过它自报的文件/命令。
+	 * `unverified`/`partial`/`blocked` 要在左栏显式标出来，别让「没验证」看起来像「已验证」。
+	 */
+	subagentVerdict?: "pass" | "partial" | "unverified" | "blocked";
 	parentId?: string;
 	model?: string;
 	thinkingLevel?: string;
@@ -3091,7 +3111,6 @@ export interface UiSettingsState {
 	reviewSkills: UiSkillInfo[];
 	extensions: UiExtensionInfo[];
 	presets: UiSettingsPreset[];
-	markersEnabled: boolean;
 	disabledMarkers: string[];
 	markers: UiMarkerInfo[];
 	subagentTemplates: UiSubagentTemplate[];
@@ -3748,6 +3767,13 @@ export type ServerMessage =
 			op: string;
 			args?: Record<string, unknown>;
 			target?: string;
+			timeoutMs: number;
+	  }
+	| {
+			type: "phone_request";
+			id: string;
+			op: string;
+			args?: Record<string, unknown>;
 			timeoutMs: number;
 	  }
 	| { type: "bg_servers"; servers: BgServer[] }

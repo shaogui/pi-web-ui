@@ -7,6 +7,7 @@ import { LeftPanel } from "../../web/src/components/LeftPanel.js";
 import { LanguageProvider } from "../../web/src/i18n.js";
 import { resetAppGlobals, setAppGlobals } from "../../web/src/app-globals.js";
 import { closeContextMenu } from "../../web/src/context-menu-state.js";
+import { saveProjectOrderManual } from "../../web/src/project-order-settings.js";
 
 vi.mock("../../web/src/components/DeviceGroupSection.js", () => ({
 	DeviceGroupSection: () => createElement("div", { className: "lp-section dg-side-section" }),
@@ -91,7 +92,7 @@ afterEach(() => {
 });
 
 describe("项目排序", () => {
-	it("首次加载按最近使用排序；页面打开期间稳定，新项目追加到末尾", () => {
+	it("自动模式：按最近真实对话时间排序（发过话就上浮），新出现的项目置顶", () => {
 		setAppGlobals({ cwd: "", ready: true, status: "open", workspaceRoots: [] });
 		mount({
 			projects: [
@@ -102,6 +103,7 @@ describe("项目排序", () => {
 		});
 		expect(projectOrder()).toEqual(["/w/new", "/w/mid", "/w/old"]);
 
+		// 真聊过天：/w/old 被顶到最新，/w/added 是新项目（lastUsed 最高）也置顶
 		render({
 			projects: [
 				{ path: "/w/old", lastUsed: 9000 },
@@ -110,7 +112,71 @@ describe("项目排序", () => {
 				{ path: "/w/added", lastUsed: 99999 },
 			],
 		});
-		expect(projectOrder()).toEqual(["/w/new", "/w/mid", "/w/old", "/w/added"]);
+		expect(projectOrder()).toEqual(["/w/added", "/w/old", "/w/new", "/w/mid"]);
+
+		// 从没对话过的项目（lastUsed 为 0）按「本浏览器首次出现」排，同样置顶
+		render({
+			projects: [
+				{ path: "/w/old", lastUsed: 9000 },
+				{ path: "/w/new", lastUsed: 3000 },
+				{ path: "/w/mid", lastUsed: 2000 },
+				{ path: "/w/fresh", lastUsed: 0 },
+			],
+		});
+		expect(projectOrder()).toEqual(["/w/fresh", "/w/old", "/w/new", "/w/mid"]);
+	});
+
+	it("手动模式：顺序只按拖拽与添加顺序，新项目置顶，聊天不重排", () => {
+		setAppGlobals({ cwd: "", ready: true, status: "open", workspaceRoots: [] });
+		mount({
+			projects: [
+				{ path: "/w/a", lastUsed: 3 },
+				{ path: "/w/b", lastUsed: 2 },
+				{ path: "/w/c", lastUsed: 1 },
+			],
+		});
+		expect(projectOrder()).toEqual(["/w/a", "/w/b", "/w/c"]);
+
+		// 打开开关：沿用眼前的排列，不跳变
+		act(() => saveProjectOrderManual(true));
+		expect(projectOrder()).toEqual(["/w/a", "/w/b", "/w/c"]);
+
+		// 聊天把 /w/c 顶到最新：手动模式不重排
+		render({
+			projects: [
+				{ path: "/w/c", lastUsed: 9999 },
+				{ path: "/w/b", lastUsed: 2 },
+				{ path: "/w/a", lastUsed: 3 },
+			],
+		});
+		expect(projectOrder()).toEqual(["/w/a", "/w/b", "/w/c"]);
+
+		// 拖到 /w/c 之后：顺序写进 localStorage
+		const dt = { effectAllowed: "", dropEffect: "", setData: vi.fn() };
+		const fire = (el: Element, type: string, clientY = 100) => {
+			const ev = new Event(type, { bubbles: true, cancelable: true });
+			Object.assign(ev, { dataTransfer: dt, clientY });
+			act(() => {
+				el.dispatchEvent(ev);
+			});
+		};
+		fire(container.querySelector(".lp-project-head-row")!, "dragstart");
+		fire(container.querySelector('[data-project-path="/w/c"]')!.closest(".lp-project-node")!, "dragover");
+		fire(container.querySelector('[data-project-path="/w/c"]')!.closest(".lp-project-node")!, "drop");
+		expect(projectOrder()).toEqual(["/w/b", "/w/c", "/w/a"]);
+		const persisted = JSON.parse(localStorage.getItem("pi-web-ui:lp-project-order") ?? "{}") as { order?: string[] };
+		expect(persisted.order).toEqual(["/w/b", "/w/c", "/w/a"]);
+
+		// 新添加的项目放在最上面
+		render({
+			projects: [
+				{ path: "/w/b", lastUsed: 2 },
+				{ path: "/w/c", lastUsed: 9999 },
+				{ path: "/w/a", lastUsed: 3 },
+				{ path: "/w/new", lastUsed: 5 },
+			],
+		});
+		expect(projectOrder()).toEqual(["/w/new", "/w/b", "/w/c", "/w/a"]);
 	});
 
 	it("Alt+↓ / Alt+↑ 在项目头上调整顺序", () => {
@@ -277,18 +343,19 @@ describe("B5：显示更多向服务端翻页", () => {
 			messageCount: 1,
 		}));
 
-	it("本地已下发的用完且服务端还有更多：请求更大的 limit，显示加载态；新数据到达后恢复", () => {
+	it("本地已下发用完且服务端还有更多：按下一页的 limit 请求，显示加载态；新数据到达后恢复", () => {
 		setAppGlobals({ cwd: "/w/a", ready: true, status: "open", workspaceRoots: [] });
 		mount({ projects: [{ path: "/w/a", lastUsed: 2 }], sessions: mk(8), projectSessionsHasMore: { "/w/a": true } });
 		const more = () => container.querySelector<HTMLButtonElement>(".lp-show-more-row");
 		expect(more()).not.toBeNull();
 		sent.length = 0;
 		act(() => more()!.click());
-		expect(sent).toContainEqual({ type: "list_sessions", path: "/w/a", limit: 400 });
+		// 首屏 5 + 一页 10 = 15；再多要一页当本地余量 → 25
+		expect(sent).toContainEqual({ type: "list_sessions", path: "/w/a", limit: 25 });
 		expect(more()!.disabled).toBe(true);
 		render({ sessions: mk(40), projectSessionsHasMore: {} });
 		expect(more()!.disabled).toBe(false);
-		expect(container.querySelectorAll(".lp-tree-session-item").length).toBe(28);
+		expect(container.querySelectorAll(".lp-tree-session-item").length).toBe(15);
 	});
 
 	it("本地还有余量时只在本地展开，不请求服务端", () => {
@@ -297,17 +364,20 @@ describe("B5：显示更多向服务端翻页", () => {
 		sent.length = 0;
 		act(() => container.querySelector<HTMLButtonElement>(".lp-show-more-row")!.click());
 		expect(sent.filter((m) => (m as { type: string }).type === "list_sessions")).toEqual([]);
-		expect(container.querySelectorAll(".lp-tree-session-item").length).toBe(28);
+		expect(container.querySelectorAll(".lp-tree-session-item").length).toBe(15);
 	});
 
-	it("展开条数持久化，重新挂载时按此前条数请求列表", () => {
+	it("刷新页面不继承上次展开的条数：默认只渲染 5 条，也不按旧条数要列表", () => {
 		setAppGlobals({ cwd: "/w/a", ready: true, status: "open", workspaceRoots: [] });
-		mount({ projects: [{ path: "/w/a", lastUsed: 2 }], sessions: mk(10) });
 		localStorage.setItem("pi-web-ui:lp-visible-counts", JSON.stringify({ "/w/a": 450 }));
+		mount({ projects: [{ path: "/w/a", lastUsed: 2 }], sessions: mk(10) });
+		expect(container.querySelectorAll(".lp-tree-session-item").length).toBe(5);
 		act(() => root!.unmount());
 		root = createRoot(container);
 		sent.length = 0;
 		render();
-		expect(sent).toContainEqual({ type: "list_sessions", limit: 600 });
+		expect(sent).toContainEqual({ type: "list_sessions", limit: 20 });
+		expect(sent).not.toContainEqual({ type: "list_sessions", limit: 600 });
+		expect(container.querySelectorAll(".lp-tree-session-item").length).toBe(5);
 	});
 });
