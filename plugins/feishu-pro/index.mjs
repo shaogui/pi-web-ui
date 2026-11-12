@@ -1440,37 +1440,35 @@ export default {
 		if (typeof offTodoRun === "function") disposers.push(offTodoRun);
 
 		/**
-		 * 顶栏「待办」入口：一个按钮 + 逾期/今天数量。
-		 * manifest 的 topbar 只能静态徽标，这里用 ui.register 注册同一个入口并动态 update badge；
-		 * 宿主没有 ui.register（老版本）就安静跳过 —— 入口不是主流程，不能因此让插件激活失败。
+		 * 顶栏待办数量的发布口：打到 manifest 静态项 feishu-pro-open（「飞书 Pro」唯一顶栏入口）。
+		 * 不再 ui.register 第二颗「待办」按钮 —— 两个 kind=view 入口会在顶栏平级出现、
+		 * 点开后同时高亮，看着像两个页面；待办的日常入口就是视图内的「待办」页签（默认页）。
+		 * 数量写在 hint（悬停提示，宿主现有渲染就吃）；badge 字段一并打上，但宿主 view 分支
+		 * 目前不渲染徽标 —— 画不画、什么时候画由宿主决定，插件侧不越界去改宿主渲染层。
+		 * 宿主没有 ui.update（老版本）就安静跳过 —— 提示不是主流程，不能因此让插件激活失败。
 		 */
-		let todoBadgeReady = false;
+		let lastTodoBadge = null;
 		function publishTodoBadge() {
 			try {
 				const stats = todoService.snapshot().stats || {};
 				const pending = (Number(stats.overdue) || 0) + (Number(stats.today) || 0);
 				const badge = pending > 0 ? String(Math.min(pending, 99)) : "";
-				if (!todoBadgeReady) {
-					const off = host.ui?.register?.({
-						id: "feishu-pro-todos",
-						slot: "topbar.primary",
-						label: "待办",
-						labelEn: "To-dos",
-						hint: pending > 0 ? `${pending} 条今天到期或已逾期` : "打开待办清单",
-						hintEn: pending > 0 ? `${pending} due today or overdue` : "Open to-dos",
-						kind: "view",
-						view: `plugin:${PLUGIN_ID}`,
-						icon: "✓",
-						order: 59,
-						badge,
-					});
-					if (typeof off === "function") disposers.push(off);
-					todoBadgeReady = true;
-				} else {
-					host.ui?.update?.("feishu-pro-todos", { badge });
-				}
+				// 每次写待办都会路过这里：数量没变就别广播（ui.update 会推给所有客户端）。
+				if (badge === lastTodoBadge) return;
+				lastTodoBadge = badge;
+				host.ui?.update?.("feishu-pro-open", {
+					badge,
+					hint:
+						pending > 0
+							? `飞书 Pro：${pending} 条待办今天到期或已逾期`
+							: "打开飞书 Pro（待办 / 会话 / 通讯录 / 云文档）",
+					hintEn:
+						pending > 0
+							? `Feishu Pro: ${pending} to-dos due today or overdue`
+							: "Open Feishu Pro (to-dos, chats, contacts, docs)",
+				});
 			} catch {
-				/* 顶栏入口失败不影响待办本身 */
+				/* 顶栏徽标失败不影响待办本身 */
 			}
 		}
 		publishTodoBadge();
