@@ -139,6 +139,47 @@ async function fixture(
 }
 
 describe("device center hub", () => {
+	it("preserves authenticated devices on an explicit old HTTP origin without allowing cookie administration there", async () => {
+		const f = await fixture("https://hub.test", undefined, { legacyOrigins: ["http://hub.test:8790"] });
+		const cookie = await f.register(),
+			device = await f.pair(cookie);
+		await f.hub.store.transact((state) => {
+			state.devices.find((d) => d.id === device.deviceId)!.uiCredentialHash = hashSecret("migration-ui");
+		});
+		const headers = {
+			Host: "hub.test:8790",
+			Origin: "http://hub.test:8790",
+			Authorization: "Bearer migration-ui",
+			"X-Device-Id": device.deviceId,
+		};
+		expect((await f.request("/api/device-user/devices", undefined, "", headers)).status).toBe(200);
+		expect(
+			(await f.request("/api/device-user/devices", undefined, "", { ...headers, Authorization: "Bearer wrong" }))
+				.status,
+		).toBe(401);
+		expect((await f.request("/api/device-user/devices", undefined, "", { ...headers, Host: "evil.test" })).status).toBe(
+			421,
+		);
+		expect(
+			(
+				await f.request("/api/rooms", { name: "blocked" }, cookie, {
+					Host: "hub.test:8790",
+					Origin: "http://hub.test:8790",
+				})
+			).status,
+		).toBe(421);
+		const port = (f.hub.server.address() as { port: number }).port;
+		const response = await new Promise<{ status: number; location?: string }>((resolve, reject) => {
+			const req = httpRequest({ host: "127.0.0.1", port, path: "/", headers: { Host: "hub.test:8790" } }, (res) => {
+				res.resume();
+				res.on("end", () => resolve({ status: res.statusCode!, location: res.headers.location }));
+			});
+			req.on("error", reject);
+			req.end();
+		});
+		expect(response.status).toBe(308);
+		expect(response.location).toBe("https://hub.test/");
+	});
 	it("routes unmentioned human messages to the primary Bot while preserving explicit targets and retries", async () => {
 		const { hub, request, register, pair } = await fixture();
 		const cookie = await register();
@@ -695,9 +736,11 @@ describe("device center hub", () => {
 			toolName: "read",
 			text: "reading files",
 		});
+		// 两条事件是两次独立写入：只等「有内容」会在 status 落盘、progress 还没跟上时提前返回，
+		// 高并发下必鞭。等到的条件必须和下面的断言一致（两条都在）。
 		const populated = await vi.waitFor(async () => {
 			const page = await request(`/api/rooms/${room.id}/tasks/${task.id}/journal`, undefined, cookie);
-			if (page.body.items.length === 0) throw new Error("journal not appended yet");
+			if (page.body.items.length < 2) throw new Error("journal not appended yet");
 			return page;
 		});
 		expect(populated.body.items.map((item: { type: string }) => item.type)).toEqual(["status", "progress"]);

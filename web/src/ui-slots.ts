@@ -59,6 +59,11 @@ const KNOWN_WHEN_VALUES: ReadonlySet<string> = new Set([
 	"file.isFile",
 	"session.isRunning",
 	"message.hasSelection",
+	"search.isSession",
+	"search.isProject",
+	"search.isFile",
+	"search.isFolder",
+	"search.isPlugin",
 ]);
 
 export interface BuiltinUiItem {
@@ -94,6 +99,7 @@ const SLOT_IDS: UiSlotId[] = [
 	"composer.leading",
 	"composer.actions",
 	"rightpanel.tabs",
+	"bottomdock.tabs",
 	"terminal.toolbar",
 	"scm.toolbar",
 	"bottombar",
@@ -103,6 +109,7 @@ const SLOT_IDS: UiSlotId[] = [
 	"contextmenu.session",
 	"contextmenu.project",
 	"contextmenu.file",
+	"contextmenu.search",
 	"contextmenu.toolcall",
 	"tool.card.footer",
 	"settings.pages",
@@ -579,7 +586,8 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 		labelKey: "screenshotCapture",
 		icon: "cut",
 		kind: "action",
-		order: 20,
+		// 排在附件与模板之后，输入框工具栏左侧第三个位。
+		order: 115,
 		align: "start",
 	},
 	{
@@ -607,6 +615,15 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 		icon: "zap",
 		kind: "action",
 		order: 130,
+		align: "start",
+	},
+	{
+		id: "host:composer-claude-perm",
+		slot: "composer.actions",
+		labelKey: "claudePermDefault",
+		icon: "lock",
+		kind: "action",
+		order: 138,
 		align: "start",
 	},
 	{
@@ -763,7 +780,6 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 		order: 30,
 	},
 	{ id: "host:scm-branch", slot: "scm.toolbar", labelKey: "scmSwitchBranch", icon: "git", kind: "action", order: 40 },
-	{ id: "host:scm-switch", slot: "scm.toolbar", labelKey: "scmSwitch", icon: "git", kind: "action", order: 50 },
 	{ id: "host:scm-push", slot: "scm.toolbar", labelKey: "scmPush", icon: "upload", kind: "action", order: 60 },
 	{ id: "host:scm-pull", slot: "scm.toolbar", labelKey: "scmPull", icon: "download", kind: "action", order: 70 },
 	{
@@ -818,6 +834,26 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 		icon: "folder",
 		kind: "view",
 		view: "files",
+		order: 10,
+	},
+
+	{
+		id: "host:right-scm",
+		slot: "rightpanel.tabs",
+		labelKey: "scmTitle",
+		icon: "git",
+		kind: "view",
+		view: "scm",
+		order: 20,
+	},
+
+	{
+		id: "host:bottom-terminal",
+		slot: "bottomdock.tabs",
+		labelKey: "terminal",
+		icon: "terminal",
+		kind: "view",
+		view: "terminal",
 		order: 10,
 	},
 
@@ -920,6 +956,97 @@ export const BUILTIN_UI_ITEMS: BuiltinUiItem[] = [
 		kind: "action",
 		context: "session",
 		order: 55,
+	},
+
+	{
+		id: "host:search-open",
+		slot: "contextmenu.search",
+		labelKey: "gsOpen",
+		icon: "open",
+		kind: "action",
+		order: 1,
+		group: "open",
+	},
+	{
+		id: "host:search-open-folder",
+		slot: "contextmenu.search",
+		labelKey: "searchMenuOpenInFiles",
+		icon: "folder",
+		kind: "action",
+		order: 2,
+		group: "open",
+	},
+	{
+		id: "host:search-reveal",
+		slot: "contextmenu.search",
+		labelKey: "fileReveal",
+		icon: "folder",
+		kind: "action",
+		order: 3,
+		group: "open",
+	},
+	{
+		id: "host:search-pin",
+		slot: "contextmenu.search",
+		labelKey: "pinConversation",
+		icon: "pin",
+		kind: "action",
+		order: 10,
+		group: "session",
+	},
+	{
+		id: "host:search-quote",
+		slot: "contextmenu.search",
+		labelKey: "quoteConversation",
+		icon: "chat",
+		kind: "action",
+		order: 20,
+		group: "chat",
+	},
+	{
+		id: "host:search-quick-ask",
+		slot: "contextmenu.search",
+		labelKey: "quickAskReference",
+		icon: "chat",
+		kind: "action",
+		order: 21,
+		group: "chat",
+	},
+	{
+		id: "host:search-copy-name",
+		slot: "contextmenu.search",
+		labelKey: "copyName",
+		icon: "copy",
+		kind: "action",
+		order: 40,
+		group: "copy",
+	},
+	{
+		id: "host:search-copy-rel",
+		slot: "contextmenu.search",
+		labelKey: "fileCopyRelPath",
+		icon: "copy",
+		kind: "action",
+		order: 41,
+		group: "copy",
+	},
+	{
+		id: "host:search-copy-path",
+		slot: "contextmenu.search",
+		labelKey: "copyPath",
+		icon: "copy",
+		kind: "action",
+		order: 42,
+		group: "copy",
+	},
+	{
+		id: "host:search-copy-id",
+		slot: "contextmenu.search",
+		labelKey: "copyConversationId",
+		icon: "copy",
+		kind: "action",
+		order: 43,
+		group: "copy",
 	},
 
 	{
@@ -1348,6 +1475,24 @@ export function setPluginViewOrder(layout: UiLayoutPrefs | undefined, pluginIds:
 	return { ...layout, order: [...order, ...pluginItemIds] };
 }
 
+const SCREENSHOT_ITEM_ID = "host:composer-screenshot";
+
+/**
+ * 早期布局快照里没有截图按钮，未登记进 `order` 的条目会排在所有已排序条目之后。
+ * 把截图按钮锚定在模板（无模板时锚定附件）之后，老用户也能直接拿到左侧第三个位。
+ */
+function migrateScreenshotOrder<T extends UiLayoutPrefs>(src: T): T {
+	const order = src.order ?? [];
+	if (order.length === 0 || order.includes(SCREENSHOT_ITEM_ID)) return src;
+	const anchor = ["host:composer-templates", "host:composer-upload"]
+		.map((id) => order.indexOf(id))
+		.find((index) => index >= 0);
+	if (anchor === undefined) return src;
+	const next = [...order];
+	next.splice(anchor + 1, 0, SCREENSHOT_ITEM_ID);
+	return { ...src, order: next };
+}
+
 const BRAND_ITEM_ID = "host:brand";
 const BRAND_OLD_IDS: readonly string[] = ["host:brand-logo", "host:brand-name"];
 
@@ -1674,7 +1819,7 @@ export function buildUiSlots(
 ): Record<UiSlotId, UiSlotEntry[]> {
 	const zh = isZhLocale(opts.locale);
 	const disabled = new Set(opts.disabledPlugins ?? []);
-	const layout = migrateBrandLayout(opts.layout ?? {});
+	const layout = migrateScreenshotOrder(migrateBrandLayout(opts.layout ?? {}));
 	const diag = (d: Omit<UiDiagnostic, "level"> & { level?: UiDiagnosticLevel }): void => {
 		opts.diagnostics?.push({ level: d.level ?? "warn", ...d });
 	};

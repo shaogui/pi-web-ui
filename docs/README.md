@@ -1,7 +1,10 @@
+[English](./README.en.md) · **简体中文** · [繁體中文](./README.zh-TW.md)
+
 # docs/ 文档总索引
 
 > 本仓库文档的**唯一入口**。`AGENTS.md` 只放「关键功能 → 事实源文件 → 文档」的映射，本文件放「每份文档讲什么、多重、什么时候该读」。
 > 新增 / 删除 / 改名文档必须同步本索引（守卫：`tests/unit/docs-index.test.ts`）。
+> 每份文档都有英文与繁体中文版：同目录下的 `文件名.en.md` 与 `文件名.zh-TW.md`，三份文件顶部可互相切换语言；本索引只登记中文原稿。覆盖度自查：`npm run docs:i18n`（`--check` 为门禁版本）；`docs/*.html` 设计稿同样有 `.en.html` / `.zh-TW.html` 版本（守卫：`npm run docs:i18n:html`）；`CHANGELOG.md` 由发布脚本生成。
 
 ## 权重含义
 
@@ -70,15 +73,17 @@
 
 ## 四、参考材料（○，不必通读）
 
-| 位置                                                                                                                                                                                                 | 内容                                                   |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
-| [`device-file-sync.md`](device-file-sync.md)                                                                                                                                                         | 分块目录导出（`prepare({recursive})`）的边界与拒绝规则 |
-| [`audits/root-cause-review-2026-10-29.md`](audits/root-cause-review-2026-10-29.md)                                                                                                                   | 根因整改审查证据（对应 `root-cause-boundaries.md`）    |
-| [`test-performance-audit.md`](test-performance-audit.md)                                                                                                                                             | 单测性能审计：实测基线、快/重两池、未解瓶颈            |
-| [`reviews/canvas-usability-review-2026-07.md`](reviews/canvas-usability-review-2026-07.md)                                                                                                           | 画布可用性评审记录                                     |
-| [`proposals/`](proposals)                                                                                                                                                                            | 旧提案（issue #769 diff 可视化两个 HTML 方案）         |
-| [`composer-height-solutions.html`](composer-height-solutions.html) · [`plugin-market-redesign.html`](plugin-market-redesign.html) · [`settings-modern-redesign.html`](settings-modern-redesign.html) · [`settings-mobile-redesign.html`](settings-mobile-redesign.html) | 交互/视觉设计稿（HTML，浏览器直接看）                  |
-| [`presets/README.md`](presets/README.md) · [`examples/`](examples)                                                                                                                                   | 预设交换格式示例与内置预设样例                         |
+| 位置                                                                                                                                                                                                                                                                                                                                                             | 内容                                                         |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| [`agent-bot-design.md`](agent-bot-design.md)                                                                                                                                                                                                                                                                                                                     | Bot 独立化设计稿：直聊/派活/投递、一句话创建、独立记忆与预算 |
+| [`issue-885-triage.md`](issue-885-triage.md)                                                                                                                                                                                                                                                                                                                     | #885 分诊记录：验收条目逐条核实与 6 步拆分建议               |
+| [`device-file-sync.md`](device-file-sync.md)                                                                                                                                                                                                                                                                                                                     | 分块目录导出（`prepare({recursive})`）的边界与拒绝规则       |
+| [`audits/root-cause-review-2026-10-29.md`](audits/root-cause-review-2026-10-29.md)                                                                                                                                                                                                                                                                               | 根因整改审查证据（对应 `root-cause-boundaries.md`）          |
+| [`test-performance-audit.md`](test-performance-audit.md)                                                                                                                                                                                                                                                                                                         | 单测性能审计：实测基线、快/重两池、未解瓶颈                  |
+| [`reviews/canvas-usability-review-2026-07.md`](reviews/canvas-usability-review-2026-07.md)                                                                                                                                                                                                                                                                       | 画布可用性评审记录                                           |
+| [`proposals/`](proposals)                                                                                                                                                                                                                                                                                                                                        | 旧提案（issue #769 diff 可视化两个 HTML 方案）               |
+| [`composer-height-solutions.html`](composer-height-solutions.html) · [`plugin-market-redesign.html`](plugin-market-redesign.html) · [`settings-modern-redesign.html`](settings-modern-redesign.html) · [`settings-mobile-redesign.html`](settings-mobile-redesign.html) · [`device-directory-redesign-proposals.html`](device-directory-redesign-proposals.html) | 交互/视觉设计稿（HTML，浏览器直接看）                        |
+| [`presets/README.md`](presets/README.md) · [`examples/`](examples)                                                                                                                                                                                                                                                                                               | 预设交换格式示例与内置预设样例                               |
 
 ## 五、按场景的阅读路线
 
@@ -89,6 +94,7 @@
 | 改样式 / 主题 / 布局         | `agent-rules.md`（UI 布局与样式）→ `architecture-core.md`（主题、CSS 分层、中央列几何）       |
 | 动终端 / bash                | `architecture-terminal.md` → `agent-rules.md`（命令与恢复状态边界）                           |
 | 动画布 / 图形工作流          | `architecture-canvas.md` → `root-cause-boundaries.md`                                         |
+| 动 Bot 独立化 / 记忆         | `agent-bot-design.md` → `device-collaboration.md` → `tool-context-budget.md`                  |
 | 动群组 / 设备中心            | `device-collaboration.md` → `device-center.md` → `device-center-deployment.md`                |
 | 动插件 / UI 插槽 / MCP       | `architecture-plugins.md` → `agent-rules.md`（插件版本号、`arrange.label`、peerDependencies） |
 | 动目标模式 / 委派 / 计划模式 | `goal-conversation-design.md` → `agent-rules.md`（运行态铁律）                                |

@@ -102,7 +102,7 @@ export const PRESET_FIELD_GROUPS = {
 		"devNoCache",
 		"autoReload",
 	],
-	engine: ["defaultAgentPreset", "defaultPermissionPreset"],
+	engine: ["defaultAgentPreset", "defaultPermissionPreset", "claudePermissionMode"],
 } as const;
 
 export type PresetFieldName = (typeof PRESET_FIELD_GROUPS)[PresetFieldGroup][number];
@@ -134,6 +134,30 @@ export function normalizePresetFieldSelection(v: unknown): string[] | undefined 
 	if (!Array.isArray(v)) return undefined;
 	const wanted = new Set(v.filter((x): x is string => typeof x === "string"));
 	return PRESET_FIELD_NAMES.filter((f) => wanted.has(f));
+}
+
+/**
+ * 把预设快照裁剪到指定字段组（不传 = 保留全量浅拷贝）。
+ * 「提示词模板」用 groups=["prompt"] 只捕获提示词组字段，应用/分享时就不会携带其它设置。
+ */
+export function narrowPresetToGroups(preset: { name: string }, groups?: readonly string[]): Record<string, unknown> {
+	if (!groups || groups.length === 0) return { ...preset };
+	const allow = new Set<string>(groups);
+	const out: Record<string, unknown> = { name: preset.name };
+	for (const [key, value] of Object.entries(preset)) {
+		if (key === "name") continue;
+		const group = presetFieldGroup(key);
+		if (group && allow.has(group)) out[key] = value;
+	}
+	return out;
+}
+
+/**
+ * 预设是否只含 prompt 字段组（设置面板「提示词模板」库的判定依据）。
+ * 全量快照的预设必然携带其它组字段 → false；未知字段也按非模板处理。
+ */
+export function isPromptOnlyPreset(preset: object): boolean {
+	return Object.keys(preset).every((key) => key === "name" || presetFieldGroup(key) === "prompt");
 }
 
 export interface PresetFieldInfo {
@@ -594,6 +618,12 @@ export const PRESET_FIELD_META = {
 		labelEn: "Default Permission Preset",
 		hintZh: "新建会话时默认加载的权限预设",
 		hintEn: "Default permission preset applied to new sessions",
+	},
+	claudePermissionMode: {
+		labelZh: "Claude Code 权限模式",
+		labelEn: "Claude Code Permission Mode",
+		hintZh: "bypassPermissions 跳过全部检查；acceptEdits / manual 等模式会给需要授权的工具弹审批",
+		hintEn: "bypassPermissions skips every check; acceptEdits / manual and friends prompt for tools that need approval",
 	},
 } as const satisfies Record<PresetFieldName, PresetFieldInfo>;
 

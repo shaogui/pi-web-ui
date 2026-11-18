@@ -18,6 +18,11 @@ update_out.txt
 
 .worktrees/
 
+bin/ffmpeg/
+/bin/desktop-codec/**/*.dll
+/bin/desktop-codec/**/build.json
+/bin/desktop-codec/**/relink/
+
 plugins/*/node_modules/
 plugins/*/package-lock.json
 plugins/voice-input/package*.json
@@ -35,6 +40,7 @@ plugins/*/*_token*
 plugins/*/*_cookie*
 plugins/*/*_session*
 plugins/*/artifacts/
+/.artifacts/
 plugins/*/*.tar.gz
 
 tests/scratch/
@@ -79,6 +85,7 @@ capsule-palettes.html
 
 # safe-exec 命令执行器日志/pidfile
 /.safe-exec/
+/bin/device-p2p/
 
 # 手机调试包（构建产物，不入库）
 /pi-web-ui-mobile-debug.apk

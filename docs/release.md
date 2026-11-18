@@ -1,6 +1,8 @@
+[English](./release.en.md) · **简体中文** · [繁體中文](./release.zh-TW.md)
+
 # 发布流程
 
-> npm 发布者账号是 `xingshuyin`（`npm whoami` 验证）。`dist/server/`、`web/dist/` 被 gitignore 不进 git，但 `package.json` 的 `files` 白名单会把它们打进 npm 包；`dist/` 根目录的本地测试文件与桌面产物不进入 npm 包；`prepublishOnly` 会在发布前自动 `npm run build`；服务端构建先清理 `dist/server/`，再编译，避免已删除源码的旧输出留在发布包。
+> npm 发布者账号是 `xingshuyin`（`npm whoami` 验证）。`dist/server/`、`web/dist/` 被 gitignore 不进 git，但 `package.json` 的 `files` 白名单会把它们打进 npm 包；`dist/` 根目录的本地测试文件与桌面产物不进入 npm 包。`prepublishOnly` 会编译 P2P 助手、检查 Windows 桌面编码组件及其源码和重链接材料，再执行 `npm run build`；服务端构建先清理 `dist/server/`，避免已删除源码的旧输出留在发布包。发布前必须先准备下文所述的 Windows 构建产物。
 
 ## 步骤
 
@@ -81,8 +83,14 @@ NPM_OTP=123456 npm run release:npm     # 预检脏工作区/账号/tag + 带 OTP
 npm run release:local -- vX.Y.Z                # 全量：桌面 + 手机（手机那步 qemu 构建 15–25 分钟）
 npm run release:local -- vX.Y.Z --skip-mobile  # 只打桌面
 npm run release:local -- vX.Y.Z --skip-desktop # 只打手机
+npm run release:local -- vX.Y.Z --skip-desktop --reuse-runtime  # 只打手机且不重建运行时（引擎没变时首选，几分钟）
 npm run release:local -- vX.Y.Z --no-upload    # 只打包，不碰 Release
 npm run release:local -- vX.Y.Z --portable     # 额外出便携版（内置 Git/Node，较慢）
+#    注意：手机包不会跟着 tag 自动出。tag 只触发 desktop-release / release-notes / 扩展；
+#    mobile-release 是手动 workflow（CI 每次新生成 debug keystore，装不上旧包还会清引擎数据），
+#    所以每个版本的 APK 都得本地跑一次上面的命令。
+#    --reuse-runtime 只在「服务端代码没变、只动了外壳/插件」时成立：运行时里装的就是本仓库
+#    npm pack 的服务端包，piWebUi 版本对不上时脚本会直接拦下（确认真没改可加 --allow-stale-engine）。
 #    脚本会先校验 tag 与 package.json 版本一致，然后：npm run build → 桌面打包 → （可选）构建
 #    arm64 运行时并打 APK → 生成 SHA256SUMS.txt → gh release upload --clobber。
 #    为什么本地优先：手机 APK 里带 280 MB 引擎运行时，CI 那份 qemu 又慢又每次换 debug 签名
@@ -97,6 +105,7 @@ npm run release:local -- vX.Y.Z --portable     # 额外出便携版（内置 Git
 #    它需要可选的 MOBILE_KEYSTORE_BASE64 等 secrets 才能发出可升级的包。
 
 # 9) 验证
+npm run release:check -- vX.Y.Z  # Release 资产是否齐全：桌面 3 平台 + 扩展 + 手机 APK + SHA256SUMS
 npm view pi-web-ui version        # 应显示新版本（registry 有缓存延迟属正常）
 curl -s https://registry.npmjs.org/pi-web-ui/latest | jq .version
 git ls-remote --tags origin       # 应能看到 vX.Y.Z
@@ -114,3 +123,11 @@ git ls-remote --tags origin       # 应能看到 vX.Y.Z
 - **发布前检查示例文件不泄密**：`deploy/`、`README` 等随 npm 包（`files` 白名单含 `deploy/`）和 GitHub 分发的文件**绝不放真实 IP / 域名 / 密钥**——用占位符（如 `<LAN_IP>`、`<PUBLIC_IP>:<PUBLIC_PORT>`、`your-host`）。真实环境配置只在本地改，不进仓库。
 
 ## 代码及文档不要泄露任何公网IP
+
+## P2P npm 候选包
+
+完整候选包通过 `npm run pack:p2p` 生成，需要 Node.js 与 Go ≥1.24。发布者先在 Windows x64 构建机运行 `npm run build:desktop-codec`；如果在 macOS/Linux 打包，须先将该构建机的 `bin/desktop-codec/win32-x64/` 和 `bin/ffmpeg/win32-x64/nvenc-compat/` 一同复制到发布工作区。命令会交叉编译五个平台助手、准备默认 Windows FFmpeg、校验原生组件和材料、构建 Web/服务端并打包。发布前也可单独运行 `npm run verify:desktop-codec`。缺少或篡改必需产物时，`pack:p2p` 和 npm 发布前检查会失败；不要用 `npm pack --ignore-scripts` 绕过检查发布。
+
+`bin/device-p2p/` 助手以及 Windows 编码器和重链接材料是生成物，不提交 Git，由 npm 的 `bin/` 文件白名单收录。Windows 桌面安装包的 release workflow 会从源码构建这些组件。源码、许可证与重链接材料随包提供，正式发布前由维护者检查第三方依赖的适用许可要求。
+
+发布前执行 `node --import tsx tests/device-p2p-test.mjs` 和相关设备权限/访问单测；从打出的 tarball 安装并检查五份助手及清单，验证包内而非工作区的连接助手。Go 交叉编译通过不等于 macOS/Linux 实机通过，发布说明必须区分。

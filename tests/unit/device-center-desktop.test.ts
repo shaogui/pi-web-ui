@@ -4,7 +4,7 @@ import { chromium } from "playwright-core";
 import { BROWSER_LAUNCH_TIMEOUT_MS, BROWSER_TEST_TIMEOUT_MS, CHROME_PATH } from "../lib/chrome.mjs";
 import { createServer, request, type Server } from "node:http";
 import { once } from "node:events";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocket } from "ws";
@@ -28,7 +28,13 @@ async function listen(server: Server) {
 	return (server.address() as { port: number }).port;
 }
 async function fixture(
-	options: { env?: NodeJS.ProcessEnv; supported?: boolean; dataDir?: string; permissions?: Native["permissions"] } = {},
+	options: {
+		env?: NodeJS.ProcessEnv;
+		supported?: boolean;
+		dataDir?: string;
+		permissions?: Native["permissions"];
+		legacyJpeg?: boolean;
+	} = {},
 ) {
 	const app = express();
 	const dataDir = options.dataDir ?? mkdtempSync(join(tmpdir(), "desktop-route-"));
@@ -49,6 +55,7 @@ async function fixture(
 	};
 	const desktop = createDeviceDesktop({
 		dataDir,
+		fileHome: dataDir,
 		app,
 		authorize: (req) => req.headers.authorization === "Bearer test",
 		env: options.env ?? { PI_DEVICE_DESKTOP: "1" },
@@ -60,6 +67,11 @@ async function fixture(
 	const http = createServer(parent);
 	http.on("upgrade", (req, socket, head) => {
 		if (req.url?.startsWith("/nested/")) req.url = req.url.slice("/nested".length);
+		if (options.legacyJpeg) {
+			const url = new URL(req.url!, "http://localhost");
+			url.searchParams.delete("jpegFeedback");
+			req.url = url.pathname + url.search;
+		}
 		if (!desktop.handleUpgrade(req, socket, head)) socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
 	});
 	const port = await listen(http);
@@ -133,6 +145,28 @@ const tinyImage = Buffer.from(
 );
 
 describe("device desktop local authorization", () => {
+	it("authorizes lightweight previews, shares requests and reuses live capture", async () => {
+		const f = await fixture();
+		expect((await fetch(f.url + "/desktop-preview")).status).toBe(403);
+		expect((await fetch(f.url + "/api/device-desktop/preview")).status).toBe(403);
+		expect((await fetch(f.url + "/desktop-preview", { headers })).status).toBe(200);
+		const first = fetch(f.url + "/api/device-desktop/preview", { headers });
+		const second = fetch(f.url + "/api/device-desktop/preview", { headers });
+		await vi.waitFor(() => expect(f.sessions).toHaveLength(1));
+		expect(f.sessions[0].options).toMatchObject({ readOnly: true, preview: true });
+		f.sessions[0].options.onFrame(tinyImage);
+		for (const response of await Promise.all([first, second])) {
+			expect(response.headers.get("cache-control")).toBe("no-store");
+			expect(response.headers.get("content-type")).toContain("image/jpeg");
+			expect(Buffer.from(await response.arrayBuffer())).toEqual(tinyImage);
+		}
+		const { ws } = await connected(f.port);
+		expect(f.sessions[0].close).toHaveBeenCalledTimes(1);
+		f.sessions[1].options.onFrame(tinyImage);
+		expect((await fetch(f.url + "/api/device-desktop/preview", { headers })).status).toBe(200);
+		expect(f.sessions).toHaveLength(2);
+		ws.close();
+	});
 	it("reports desktop status and native permission support without requesting permissions", async () => {
 		const permissions = vi.fn<NonNullable<Native["permissions"]>>();
 		const f = await fixture({ permissions });
@@ -414,13 +448,55 @@ describe("device desktop native route", () => {
 			);
 			expect(
 				messages.filter((message) => !message.binary).map((message) => JSON.parse(message.data.toString())),
-			).toContainEqual({ type: "ready" });
+			).toContainEqual({ type: "ready", dynamicQuality: false });
 			expect(session.input).not.toHaveBeenCalled();
 			const closed = once(ws, "close");
 			ws.close();
 			await closed;
 			await vi.waitFor(() => expect(session.close).toHaveBeenCalledTimes(1));
 		}
+	});
+	it("binds remote file writes to the current authorized control session", async () => {
+		const f = await fixture();
+		const key = "a".repeat(32),
+			other = "b".repeat(32);
+		const requestFiles = (path: string, session?: string, method = "GET", body?: unknown) =>
+			fetch(f.url + "/api/device-desktop/files/" + path, {
+				method,
+				headers: {
+					...headers,
+					...(session ? { "x-pi-desktop-file-session": session } : {}),
+					...(body ? { "content-type": "application/json" } : {}),
+				},
+				body: body ? JSON.stringify(body) : undefined,
+			});
+		expect((await requestFiles("info")).status).toBe(403);
+		const { ws } = await connected(f.port, "/desktop-ws?viewOnly=1");
+		const acknowledged = once(ws, "message");
+		ws.send(JSON.stringify({ type: "files_session", key }));
+		expect(JSON.parse(String((await acknowledged)[0])).type).toBe("files_session_ready");
+		expect((await (await requestFiles("info", key)).json()).readOnly).toBe(true);
+		expect((await requestFiles("info", other)).status).toBe(403);
+		expect((await requestFiles("mkdir", key, "POST", { path: f.dataDir, name: "forbidden" })).status).toBe(403);
+		expect(
+			(await requestFiles("jobs", key, "POST", { key: other, entries: [{ path: "test.txt", size: 0 }] })).status,
+		).toBe(403);
+		const readable = join(f.dataDir, "readable.txt");
+		await import("node:fs/promises").then((fs) => fs.writeFile(readable, "safe to read"));
+		const download = await (await requestFiles("downloads", key, "POST", { path: readable })).json();
+		expect(await (await requestFiles("download/" + download.id)).text()).toBe("safe to read");
+		const closed = once(ws, "close");
+		ws.close();
+		await closed;
+		expect((await requestFiles("info", key)).status).toBe(403);
+		const control = await connected(f.port, "/desktop-ws?viewOnly=0"),
+			controlAck = once(control.ws, "message");
+		control.ws.send(JSON.stringify({ type: "files_session", key: other }));
+		await controlAck;
+		expect((await (await requestFiles("info", other)).json()).readOnly).toBe(false);
+		expect((await requestFiles("mkdir", other, "POST", { path: f.dataDir, name: "permitted" })).status).toBe(200);
+		expect(existsSync(join(f.dataDir, "permitted"))).toBe(true);
+		control.ws.close();
 	});
 	it("forwards validated JSON inputs only after explicit control permission", async () => {
 		const f = await fixture();
@@ -523,7 +599,7 @@ describe("device desktop native route", () => {
 		for (const session of f.sessions) expect(session.close).toHaveBeenCalledTimes(1);
 		await rejected(f.port, 503);
 	});
-	it("bounds frames and drops frames while a prior send is pending", async () => {
+	it("pipelines two frames and keeps only the latest additional frame until an ACK", async () => {
 		expect(DESKTOP_LIMITS.frame).toBe(4 * 1024 * 1024);
 		expect(DESKTOP_LIMITS.queue).toBe(4 * 1024 * 1024);
 		const f = await fixture();
@@ -547,24 +623,77 @@ describe("device desktop native route", () => {
 		const session = f.sessions[0];
 		session.options.onFrame(tinyImage);
 		session.options.onFrame(Buffer.from("dropped"));
+		const latest = Buffer.from("newest");
+		session.options.onFrame(latest);
 		expect(delivered).toEqual([tinyImage]);
 		expect(finish).toBeTypeOf("function");
 		finish!();
-		session.options.onFrame(tinyImage);
-		expect(delivered).toHaveLength(1);
-		ws.send(JSON.stringify({ type: "ack" }));
-		await vi.waitFor(() => {
-			session.options.onFrame(tinyImage);
-			expect(delivered).toHaveLength(2);
-		});
+		expect(delivered).toEqual([tinyImage, latest]);
+		finish!();
+		session.options.onFrame(Buffer.from("superseded"));
+		const third = Buffer.from("third");
+		session.options.onFrame(third);
 		expect(delivered).toHaveLength(2);
+		ws.send(JSON.stringify({ type: "ack" }));
+		await vi.waitFor(() => expect(delivered).toEqual([tinyImage, latest, third]));
 		expect(session.input).not.toHaveBeenCalled();
 		finish!();
 		const closed = once(ws, "close");
 		session.options.onFrame(Buffer.alloc(DESKTOP_LIMITS.frame + 1));
 		await closed;
-		expect(delivered).toHaveLength(2);
+		expect(delivered).toHaveLength(3);
 		expect(session.close).toHaveBeenCalledTimes(1);
+	});
+	it("negotiates cumulative JPEG feedback without treating one slow ACK as bandwidth", async () => {
+		const f = await fixture();
+		const { ws, messages } = await connected(f.port, "/desktop-ws?jpegFeedback=1");
+		let now = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => now);
+		const frames = () => messages.filter((message) => message.binary);
+		const send = async (text: string, count: number) => {
+			f.sessions[0].options.onFrame(Buffer.from(text));
+			await vi.waitFor(() => expect(frames()).toHaveLength(count));
+		};
+		const ack = async (id: number) => {
+			ws.send(JSON.stringify({ type: "jpeg_ack", id }));
+			const pong = once(ws, "pong");
+			ws.ping();
+			await pong;
+		};
+		await send("first", 1);
+		expect(
+			messages.filter((message) => !message.binary).map((message) => JSON.parse(message.data.toString())),
+		).toContainEqual({ type: "ready", dynamicQuality: false, jpegFeedback: 1 });
+		now = 105;
+		await ack(1);
+		for (let i = 0; i < 2; i++) await send(`frame-${i}`, i + 2);
+		f.sessions[0].options.onFrame(Buffer.from("superseded"));
+		f.sessions[0].options.onFrame(Buffer.from("latest"));
+		await ack(1000);
+		await ack(1);
+		expect(frames()).toHaveLength(3);
+		now = 210;
+		await ack(3);
+		await vi.waitFor(() => expect(frames()).toHaveLength(4));
+		expect(frames().at(-1)!.data.toString()).toBe("latest");
+		expect(f.sessions[0].input).not.toHaveBeenCalled();
+	});
+	it("caps unacknowledged JPEG bytes even with a large latency window", async () => {
+		const f = await fixture();
+		const { ws, messages } = await connected(f.port, "/desktop-ws?jpegFeedback=1");
+		const frame = Buffer.alloc(DESKTOP_LIMITS.queue / 2, 1);
+		const frames = () => messages.filter((message) => message.binary);
+		for (let i = 1; i <= 2; i++) {
+			f.sessions[0].options.onFrame(frame);
+			await vi.waitFor(() => expect(frames()).toHaveLength(i));
+		}
+		f.sessions[0].options.onFrame(frame);
+		const pong = once(ws, "pong");
+		ws.ping();
+		await pong;
+		expect(frames()).toHaveLength(2);
+		ws.send(JSON.stringify({ type: "jpeg_ack", id: 2 }));
+		await vi.waitFor(() => expect(frames()).toHaveLength(3));
 	});
 	it("drops frames when the WebSocket output queue is full and resumes after draining", async () => {
 		const f = await fixture();
@@ -576,6 +705,16 @@ describe("device desktop native route", () => {
 		await vi.waitFor(() => expect(messages.filter((message) => message.binary)).toHaveLength(1));
 		expect(messages.find((message) => message.binary)!.data).toEqual(tinyImage);
 	});
+	it("closes a stalled viewer instead of leaving a connected but frozen desktop", async () => {
+		const f = await fixture();
+		const { ws, messages } = await connected(f.port);
+		f.sessions[0].options.onFrame(tinyImage);
+		await once(ws, "close");
+		expect(
+			messages.filter((message) => !message.binary).map((message) => JSON.parse(message.data.toString())),
+		).toContainEqual({ type: "error", message: expect.stringContaining("acknowledging") });
+		expect(f.sessions[0].close).toHaveBeenCalledTimes(1);
+	}, 20000);
 	it("does not consume unrelated upgrade paths", async () => {
 		const f = await fixture();
 		const socket = {
@@ -585,10 +724,10 @@ describe("device desktop native route", () => {
 		} as any;
 		expect(f.desktop.handleUpgrade({ url: "/other" } as any, socket, Buffer.alloc(0))).toBe(false);
 	});
-	it.skipIf(!CHROME_PATH)(
-		"decodes native frames onto the canvas through a nested proxy path",
-		async () => {
-			const f = await fixture();
+	it.skipIf(!CHROME_PATH).each([false, true])(
+		"decodes native frames onto the canvas through a nested proxy path (legacy JPEG: %s)",
+		async (legacyJpeg) => {
+			const f = await fixture({ legacyJpeg });
 			const browser = await chromium.launch({
 				executablePath: CHROME_PATH,
 				headless: true,
@@ -596,11 +735,23 @@ describe("device desktop native route", () => {
 				args: ["--no-sandbox"],
 			});
 			cleanups.push(() => browser.close());
-			const page = await browser.newPage({ extraHTTPHeaders: headers, viewport: { width: 390, height: 740 } });
+			// 页面与文件管理器的语言取 navigator.language：断言写的是英文，必须钉住 locale。
+			const page = await browser.newPage({
+				locale: "en-US",
+				extraHTTPHeaders: headers,
+				viewport: { width: 390, height: 740 },
+			});
 			const errors: string[] = [];
 			const requests: string[] = [];
+			const acknowledgements: any[] = [];
 			page.on("pageerror", (error) => errors.push(error.message));
-			page.on("websocket", (socket) => requests.push(socket.url()));
+			page.on("websocket", (socket) => {
+				requests.push(socket.url());
+				socket.on("framesent", ({ payload }) => {
+					const value = JSON.parse(String(payload));
+					if (value.type === "ack" || value.type === "jpeg_ack") acknowledgements.push(value);
+				});
+			});
 			page.on("response", (response) => {
 				if (response.status() >= 400) errors.push(response.url() + ":" + response.status());
 			});
@@ -623,8 +774,54 @@ describe("device desktop native route", () => {
 				await page.screenshot({ path: "artifacts/device-center/desktop-native.png", fullPage: true });
 			}
 			expect(requests[0]).toContain("/nested/desktop-ws");
+			for (let i = 1; i <= 9; i++) {
+				f.sessions[0].options.onFrame(tinyImage);
+				await vi.waitFor(() => expect(acknowledgements.length).toBeGreaterThanOrEqual(i + 1));
+			}
+			expect(acknowledgements.at(-1)).toEqual(legacyJpeg ? { type: "ack" } : { type: "jpeg_ack", id: 10 });
 			expect(f.sessions[0].options.readOnly).toBe(false);
+			await page.locator("#canvas").focus();
+			for (const code of [
+				"Numpad0",
+				"Numpad1",
+				"Numpad9",
+				"NumpadDecimal",
+				"NumpadAdd",
+				"NumpadSubtract",
+				"NumpadMultiply",
+				"NumpadDivide",
+				"NumpadEnter",
+				"NumLock",
+			]) {
+				await page.keyboard.press(code);
+				await vi.waitFor(() => {
+					expect(f.sessions[0].input).toHaveBeenCalledWith({ type: "key", code, action: "down" });
+					expect(f.sessions[0].input).toHaveBeenCalledWith({ type: "key", code, action: "up" });
+				});
+			}
 			expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+			writeFileSync(join(f.dataDir, "file-for-session.txt"), "test");
+			await page.locator("#file-transfer").click();
+			const fileDialog = page.locator("#file-transfer-dialog"),
+				localFiles = fileDialog.locator(".fm-pane").first();
+			await localFiles.getByRole("checkbox", { name: "file-for-session.txt", exact: true }).check();
+			const send = localFiles.getByRole("button", { name: "Send →", exact: true });
+			await expect.poll(() => send.isEnabled()).toBe(true);
+			await fileDialog.locator(".fm-head button").click();
+			await page.locator("#viewonly").check();
+			await vi.waitFor(() => expect(f.sessions).toHaveLength(2));
+			f.sessions[1].options.onFrame(tinyImage);
+			await page.getByText("Connected · view only", { exact: true }).waitFor();
+			await page.locator("#file-transfer").click();
+			await expect.poll(() => send.isDisabled()).toBe(true);
+			await fileDialog.locator(".fm-head button").click();
+			await page.locator("#viewonly").uncheck();
+			await vi.waitFor(() => expect(f.sessions).toHaveLength(3));
+			f.sessions[2].options.onFrame(tinyImage);
+			await page.getByText("Connected · control enabled", { exact: true }).waitFor();
+			await page.locator("#file-transfer").click();
+			await expect.poll(() => send.isEnabled()).toBe(true);
+			await fileDialog.locator(".fm-head button").click();
 			await page.locator("#disconnect").click();
 			await vi.waitFor(() => expect(f.sessions[0].close).toHaveBeenCalledTimes(1));
 			expect(await page.locator("#connect").isEnabled()).toBe(true);

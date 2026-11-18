@@ -50,6 +50,26 @@ export interface AgentEventSink {
 	onTurnComplete(meta?: AgentTurnMeta): void;
 
 	onError(err: Error | string): void;
+
+	/**
+	 * Explicit opt-in for permission prompts. A `typeof onApprovalRequest === "function"`
+	 * check is not reliable here: the session wraps the sink in a Proxy whose `get` trap
+	 * returns a function for *every* key, so a sink without approval wiring would still
+	 * look like it has one — the call is then silently dropped and the CLI waits forever.
+	 */
+	supportsApproval?: boolean;
+
+	/**
+	 * The engine asks a human to approve one tool call (Claude Code's `can_use_tool`).
+	 * The host must eventually call the driver's `respondApproval`; otherwise the engine
+	 * keeps waiting for the answer and the turn never finishes.
+	 */
+	onApprovalRequest?(
+		requestId: string,
+		toolName: string,
+		params: Record<string, unknown>,
+		options?: { suggestions?: unknown[] },
+	): void;
 }
 
 export abstract class BaseAgentDriver {
@@ -122,6 +142,23 @@ export abstract class BaseAgentDriver {
 
 	async getSkills?(): Promise<Array<{ name: string; description: string; filePath?: string }>> {
 		return [];
+	}
+
+	/** Permission mode surfaced in the UI (Claude Code only); undefined = driver has no such setting. */
+	permissionModeOptions?(): string[];
+
+	currentPermissionMode?(): string;
+
+	setPermissionMode?(_mode: string): void;
+
+	/** Answer an engine permission request. Drivers without permission plumbing return false. */
+	async respondApproval(
+		_requestId: string,
+		_decision: "approve" | "edit" | "deny",
+		_editedParams?: Record<string, unknown>,
+		_reason?: string,
+	): Promise<boolean> {
+		return false;
 	}
 
 	/** True when `/name` must be sent to the native CLI verbatim instead of pi's slash handlers. */

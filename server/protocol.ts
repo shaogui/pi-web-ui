@@ -1371,6 +1371,7 @@ export type ClientMessage =
 			conversationId?: string;
 	  }
 	| { type: "extensions_reload" }
+	| { type: "extension_inventory"; reqId: number }
 	| { type: "list_commands" }
 	| { type: "save_commands"; commands: CommandDef[] }
 	| { type: "abort" }
@@ -1629,7 +1630,7 @@ export type ClientMessage =
 	| { type: "plugins_reload" }
 	| { type: "plugin_dom_consent"; pluginId: string; granted: boolean }
 	| { type: "plugin_dom_consent_response"; id: string; ok: boolean }
-	| { type: "save_preset"; name: string }
+	| { type: "save_preset"; name: string; groups?: string[] }
 	| { type: "save_subagent_template"; template: UiSubagentTemplate }
 	| { type: "delete_subagent_template"; name: string }
 	| { type: "save_approval_rule"; rule: UiApprovalRule }
@@ -1694,7 +1695,6 @@ export type ClientMessage =
 	  }
 	| { type: "plugin_job_cancel"; jobId: string }
 	| { type: "plugin_install_inspect"; requestId: string; source: string; explicitId?: string; force?: boolean }
-	| { type: "plugin_api_catalog"; requestId: string }
 	| { type: "plugin_path_response"; id: string; ok: boolean; remember?: boolean }
 	| { type: "plugin_path_revoke"; pluginId?: string; path?: string }
 	| { type: "plugin_permission_response"; id: string; ok: boolean; remember?: boolean }
@@ -1713,6 +1713,7 @@ export type ClientMessage =
 	| { type: "dsh_preset_default"; preset: string }
 	| { type: "dsh_permission_set"; preset: string }
 	| { type: "dsh_permission_default"; preset: string }
+	| { type: "claude_permission_mode"; mode: string }
 	| { type: "dsh_patches_rescan" }
 	| { type: "dsh_patch_install"; spec: string; id?: string }
 	| { type: "dsh_patch_toggle"; name: string; enabled: boolean }
@@ -2158,6 +2159,10 @@ export interface UiToolApproval {
 	parentTool?: string;
 	conversationId?: string;
 	conversationTitle?: string;
+	/** Engine-issued approval (e.g. Claude Code) that has no durable rule store behind it:
+	 *  the dialog must not offer "always allow for this conversation", because answering it
+	 *  once cannot persist anything. */
+	scopeless?: boolean;
 }
 
 export type PlanStepStatus = "pending" | "in_progress" | "done" | "failed";
@@ -2430,37 +2435,6 @@ export interface PluginRequires {
 	plugins?: string[];
 }
 
-export interface CatalogSlotOccupant {
-	pluginId: string;
-	items: number;
-}
-export interface CatalogSlotEntry {
-	slot: string;
-	aliases: string[];
-	kinds: string[];
-	occupants: CatalogSlotOccupant[];
-	replaceRisk: string;
-	example: string;
-}
-export interface CatalogAgentTool {
-	name: string;
-	group: string;
-	defaultOn: boolean;
-	dshVisible: boolean;
-}
-export interface CatalogHostMethod {
-	name: string;
-	needs: string;
-	summary: string;
-	example: string;
-}
-export interface PluginApiCatalog {
-	version: 1;
-	slots: CatalogSlotEntry[];
-	agentTools: CatalogAgentTool[];
-	hostMethods: CatalogHostMethod[];
-}
-
 export interface UiPluginFileHandler {
 	id: string;
 	extensions: string[];
@@ -2534,11 +2508,13 @@ export type UiSlotId =
 	| "composer.actions"
 	| "message.actions"
 	| "rightpanel.tabs"
+	| "bottomdock.tabs"
 	| "contextmenu.topbar"
 	| "contextmenu.message"
 	| "contextmenu.session"
 	| "contextmenu.project"
 	| "contextmenu.file"
+	| "contextmenu.search"
 	| "contextmenu.toolcall"
 	| "tool.card.footer"
 	| "settings.pages"
@@ -2838,8 +2814,31 @@ export interface UiExtensionInfo {
 	enabled: boolean;
 }
 
+/** #885 T1：扩展统一清单条目（三类来源统一 shape，只读）。 */
+export type UiExtensionInventorySource = "cli" | "webui" | "external";
+
+/** #885 健康探测：仅读聚合，不建新连接。online=运行中，offline=离线，error=异常，stopped=已停用，unknown=未知。 */
+export type UiExtensionInventoryHealth = "online" | "offline" | "error" | "stopped" | "unknown";
+
+export interface UiExtensionInventoryEntry {
+	name: string;
+	source: UiExtensionInventorySource;
+	enabled: boolean;
+	version?: string;
+	description?: string;
+	error?: string;
+	/** cli 内置隐藏扩展不可单独启停时为 false，前端置灰（T3，绝不静默跳过）。 */
+	switchable?: boolean;
+	/** #885 健康状态：external 由 listMcpServers status/error/enabled 只读映射；cli/webui 缺席为 undefined。 */
+	health?: UiExtensionInventoryHealth;
+	/** #885 MCP 工具数（listMcpServers tools.length 只读透出）。 */
+	toolCount?: number;
+}
+
 export interface UiSettingsPreset {
 	name: string;
+	/** 预设字段组范围："prompt" = 只捕获提示词组（设置面板按模板展示）；缺省 = 全量快照 */
+	scope?: "prompt";
 	plugins?: UiPresetPluginDependency[];
 	promptMode: "append" | "replace";
 	customSystemPrompt: string;
@@ -3364,6 +3363,7 @@ export type ServerMessage =
 	| { type: "slash_commands"; commands: SlashCommandInfo[] }
 	| { type: "notice"; level: "info" | "warning" | "error"; text: string; textEn?: string }
 	| { type: "scm_changed" }
+	| { type: "extension_inventory_changed" }
 	| { type: "heartbeat"; hostMetrics?: UiHostMetrics; latencyMs?: number }
 	| { type: "sessions"; sessions: SessionSummary[]; cwd?: string; hasMore?: boolean }
 	/** Filename matches for the global search panel (reqId echo). Always sent
@@ -3520,6 +3520,14 @@ export type ServerMessage =
 	  }
 	| { type: "install_result"; ok: boolean; detail: string }
 	| {
+			/** #885 T1：扩展统一清单只读查询结果（不改运行时）。 */
+			type: "extension_inventory_data";
+			reqId: number;
+			ok: boolean;
+			entries: UiExtensionInventoryEntry[];
+			error?: string;
+	  }
+	| {
 			type: "scm_data";
 			reqId: number;
 			kind: "status" | "history" | "filediff" | "commit" | "commitmsg";
@@ -3664,11 +3672,6 @@ export type ServerMessage =
 			detail?: string;
 			manifest?: { id?: string; name?: string; version?: string; description?: string; permissions?: string[] };
 	  }
-	| {
-			type: "plugin_api_catalog_result";
-			requestId: string;
-			catalog: PluginApiCatalog;
-	  }
 	| { type: "plugin_path_request"; id: string; pluginId: string; path: string; reason?: string }
 	| { type: "plugin_dom_consent_request"; id: string; pluginId: string; from: string }
 	| { type: "plugin_grants"; grants: { pluginId: string; paths: string[] }[] }
@@ -3716,6 +3719,7 @@ export type ServerMessage =
 			defaultPreset: string;
 	  }
 	| { type: "dsh_permission"; options: DshPermissionOption[]; defaultPreset: string }
+	| { type: "claude_permission"; modes: string[]; current: string }
 	| {
 			type: "question_pending";
 			owner?: string;
@@ -3743,6 +3747,7 @@ export type ServerMessage =
 			parentTool?: string;
 			conversationId?: string;
 			conversationTitle?: string;
+			scopeless?: boolean;
 	  }
 	| { type: "tool_approval_resolved"; id: string; owner?: string; global?: boolean }
 	| { type: "global_interactions"; questions: UiPendingQuestion[]; approvals: UiToolApproval[] }

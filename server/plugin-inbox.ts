@@ -83,8 +83,8 @@ export class PluginInbox {
 			// 没有消息 id 的入站事件无法去重，只能放行。
 			return { id: `${this.ledger.pluginId}:`, status: "new", attempts: 1 };
 		}
-		const existing = this.ledger.get(k);
-		if (existing && existing.direction === "in") {
+		const existing = this.ledger.get(k, "in");
+		if (existing) {
 			if (existing.state === "done") {
 				return { id: existing.id, status: "duplicate", attempts: existing.attempts, reason: "done" };
 			}
@@ -94,6 +94,15 @@ export class PluginInbox {
 			const stalled = now - existing.updatedAt >= this.stallMs;
 			if (existing.state === "claimed" && !stalled) {
 				return { id: existing.id, status: "duplicate", attempts: existing.attempts, reason: "in-flight" };
+			}
+			// claimed 态的 stalled 重投同样计入上限：宿主处理到一半崩死（永远到不了
+			// complete/fail）的毒消息不能每个 stall 周期被无限重投、永不进死信。
+			if (existing.state === "claimed" && existing.attempts >= this.ledger.maxAttempts) {
+				existing.state = "failed";
+				existing.error = "repeatedly stalled before completion";
+				existing.updatedAt = now;
+				this.ledger.put(existing);
+				return { id: existing.id, status: "duplicate", attempts: existing.attempts, reason: "dead" };
 			}
 			existing.state = "claimed";
 			existing.attempts += 1;
@@ -117,8 +126,8 @@ export class PluginInbox {
 	complete(key: unknown, opts: InboxCompleteOptions = {}): void {
 		const k = normalizeLedgerKey(key);
 		if (!k) return;
-		const record = this.ledger.get(k);
-		if (!record || record.direction !== "in") return;
+		const record = this.ledger.get(k, "in");
+		if (!record) return;
 		record.state = "done";
 		record.updatedAt = this.now;
 		delete record.error;
@@ -131,8 +140,8 @@ export class PluginInbox {
 	fail(key: unknown, error: unknown): void {
 		const k = normalizeLedgerKey(key);
 		if (!k) return;
-		const record = this.ledger.get(k);
-		if (!record || record.direction !== "in") return;
+		const record = this.ledger.get(k, "in");
+		if (!record) return;
 		record.state = "failed";
 		record.updatedAt = this.now;
 		record.error = errorText(error);

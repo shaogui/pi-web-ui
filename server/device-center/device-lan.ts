@@ -1,4 +1,5 @@
 import { randomBytes, constants } from "node:crypto";
+import { desktopDownloadLimit } from "./desktop-files-protocol.js";
 import http, { type IncomingHttpHeaders, type IncomingMessage } from "node:http";
 import https from "node:https";
 import { isIPv4, type Socket } from "node:net";
@@ -96,7 +97,7 @@ function byteLength(data: RawData) {
 }
 
 export function createDeviceLanServer(options: Options): {
-	issueGrant(): Promise<DeviceLanGrant | null>;
+	issueGrant(options?: { loopbackOnly?: boolean }): Promise<DeviceLanGrant | null>;
 	revoke(identity: string): void;
 	close(): void;
 } {
@@ -186,7 +187,8 @@ export function createDeviceLanServer(options: Options): {
 					req.resume();
 					return;
 				}
-				const desktop = req.url?.startsWith("/api/device-desktop/");
+				const desktop =
+					req.url?.startsWith("/api/device-desktop/") && !req.url.startsWith("/api/device-desktop/files/");
 				const limit = desktop ? INPUT : RELAY_LIMITS.body;
 				if (s.tasks.size >= RELAY_LIMITS.streams || Number(req.headers["content-length"] ?? 0) > limit) {
 					res.setHeader("Connection", "close");
@@ -195,9 +197,9 @@ export function createDeviceLanServer(options: Options): {
 					return;
 				}
 				const input = bodyLimit(limit);
-				const output = bodyLimit(RELAY_LIMITS.body);
+				const output = bodyLimit(desktopDownloadLimit(req.url, req.method) ?? RELAY_LIMITS.body);
 				let stopped = false;
-				const timer = setTimeout(() => cleanup(), 60_000);
+				const timer = setTimeout(() => cleanup(), desktopDownloadLimit(req.url, req.method) ? 30 * 60_000 : 60_000);
 				const upstream = localRequest(
 					{
 						protocol: local.protocol,
@@ -365,16 +367,16 @@ export function createDeviceLanServer(options: Options): {
 			request.end();
 		});
 	}
-	async function issueGrant(): Promise<DeviceLanGrant | null> {
+	async function issueGrant(grantOptions: { loopbackOnly?: boolean } = {}): Promise<DeviceLanGrant | null> {
 		const issuedGeneration = generation;
 		try {
 			if (checking.size >= 16) return null;
 			if (!(await (options.enabled ? options.enabled() : available())) || issuedGeneration !== generation) return null;
-			const candidates = [...new Set((options.addresses ?? addresses)())];
+			const candidates = grantOptions.loopbackOnly ? ["127.0.0.1"] : [...new Set((options.addresses ?? addresses)())];
 			if (
 				!candidates.length ||
 				candidates.length > 16 ||
-				candidates.some((a) => !privateAddress(a, !!options.addresses))
+				candidates.some((a) => !privateAddress(a, !!options.addresses || grantOptions.loopbackOnly === true))
 			)
 				return null;
 			const s = state ?? start();
@@ -428,12 +430,30 @@ export async function probeDeviceLan(
 	grant: unknown,
 	options: { timeoutMs?: number; allowLoopback?: boolean; signal?: AbortSignal } = {},
 ): Promise<DeviceLanConnection | null> {
+	return probeDeviceConnection(grant, options);
+}
+
+export async function probeDeviceTunnel(
+	grant: unknown,
+	port: number,
+	options: { timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<DeviceLanConnection | null> {
+	if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+	return probeDeviceConnection(grant, { ...options, allowLoopback: true }, port);
+}
+
+async function probeDeviceConnection(
+	grant: unknown,
+	options: { timeoutMs?: number; allowLoopback?: boolean; signal?: AbortSignal },
+	tunnelPort?: number,
+): Promise<DeviceLanConnection | null> {
 	if (!validGrant(grant, options.allowLoopback === true) || options.signal?.aborted) return null;
 	const timeout = options.timeoutMs ?? 800;
 	if (!Number.isFinite(timeout) || timeout <= 0 || timeout > 30_000) return null;
 	return new Promise((resolve) => {
 		let settled = false;
-		let remaining = grant.addresses.length;
+		const candidatesAddresses = tunnelPort ? ["127.0.0.1"] : grant.addresses;
+		let remaining = candidatesAddresses.length;
 		const candidates = new Set<{ agent: https.Agent; cancel(): void }>();
 		const finish = (winner: DeviceLanConnection | null) => {
 			if (settled) return;
@@ -444,7 +464,7 @@ export async function probeDeviceLan(
 		};
 		const abort = () => finish(null);
 		options.signal?.addEventListener("abort", abort, { once: true });
-		for (const address of grant.addresses) {
+		for (const address of candidatesAddresses) {
 			const agent = new https.Agent({
 				...TLS_OPTIONS,
 				keepAlive: true,
@@ -454,7 +474,7 @@ export async function probeDeviceLan(
 				pskCallback: () => ({ identity: grant.identity, psk: Buffer.from(grant.key, "base64url") }),
 				checkServerIdentity: () => undefined,
 			});
-			const origin = `https://${address}:${grant.port}`;
+			const origin = `https://${address}:${tunnelPort ?? grant.port}`;
 			let finished = false;
 			const fail = () => {
 				if (finished) return;

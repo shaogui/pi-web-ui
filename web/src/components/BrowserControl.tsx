@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState, type MouseEvent } from "react";
-import { FiExternalLink, FiMaximize2, FiPlus, FiSidebar, FiUser } from "react-icons/fi";
+import { useEffect, useState, type MouseEvent, type ReactNode } from "react";
+import { FiMaximize2, FiPlus, FiSidebar, FiUser } from "react-icons/fi";
 import { LuCompass } from "react-icons/lu";
-import { isZhLocale, useI18n, useT } from "../i18n";
+import { useT } from "../i18n";
 import {
 	PAGE_PICKER_ZIP_URL,
 	openExtensionOptions,
@@ -26,53 +26,45 @@ interface DesktopBrowserState {
 	activeTabId?: string | null;
 }
 
-export function BrowserControl() {
-	const t = useT();
-	const { locale } = useI18n();
-	const isZh = isZhLocale(locale);
-	const { status, refresh } = useBrowserControl();
-	const [open, setOpen] = useState(false);
-	const [flash, setFlash] = useState<string | null>(null);
-	const flashTimer = useRef<number | null>(null);
+function desktopBridge(): DesktopBrowserBridge | undefined {
+	return typeof window !== "undefined"
+		? ((window as unknown as DesktopShellWindow).piDesktop?.browser as DesktopBrowserBridge | undefined)
+		: undefined;
+}
 
-	const [desktopState, setDesktopState] = useState<DesktopBrowserState | null>(null);
-	const desktop =
-		typeof window !== "undefined"
-			? ((window as unknown as DesktopShellWindow).piDesktop?.browser as DesktopBrowserBridge | undefined)
-			: undefined;
-
+function useDesktopBrowserState(desktop?: DesktopBrowserBridge): DesktopBrowserState | null {
+	const [state, setState] = useState<DesktopBrowserState | null>(null);
 	useEffect(() => {
 		if (!desktop) return;
 		void desktop.getState().then((s) => {
-			if (s && typeof s === "object") setDesktopState(s as DesktopBrowserState);
+			if (s && typeof s === "object") setState(s as DesktopBrowserState);
 		});
 		const unsub = desktop.onState((s) => {
-			if (s && typeof s === "object") setDesktopState(s as DesktopBrowserState);
+			if (s && typeof s === "object") setState(s as DesktopBrowserState);
 		});
 		return () => {
 			unsub?.();
 		};
 	}, [desktop]);
+	return state;
+}
 
-	const say = (text: string): void => {
-		setFlash(text);
-		if (flashTimer.current !== null) window.clearTimeout(flashTimer.current);
-		flashTimer.current = window.setTimeout(() => setFlash(null), 2600);
-	};
-
-	const cite = (page: BrowserControlPage): void => {
-		const ok = composeToComposer({ attachments: [pageCitation(page)] });
-		say(ok ? t("browserControlCited") : t("browserControlCiteFailed"));
-	};
+/**
+ * 顶栏入口。面板本身由 TopBar 持有并渲染（{@link BrowserControlModal}），
+ * 这样从折叠菜单点开时菜单可以先关闭，面板不会随之卸载。
+ *
+ * - `onActivate`：入口被点击时就调（折叠菜单据此收起）
+ * - `onOpenPanel`：需要弹出控制面板时就调（由宿主渲染）
+ */
+export function BrowserControl({ onActivate, onOpenPanel }: { onActivate?: () => void; onOpenPanel?: () => void }) {
+	const t = useT();
+	const { status } = useBrowserControl();
+	const desktop = desktopBridge();
+	const desktopState = useDesktopBrowserState(desktop);
 
 	const openPanel = (): void => {
-		setOpen(true);
-		refresh();
-		if (desktop) {
-			void desktop.getState().then((s) => {
-				if (s && typeof s === "object") setDesktopState(s as DesktopBrowserState);
-			});
-		}
+		onActivate?.();
+		onOpenPanel?.();
 	};
 
 	if (desktop) {
@@ -81,14 +73,9 @@ export function BrowserControl() {
 		const toggleMode = () => {
 			const nextMode = isSplit || isBrowser ? "agent" : "split";
 			void desktop.setMode(nextMode);
+			onActivate?.();
 		};
-		const tip = isSplit
-			? isZh
-				? "收起浏览器分栏 (Ctrl+Shift+2) · 右键打开选项"
-				: "Collapse browser split (Ctrl+Shift+2) · Right-click for options"
-			: isZh
-				? "打开浏览器分栏 (Ctrl+Shift+3) · 右键打开选项"
-				: "Open browser split (Ctrl+Shift+3) · Right-click for options";
+		const tip = isSplit ? t("browserControlSplitCloseTip") : t("browserControlSplitOpenTip");
 
 		const handleContextMenu = (e: MouseEvent) => {
 			e.preventDefault();
@@ -109,17 +96,6 @@ export function BrowserControl() {
 					<LuCompass size={14} aria-hidden />
 					<span>{t("browserControl")}</span>
 				</button>
-				{flash && <span className="bc-flash">{flash}</span>}
-				{open && (
-					<BrowserControlPanel
-						status={status}
-						desktop={desktop}
-						desktopState={desktopState}
-						onRefresh={refresh}
-						onCite={cite}
-						onClose={() => setOpen(false)}
-					/>
-				)}
 			</span>
 		);
 	}
@@ -142,18 +118,39 @@ export function BrowserControl() {
 					{pages.length > 0 ? ` · ${pages.length}` : ""}
 				</span>
 			</button>
-			{flash && <span className="bc-flash">{flash}</span>}
-			{open && (
-				<BrowserControlPanel
-					status={status}
-					desktop={desktop}
-					desktopState={desktopState}
-					onRefresh={refresh}
-					onCite={cite}
-					onClose={() => setOpen(false)}
-				/>
-			)}
 		</span>
+	);
+}
+
+/** 浏览器控制面板（模态）。由 TopBar 渲染，独立于顶栏/折叠菜单的挂载状态。 */
+export function BrowserControlModal({ onClose }: { onClose: () => void }) {
+	const t = useT();
+	const { status, refresh } = useBrowserControl();
+	const desktop = desktopBridge();
+	const desktopState = useDesktopBrowserState(desktop);
+	const [flash, setFlash] = useState<string | null>(null);
+
+	useEffect(() => {
+		if (flash === null) return;
+		const timer = window.setTimeout(() => setFlash(null), 2600);
+		return () => window.clearTimeout(timer);
+	}, [flash]);
+
+	const cite = (page: BrowserControlPage): void => {
+		const ok = composeToComposer({ attachments: [pageCitation(page)] });
+		setFlash(ok ? t("browserControlCited") : t("browserControlCiteFailed"));
+	};
+
+	return (
+		<BrowserControlPanel
+			status={status}
+			desktop={desktop}
+			desktopState={desktopState}
+			onRefresh={refresh}
+			onCite={cite}
+			onClose={onClose}
+			flash={flash}
+		/>
 	);
 }
 
@@ -164,6 +161,7 @@ function BrowserControlPanel({
 	onRefresh,
 	onCite,
 	onClose,
+	flash,
 }: {
 	status: BrowserControlStatus | null;
 	desktop?: DesktopBrowserBridge;
@@ -171,10 +169,9 @@ function BrowserControlPanel({
 	onRefresh: () => void;
 	onCite: (page: BrowserControlPage) => void;
 	onClose: () => void;
+	flash?: ReactNode;
 }) {
 	const t = useT();
-	const { locale } = useI18n();
-	const isZh = isZhLocale(locale);
 	const [busy, setBusy] = useState(false);
 	const pages = status?.pages ?? [];
 
@@ -212,15 +209,14 @@ function BrowserControlPanel({
 				</div>
 				<div className="modal-desc">
 					{desktop
-						? isZh
-							? "桌面内置浏览器已就绪，可在右侧并列分栏浏览网页，或切换到独立浏览器。"
-							: "Desktop browser ready: view web pages side-by-side in split view or switch to full browser."
+						? t("browserControlDesktopReady")
 						: t(status?.native ? "browserControlNativeLead" : "browserControlTip")}
 				</div>
+				{flash && <div className="bc-note">{flash}</div>}
 
 				{desktop && (
 					<>
-						<div className="bc-section">{isZh ? "视图模式" : "View Mode"}</div>
+						<div className="bc-section">{t("browserControlViewMode")}</div>
 						<div className="bc-actions" style={{ marginTop: 0, marginBottom: 12 }}>
 							<button
 								type="button"
@@ -228,7 +224,7 @@ function BrowserControlPanel({
 								onClick={() => void setMode("split")}
 							>
 								<FiSidebar size={14} style={{ marginRight: 6 }} />
-								{isZh ? "并列分栏 (Split)" : "Split View"}
+								{t("browserControlModeSplit")}
 							</button>
 							<button
 								type="button"
@@ -236,7 +232,7 @@ function BrowserControlPanel({
 								onClick={() => void setMode("browser")}
 							>
 								<FiMaximize2 size={14} style={{ marginRight: 6 }} />
-								{isZh ? "完整浏览器 (Browser)" : "Full Browser"}
+								{t("browserControlModeBrowser")}
 							</button>
 							<button
 								type="button"
@@ -244,13 +240,13 @@ function BrowserControlPanel({
 								onClick={() => void setMode("agent")}
 							>
 								<FiUser size={14} style={{ marginRight: 6 }} />
-								{isZh ? "仅 Agent 模式" : "Agent Only"}
+								{t("browserControlModeAgent")}
 							</button>
 						</div>
 						<div className="bc-actions" style={{ marginTop: 0, marginBottom: 12 }}>
 							<button type="button" onClick={() => void createTab()}>
 								<FiPlus size={14} style={{ marginRight: 6 }} />
-								{isZh ? "新建网页标签" : "New Browser Tab"}
+								{t("browserControlNewTab")}
 							</button>
 						</div>
 					</>
@@ -258,12 +254,12 @@ function BrowserControlPanel({
 
 				{desktop && desktopState?.tabs && desktopState.tabs.length > 0 && (
 					<>
-						<div className="bc-section">{isZh ? "已打开的网页标签" : "Open Browser Tabs"}</div>
+						<div className="bc-section">{t("browserControlOpenTabs")}</div>
 						<ul className="bc-pages">
 							{desktopState.tabs.map((tab) => (
 								<li key={tab.id}>
 									<span className="bc-title" title={tab.title || tab.url}>
-										{tab.title || (isZh ? "新标签页" : "New Tab")}
+										{tab.title || t("browserControlNewTabTitle")}
 									</span>
 									<span className="bc-origin" title={tab.url}>
 										{tab.url}
@@ -276,7 +272,7 @@ function BrowserControlPanel({
 											void setMode("split");
 										}}
 									>
-										{isZh ? "跳转" : "Open"}
+										{t("browserControlOpenTab")}
 									</button>
 								</li>
 							))}

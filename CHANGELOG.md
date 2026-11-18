@@ -10,6 +10,51 @@
 
 ## [Unreleased]
 
+## [0.121.0] — 2026-11-14
+
+### Added
+
+- **远程桌面与设备协作**：设备访问增加已鉴权的 WebRTC P2P 通道，按局域网、P2P、Hub 顺序连接；桌面、聊天和设备网页共用现有授权与回退边界。
+- **桌面预览与群组**：聊天右栏增加远程桌面预览、设备切换和群组成员桌面；放大、独立窗口关闭后返回预览，远程聊天页复用当前设备连接。
+- **Windows 系统桌面服务**：可选安装，支持锁屏登录界面采集及会话切换后的自动恢复；Windows / Mac 增加显示器选择与鼠标坐标映射。
+- **动态画质与高帧率**：远程桌面增加动态画质、传输分辨率和 60 / 120 / 240 FPS 目标；Windows 优先 DXGI、Mac 使用持续 SCStream，H.264 通道走 NVENC / VideoToolbox，实际帧率受设备与网络限制。
+- **剪贴板同步**：文本、图片和普通文件的单向或双向同步，默认关闭；从控制端 localhost 打开，接收文件有大小与数量限额。
+- **SCM 面板补齐常用 Git 操作**：全部暂存／取消暂存、逐文件丢弃（含未跟踪）、并排 diff 与上一处／下一处导航及 hunk 统计、stash 全套、amend、分支新建／改名／删除、blame 行归属。
+- **扩展中心统一清单**：按来源（内置／项目／本地）打徽标，一键开关与刷新；MCP 服务器健康检查、自动刷新与搜索过滤。
+- **vscode-editor 0.7.0**：ZIP 打包／解包、文件夹上传与拖拽解压、可见的保存按钮、本地目录 tar.gz 下载、进度重试与英文界面。
+- **session-migrate 0.5.0**：会话导出，以及上传 JSONL 导入。
+- **image-toolkit 0.2.6**：预置 FLUX.2 全系模型并写明生图路线。
+- **内置浏览器增强**：自定义新标签页与主题覆盖（`browser_design`）；凭据保险库把密码与 TOTP 合并到同一入口，密码列表不再下发明文；标签显示站点图标。
+- **设置·系统提示词页**：开关式拼装 + 提示词模板库，模板复用预设通道保存与套用。
+- **未登录页原生表单登录**：口令表单直接 POST，不再靠 JS 拼 `?token=`；另加 macOS 系统截图与截图按钮位次调整。
+- **phone 工具分级**：操控档改为逐操作审批，读屏档直接放行。
+- **发版工具链**：`release:npm` 带 OTP 发布并对 staged 发布自愈，`release:check` 把「发版别忘手机包」变成一条能自检的命令。
+
+### Fixed
+
+- **桌面输入与资源**：补齐数字小键盘输入、桌面主题与设备标签；断线、返回预览及切屏时释放旧输入和采集资源；P2P 抖动不再把画面卡成定格，改为按累计反馈控速。
+- **远程会话**：修复远程历史会话持续加载及跨项目会话列表读取，增加超时、重试和按项目分页。
+- **安全**：渠道白名单为空改为默认拒绝（需显式 `allowAllSenders`）；出站 webhook 堵住 SSRF 的确定性缺口与等价变形；lx-music 封死 User API 脚本 VM 的宿主 realm 逃逸；自定义新标签页禁用凭据桥。
+- **长跑稳定性**：qq 单实例锁改为「删后重申领」并重读陈旧锁；hub-upgrade 探活成功后不再回滚；投递 pump 加重入守卫、反复 stall 进死信；job 日志流统一走守卫，堵住 `ERR_STREAM_WRITE_AFTER_END`；执行者 probe 加超时；账本 in/out 同 key 命名空间隔离，事件截断不再造幽灵记录。
+- **会话与客户端状态**：`new_chat` 带目标 `cwd`，杜绝切项目新建对话落到旧项目；非 win32 的盘符路径也归一尾斜杠；左栏拖拽插入指示线锚定分割线；扩展加载失败占位不再中英混排。
+- **插件**：修正 #896 收编转义副本时写错的导入路径（导致 4 个插件加载失败），并同步递增内置插件版本。
+
+### Changed
+
+- **协议**：`PROTOCOL_VERSION` 由 55 升至 57（`new_chat.cwd` 必填、`save_preset` 增 `groups`）；下线 `plugin_api_catalog` 死链并为 `getLegacyMarkersGlobalOff` 补 sunset。
+- **代码卫生**：原子写与转义副本收编到单源，防回潮守卫补箭头函数、`fs/promises` 与非 client 路径形态。
+
+<!-- auto-i18n:start -->
+
+### i18n
+
+- 前端新增 key（132）：`scmStageAll`、`scmStageAllTip`、`scmUnstageAll`、`scmUnstageAllTip`、`scmDiscardTip`、`scmDiscardConfirm`、`scmDiscardUntrackedTip`、`scmDiscardUntrackedConfirm`、`scmDiffInline`、`scmDiffSideBySide`、`scmDiffInlineTip`、`scmDiffSideBySideTip`、`scmDiffLineNumbers`、`scmDiffPrev`、`scmDiffNext`、`scmDiffPrevTip`、`scmDiffNextTip`、`scmDiffHunks`、`scmStash`、`scmStashList`、`scmStashListTip`、`scmStashSave`、`scmStashSaveTip`、`scmStashUntracked`、`scmStashUntrackedTip`、`scmStashMsgPrompt`、`scmStashScopeUntracked`、`scmStashSaveConfirm`、`scmStashRefLabel`、`scmStashRefPrompt`、`scmStashRefPlaceholder`、`scmStashPop`、`scmStashPopTip`、`scmStashPopConfirm`、`scmStashApply`、`scmStashApplyTip`、`scmStashApplyConfirm`、`scmStashDrop`、`scmStashDropTip`、`scmStashDropConfirm`、`scmStashEmpty`、`scmStashLoading`、`scmAmend`、`scmAmendTip`、`scmAmendConfirmNoMsg`、`scmAmendConfirmWithMsg`、`scmBranchNew`、`scmBranchNewTip`、`scmBranchNewPrompt`、`scmBranchInvalid`、`scmBranchCreateConfirm`、`scmBranchDelete`、`scmBranchDeleteTip`、`scmBranchDeleteConfirm`、`scmBranchForceDelete`、`scmBranchForceDeleteTip`、`scmBranchForceDeleteConfirm1`、`scmBranchForceDeleteConfirm2`、`scmBranchRename`、`scmBranchRenameTip`、`scmBranchRenamePrompt`、`scmBranchRenameConfirm`、`scmBranchDeleteCurrent`、`scmBranchNoSelection`、`scmBlame`、`scmBlameTip`、`scmBlameLoading`、`scmBlameEmpty`、`scmBlameFail`、`scmBlameHide`、`scmBlameShow`、`promptAssemblyLabel`、`promptAssemblyHint`、`promptAssemblyOff`、`promptAssemblyAddHint`、`promptAssemblyLegacyWarn`、`promptMoveUp`、`promptMoveDown`、`promptTemplateLibLabel`、`promptTemplateLibHint`、`promptTemplateSaveNamePh`、`promptTemplateSaveBtn`、`promptTemplateActive`、`promptTemplateApply`、`promptTemplateEmpty`、`promptTemplateMetaOv`、`promptTemplateMetaOff`、`browserDesignEnabledDesc`、`browserDesignOffHint`、`sessionsLoadFailed`、`desktop.title`、`desktop.choose`、`desktop.expand`、`desktop.collapse`、`desktop.close`、`desktop.operating`、`desktop.back`、`desktop.resize`、`desktop.preview`、`desktop.open`、`desktop.lan`、`desktop.hub`、`desktop.connecting`、`desktop.paused`、`desktop.updated`、`desktop.waiting`、`desktop.previewUnavailable`、`desktop.retry`、`desktop.window`、`desktop.tab`、`desktop.exitFullscreen`、`desktop.fullscreen`、`desktop.p2p`、`desktop.devicesUnavailable`、`desktop.noDevices`、`desktop.currentDevice`、`desktop.showCurrent`、`desktop.currentConnection`、`desktop.groupTitle`、`desktop.groupAll`、`desktop.groupMembers`、`desktop.groupNoDevice`、`desktop.groupSelect`、`desktop.groupOpen`、`desktop.clipboard`、`desktop.clipboardOff`、`desktop.clipboardSend`、`desktop.clipboardReceive`、`desktop.clipboardBoth`、`desktop.clipboardReady`、`desktop.clipboardHint`、`desktop.clipboardLocal`
+- 前端删除 key（2）：`promptTemplateLabel`、`promptInsertTokens`
+- 前端中文变更（2）：`screenshotUnavailable`、`phoneEnabledDesc`
+- 前端英文变更（2）：`screenshotUnavailable`、`phoneEnabledDesc`
+
+<!-- auto-i18n:end -->
+
 ## [0.120.0] — 2026-11-12
 
 ### Added
@@ -77,6 +122,7 @@
 - **CI 单测并行**：单测按 shard 拆并行跑，浏览器型用例的启动预算收口到单一常量（4 vCPU runner 上不再随机撞线）。
 
 <!-- auto-i18n:start -->
+
 ### i18n
 
 - 前端新增 key（62）：`currentModelLabel`、`currentModelBadge`、`currentModelHint`、`bgTaskJobKind`、`bgTaskStopping`、`openLocalProject`、`openRemoteProject`、`filesFilterPlaceholder`、`settingsSaveSaving`、`settingsSaveSaved`、`settingsSaveFailed`、`phoneEnabledDesc`、`phoneOffHint`、`projectClickSwitch`、`projectClickSwitchDesc`、`projectOrderManual`、`projectOrderManualDesc`、`toolInspectorOutputStats`、`toolInspectorThinkingStatusRunning`、`toolInspectorThinkingStatusDone`、`toolInspectorThinkingFooterRunning`、`toolInspectorThinkingFooterLines`、`toolTimeRange`、`toolTimeRunning`、`tplStepIdentity`、`tplStepIdentitySub`、`tplStepBehavior`、`tplStepBehaviorSub`、`tplStepCapability`、`tplStepCapabilitySub`、`tplStepReview`、`tplStepReviewSub`、`tplIdentityHint`、`tplNameRequired`、`tplAdvanced`、`tplEnIntro`、`tplEnPrompt`、`tplEnFilled`、`tplEnEmpty`、`tplSearchWhitelist`、`tplNoMatch`、`tplLimited`、`tplFollowSession`、`tplSumName`、`tplSumIntro`、`tplSumMode`、`tplSumModel`、`tplSumThinking`、`tplSumSkills`、`tplSumExtensions`、`tplSpawnTitle`、`tplSpawnNote`、`tplStateOn`、`tplStateOff`、`bgTaskRestart`、`bgTaskStart`、`bgTaskRunning`、`bgTaskQuickStart`、`subagentVerdictUnverified`、`subagentVerdictPartial`、`subagentVerdictBlocked`、`subagentVerdictHint`
@@ -86,6 +132,7 @@
 - 服务端新增 key（29）：`agent.subagent.budget.reached`、`agent.subagent.resume.title`、`bash.bgTimeout`、`bash.bgNoTimeout`、`bash.bgStarted`、`subagents.notify.evidence`、`subagents.spawn.task.missing.prompt`、`subagents.spawn.task.bad.key`、`subagents.complete.evidence.invalid`、`subagents.complete.rejected`、`subagents.complete.recorded`、`subagents.spawn.batch.too.many`、`subagents.spawn.batch.duplicate.key`、`subagents.spawn.batch.rejected`、`subagents.spawn.batch.started`、`subagents.spawn.batch.wait.hint`、`subagents.get.evidence`、`subagents.resume.missing.runId`、`subagents.resume.failed`、`subagents.resume.transcript`、`subagents.resume.no.transcript`、`subagents.resume.ok`、`subagents.steer.queued`、`subagents.steer.restarted`、`subagents.steer.missed`、`subagents.steer.delivered`、`subagents.list.ledger.resumed`、`subagents.list.ledger.item`、`subagents.list.ledger.head`
 - 服务端文案变更（29）：`agent.subagent.limit.reached`、`delegate.validate.agent`、`delegate.validate.short`、`delegate.started`、`subagents.notify.footer`、`subagents.spawn.template.unavailable`、`subagents.spawn.thinking.invalid`、`subagents.spawn.isolation.invalid`、`subagents.action.missing`、`subagents.spawn.missing.prompt`、`subagents.spawn.started`、`subagents.get.missing.runId`、`subagents.get.done`、`subagents.steer.missing.runId`、`subagents.steer.missing.message`、`subagents.steer.not.found`、`subagents.steer.injected`、`subagents.list.empty`、`subagents.stop.missing.runId`、`subagents.stop.not.found`、`subagents.templates.list`、`subagents.handoff.missing.toRunId`、`subagents.handoff.missing.payload`、`subagents.handoff.not.found`、`subagents.dismiss.missing.target`、`subagents.dismiss.running`、`subagents.dismiss.success.single`、`subagents.dismiss.success.batch`、`subagents.wait.pending`
 - 服务端删除 key（1）：`prompt.tools.lazy`
+
 <!-- auto-i18n:end -->
 
 ## [0.119.0] — 2026-11-08
@@ -2436,7 +2483,8 @@ when?, children?}`，也收 `topbar` / `settings` 这类简写别名）；宿主
 [0.90.1]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.90.1
 [0.90.0]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.90.0
 [0.89.0]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.89.0
-[Unreleased]: https://github.com/xing-shuyin/pi-web-ui/compare/v0.119.0...main
+[Unreleased]: https://github.com/xing-shuyin/pi-web-ui/compare/v0.121.0...main
+[0.121.0]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.121.0
 [0.120.0]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.120.0
 [0.119.0]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.119.0
 [0.118.0]: https://github.com/xing-shuyin/pi-web-ui/releases/tag/v0.118.0

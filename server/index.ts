@@ -17,6 +17,9 @@
  *   PI_CODING_AGENT_DIR  pi config dir (auth/models/skills) — passed to the SDK
  */
 import { botExecutionMessageAllowed } from "./device-center/bot-execution.js";
+import { createBotDraftStore, normalizeBotDraft } from "./device-center/bot-drafts.js";
+import { setAgentBotHost } from "./device-center/bot-creation-tool.js";
+import { startBotMemoryMaintenance } from "./device-center/bot-memory-scheduler.js";
 import { ALL_AGENT_TOOL_ENTRIES, effectiveDisabledAgentTools, isToolSupportedOnPlatform } from "./tool-manager.js";
 import "./patch-remote-catalog.js";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
@@ -101,6 +104,7 @@ import { createLocalBotRegistry } from "./device-center/bots.js";
 import { setDeviceCollabService } from "./device-center/collab-tool.js";
 import { createDeviceDesktop } from "./device-center/desktop.js";
 import { createDeviceLanAccess } from "./device-center/device-lan-access.js";
+import { isSelfAuthenticatedWebhook } from "./device-center/hub-webhooks.js";
 
 import { createHostMetricsSampler } from "./host-metrics.js";
 import { SchedulerStore } from "./scheduler-tasks.js";
@@ -108,6 +112,7 @@ import { BackgroundExecutorRegistry } from "./background-executors.js";
 import { initHttpProxy } from "./http-proxy.js";
 import { globalLspPool } from "./lsp-tool.js";
 import { buildPiWebTokenCookie, decodeCookieToken, isTlsRequest } from "./auth-cookie.js";
+import { AUTH_ERROR_PARAM, AUTH_LOGIN_PATH, loginFailureLocation, sanitizeNextPath } from "./auth-login.js";
 import { isLoopbackAddress, loadServerFileConfig, saveServerFileConfig, tokenWarning } from "./server-config.js";
 import { renderSetupHtml } from "./setup-page.js";
 import { renderUnauthorizedHtml } from "./unauthorized-page.js";
@@ -490,6 +495,21 @@ app.use((req, res, next) => {
 	pluginMgr.handleHttp("superagent", "POST", `/webhooks/${provider}`, req, res);
 });
 
+// 口令登录表单：原生 POST → 303 → GET，浏览器密码管理器才愿意询问「是否保存密码」
+// （JS preventDefault + `?token=` 跳转不满足条件）。安全约束见 server/auth-login.ts。
+// 必须注册在下面的鉴权中间件之前。
+app.post(AUTH_LOGIN_PATH, express.urlencoded({ extended: false, limit: "8kb" }), (req, res) => {
+	const body = (req.body ?? {}) as Record<string, unknown>;
+	const submitted = typeof body.token === "string" ? body.token.trim() : "";
+	const next = sanitizeNextPath(body.next);
+	if (AUTH_TOKEN && submitted && sameSecret(submitted)) {
+		res.setHeader("Set-Cookie", buildPiWebTokenCookie(encodeURIComponent(AUTH_TOKEN), 31536000, isTlsRequest(req)));
+		res.redirect(303, next);
+		return;
+	}
+	res.redirect(303, loginFailureLocation(next));
+});
+
 app.use((req, res, next) => {
 	const preview = livePreviewCapability(req);
 	if (preview) {
@@ -510,7 +530,10 @@ app.use((req, res, next) => {
 	} else if (cookie) {
 		res.setHeader("Set-Cookie", [buildPiWebTokenCookie("", 0, false), buildPiWebTokenCookie("", 0, true)]);
 	}
-	if (req.path === "/api/health" || ok) {
+	// 入站 webhook 自带 token（Hub 侧严格比对，见 hub-webhooks 的 incomingWebhookToken）：
+	// 外部平台不可能持有本机口令，只能靠 webhook token 证明身份。只放行这一条精确路径，
+	// 不放宽到整个 /api/rooms —— 否则修"公网回调恒 401"会以相反方向变成越权。
+	if (req.path === "/api/health" || ok || isSelfAuthenticatedWebhook(req)) {
 		next();
 		return;
 	}
@@ -520,7 +543,15 @@ app.use((req, res, next) => {
 		res.status(401);
 		res.setHeader("Content-Type", "text/html; charset=utf-8");
 		res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
-		res.send(renderUnauthorizedHtml({ isLoopback, isStaleCookie: Boolean(cookie), port: PORT }));
+		res.send(
+			renderUnauthorizedHtml({
+				isLoopback,
+				isStaleCookie: Boolean(cookie),
+				port: PORT,
+				authFailed: req.query?.[AUTH_ERROR_PARAM] !== undefined,
+				nextPath: sanitizeNextPath(req.originalUrl ?? "/"),
+			}),
+		);
 		return;
 	}
 	res
@@ -971,10 +1002,12 @@ app.get("/plugins-shared/*splat", (req, res) => {
 const RESTART_CHILD_ENV = "PI_WEB_RESTART_CHILD";
 const deviceDesktop = createDeviceDesktop({ app, dataDir: DATA_DIR, authorize: (req) => !AUTH_TOKEN || tokenOk(req) });
 const deviceBots = await createLocalBotRegistry(DATA_DIR);
+const deviceBotDrafts = createBotDraftStore(DATA_DIR);
 const deviceCenter = await installLocalDeviceCenter({
 	app,
 	dataDir: DATA_DIR,
 	bots: deviceBots,
+	botDrafts: deviceBotDrafts,
 	allowHosts: ALLOW_HOSTS,
 	lanAccess: deviceLanAccess,
 	botCatalog: {
@@ -1059,6 +1092,24 @@ const deviceCenter = await installLocalDeviceCenter({
 			},
 		};
 	},
+});
+
+// Bot 记忆的日常维护：24h 一轮，定时器按 ≤6h 分片（红线），进程退出不阻塞。
+const botMemoryMaintenance = startBotMemoryMaintenance({
+	dataDir: DATA_DIR,
+	bots: deviceBots,
+	onError: (botId, error) => console.warn(`[agent-bot] memory maintenance failed for ${botId}`, error),
+});
+void botMemoryMaintenance;
+
+// 一句话创建：模型只能写草案，落库由人在界面确认（见 bot-drafts.ts 的批准语义）。
+setAgentBotHost({
+	draft: async (input) => {
+		const allowed = new Set(ALL_AGENT_TOOL_ENTRIES.map((tool) => tool.name));
+		return deviceBotDrafts.create(normalizeBotDraft(input, allowed, "model"), "model");
+	},
+	list: () => deviceBotDrafts.list(),
+	cancel: (id) => deviceBotDrafts.discard(id),
 });
 const webDist = join(pkgRoot, "web", "dist");
 function webDistPath(): string {
@@ -1554,6 +1605,7 @@ export interface DispatchSession {
 	setDefaultAgentPreset?(preset: string): Promise<void>;
 	setPermissionPreset?(preset: string): Promise<void>;
 	setDefaultPermissionPreset?(preset: string): Promise<void>;
+	setClaudePermissionMode?(mode: string): Promise<void>;
 	answerQuestion?(
 		id: string,
 		answers: { id: string; selected: string[]; custom?: string }[],
@@ -1581,7 +1633,7 @@ export interface DispatchSession {
 	updatePlan?(steps: import("./protocol.js").PlanStep[], activeStepId?: string | null, conversationId?: string): void;
 	setPlanMode?(enabled: boolean, conversationId?: string): Promise<void>;
 	setDelegateMode?(enabled: boolean, conversationId?: string): Promise<void>;
-	savePreset(name: string): Promise<void>;
+	savePreset(name: string, groups?: readonly string[]): Promise<void>;
 	applyPreset(name: string): Promise<void>;
 	deletePreset(name: string): Promise<void>;
 	saveMcpServer?(

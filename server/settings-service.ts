@@ -40,6 +40,7 @@ import {
 	type PromptMode,
 } from "./client-state.js";
 import { normalizeAutoCompactionInstructions, normalizeSoftCapByModel, normalizeSoftCapTokens } from "./soft-cap.js";
+import { narrowPresetToGroups } from "./preset-fields.js";
 import { findVisionModels, SYSTEM_PROMPT } from "./vision-bridge.js";
 import { COMMITMSG_SYSTEM_PROMPT } from "./scm-commitmsg.js";
 import { PLAN_MODE_SYSTEM_PROMPT } from "./plan-mode.js";
@@ -546,7 +547,7 @@ export class SettingsService {
 				toolImagesEnabled: this.settings.toolImagesEnabled ?? true,
 				keepRecentMessages: normalizeKeepRecentMessages(this.settings.keepRecentMessages),
 				reversePagination: this.settings.reversePagination ?? false,
-				showForkedParentSessions: this.settings.showForkedParentSessions ?? false,
+				showForkedParentSessions: this.settings.showForkedParentSessions ?? true,
 				retainFinishedConversations: this.settings.retainFinishedConversations ?? false,
 				openRecentSessionOnProjectSwitch: this.settings.openRecentSessionOnProjectSwitch ?? true,
 				chatUploadMaxMb: this.settings.chatUploadMaxMb ?? 20,
@@ -890,7 +891,7 @@ export class SettingsService {
 		let sessionsFilterChanged = false;
 		if (partial.showForkedParentSessions !== undefined) {
 			const nextVal = Boolean(partial.showForkedParentSessions);
-			if (nextVal !== (next.showForkedParentSessions ?? false)) {
+			if (nextVal !== (next.showForkedParentSessions ?? true)) {
 				sessionsFilterChanged = true;
 			}
 			next.showForkedParentSessions = nextVal;
@@ -1035,7 +1036,7 @@ export class SettingsService {
 		if (needsReload) await this.applyRuntime();
 	}
 
-	async savePreset(name: string): Promise<void> {
+	async savePreset(name: string, groups?: readonly string[]): Promise<void> {
 		const n = name.trim();
 		if (!n) {
 			this.host.emit({
@@ -1047,7 +1048,7 @@ export class SettingsService {
 			return;
 		}
 		this.presets = this.host.stateStore.getPresets(this.host.clientId);
-		const preset = this.snapshotPreset(n);
+		const preset = narrowPresetToGroups(this.snapshotPreset(n), groups) as unknown as SettingsPreset;
 		const existing = this.presets.findIndex((p) => p.name === n);
 		if (existing >= 0) this.presets[existing] = preset;
 		else this.presets.push(preset);
@@ -1087,7 +1088,7 @@ export class SettingsService {
 		delete patch.name;
 		delete patch.plugins;
 		for (const k of Object.keys(patch)) if (patch[k] === undefined) delete patch[k];
-		const prevShowForked = this.settings.showForkedParentSessions ?? false;
+		const prevShowForked = this.settings.showForkedParentSessions ?? true;
 		this.commitSettings({
 			...patch,
 			...(hasToolSettings
@@ -1110,7 +1111,7 @@ export class SettingsService {
 			this.host.applyToolGating();
 		}
 		this.push();
-		if ((this.settings.showForkedParentSessions ?? false) !== prevShowForked) {
+		if ((this.settings.showForkedParentSessions ?? true) !== prevShowForked) {
 			this.host.onSessionsFilterChanged?.();
 		}
 		await this.applyRuntime(true, runtimeTarget);

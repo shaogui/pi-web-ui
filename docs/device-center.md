@@ -1,3 +1,5 @@
+[English](./device-center.en.md) · **简体中文** · [繁體中文](./device-center.zh-TW.md)
+
 # 设备中心与跨平台协作（内测）
 
 手机原生客户端可使用 Hub 账号列出、连接和切换多台设备，集中接收设备通知；native 登录、capability、中继边界和构建验收见 [`mobile.md`](mobile.md)。
@@ -37,6 +39,19 @@
 
 本机用户操作与 AI 接力使用不同权限：新配对时分别生成设备执行凭据和本机交互凭据，后者仅由本机受限 HTTP 接口持有，不下发浏览器或模型。本机人类可发起新的任务链，AI 凭据仍需可信父任务；旧绑定缺少交互凭据时需重新配对。删除群组或移除成员遇到相关未结束任务时拒绝，避免丢失执行归属。
 
+## 左上角设备浮层（桌面浮层 / 手机抽屉）
+
+顶栏左上角品牌按钮（`BrandDeviceMenu`）在有外部绑定时变成设备入口：桌面是贴着按钮的浮层，窄屏或粗指针（`(max-width: 640px), (pointer: coarse)`）换成从底部升起的抽屉。两处共用同一份内容体 `DevicePanel`，只换容器与尺寸令牌。
+
+- **一行一台设备 = 一个可点区域**：整行点击直接打开该设备（最高频动作，0 层菜单）；行尾常显 `远程桌面` 与 `⋯` 两个动作，`⋯` 只放低频（设置备注 / 复制设备 ID）。远程桌面是第二高频动作，不进菜单——否则就多一次点击。打开任一设备后浮层/抽屉立即收起。
+- **本机行只做标识**：不渲染整行链接、不渲染 `远程桌面`（打开自己是重复窗口，远程控制自己没有意义），只留「本机」标签和 `⋯`（备注 / 复制 ID）。
+- **尺寸**：桌面浮层 264px 宽、行 30px、图标 24px；触控布局行 56px、触控块 44×44（两块之间 1px 分隔线，读作「分体按钮」）、行内显示设备 ID 次行、隐去 chevron。
+- **备注**：桌面在行内就地编辑（`Enter` 保存、`Esc` 取消、行高不变）；手机是「长按整行」或 `⋯ → 设置备注` 打开抽屉底部编辑条（`保存` 一次点完）。
+- **手势**：抽屉在列表滚到顶部时下拉刷新（0 次点击）、从顶部抓手条下滑关闭、点遮罩关闭；键盘 `Esc` 关闭。触控反馈走 `:active`，不依赖 `:hover`。
+- **浮层契约**：`⋯` 菜单 portal 到 `body` + `fixed`（否则被 `.dp-scroll` / 浮层的 `overflow` 截断），层级走 `useOverlayZIndex()`；抽屉容器用叠栈层号，`max-height: 62dvh` + `overscroll-behavior: contain` + `env(safe-area-inset-bottom)`。
+- **断点单源**：`web/src/use-coarse-pointer.ts` 的 `COARSE_POINTER_QUERY` 与 `styles.css` 里 `.dp-*` 的媒体查询必须同时改，否则组件与样式会各走一套布局。
+- **事实源**：`web/src/components/DeviceDirectory.tsx`（取数 / 备注写回 / 页面版卡片） · `web/src/components/DevicePanel.tsx`★（浮层与抽屉的内容体） · `web/src/components/BrandDeviceMenu.tsx`（浮层 / 抽屉容器） · `web/src/use-coarse-pointer.ts` · `web/src/styles.css`（`.dp-*`）。单测：`tests/unit/device-panel.test.ts`、`tests/unit/brand-device-menu.test.ts`。
+
 ## 部署中心
 
 已安装 npm 包可直接管理服务；源码目录需要先构建服务端：
@@ -59,6 +74,22 @@ pi-web-ui hub uninstall
 `install` 保存配置并启动，`start/stop/restart/status/uninstall` 使用已保存的配置；`restart --allow-registration=false` 仅变更注册设置并保留其他配置。`uninstall` 移除自启动配置，保留账号、设备和群组数据。安装拒绝覆盖已有或无法确认归属的服务；端口占用、权限不足、健康检查失败会明确报错。安装中断后先运行 `status --json` 检查，再用 `start` 或 `restart` 恢复；不要删除数据目录来重试。
 
 Linux 使用 `systemd --user`，macOS 使用 launchd 用户服务，Windows 使用登录计划任务。原生服务管理器不可用或权限不足时，安装会报告失败；Linux 在无人登录时开机启动需管理员为该用户启用 linger。CLI 配置中的锁只有在确认持有进程已退出时才回收，未知或仍存活的持有者不会被覆盖。
+
+### 公网 HTTPS 自动部署
+
+Linux 公网安装默认配置可信 HTTPS。将下面的地址换成自己的公网 IPv4 或已解析到服务器的域名即可；不依赖某台电脑、固定 IP 或其他应用的配置：
+
+```sh
+pi-web-ui hub install --public-url https://YOUR_PUBLIC_IP_OR_DOMAIN --allow-registration
+```
+
+Debian/Ubuntu 自动准备 Certbot（至少 5.4），为公网 IPv4 申请 Let's Encrypt 短期证书，为域名申请域名证书，安装 Node HTTPS/WebSocket 网关和每六小时检查一次的续期计时器。已有匹配的 Certbot 证书会复用，其原有续期钩子保持不变；网关自动加载更新后的证书。管理员权限仅用于证书、80/443 端口和 systemd 系统服务；Hub 仍使用原来的用户服务和数据目录。其他 Linux 发行版需事先安装 Certbot 5.4+；自动 IPv6 证书部署暂不支持。
+
+公网 TCP 80（证书验证）和 443（HTTPS）须在云安全组及防火墙放行。自动安装器不会抢占其他应用的端口：若 80/443 已被占用且没有可复用证书，应使用现有反向代理并传 `--https=external`；局域网 HTTP 或调试部署可传 `--https=off`。HTTP 的 `--public-url` 在自动部署成功后会转为同一主机的默认 HTTPS 地址，内部 Hub 端口仍是 8790。HTTPS 校验失败会恢复原 Hub 配置，命令不会报告安装成功。
+
+已有 Hub 更新到支持 HTTPS 的版本后，运行一次 `pi-web-ui hub https`。可用 `--public-url https://YOUR_DOMAIN` 指定新地址。原有 HTTP 地址仅保留已认证设备连接，浏览器入口跳转 HTTPS；已有账号、群组和设备绑定保留。设备稍后可改用 HTTPS Hub 地址，全部迁移后可关闭旧 HTTP 端口。`PI_DEVICE_HUB_LEGACY_ORIGINS` 是这一兼容白名单（最多八个 HTTP origin），不会放宽浏览器管理接口的 Origin 校验。`PI_DEVICE_HUB_HTTPS=off|external` 与对应安装参数同义。
+
+HTTPS 提供浏览器 WebCodecs、剪贴板等安全上下文；P2P 能否建立仍取决于双方版本及 NAT/防火墙。HTTPS 本身不会让中继自动变成直连。仅卸载 Hub 用户服务不会删除共享证书或 HTTPS 系统服务；停用整个部署时应同时停用对应的 `pi-device-hub[-名称]-https.service` 和续期计时器。
 
 不带子命令的 `pi-web-ui hub` 保留前台运行方式，可配置以下环境变量；源码目录也可以运行 `node bin/pi-device-hub.mjs`。
 
@@ -202,15 +233,9 @@ Hub 等待绑定当前设备 WS 的 executor ACK 才移除交互；拒绝或 5 �
 
 ## 交付验证与集成流水线
 
-提交交付沿用先审查再准备的流程；产物交付可先准备并真实验证，之后再独立验收。人类选择目标 Bot 与分支，查看隔离工作树中的差异或冲突。产物方式核对仓库、基线、补丁和 outputTree 后物化真实提交，当前要求目标 HEAD 等于产物基线，防止验证与交付对象不一致。Hub 负责授权和持久协调，Git 在目标设备受控 RPC 执行；记录绑定准确交付、契约、有效审查、Bot revision、目标基线及操作代次。
+提交交付沿用「先审查再准备」：产物可先准备并真实验证，之后再独立验收；`completed` 不代表验收通过。人类选择目标 Bot 与分支、查看隔离工作树差异，验证命令由账号所有者首次明确提交并冻结，最终确认必须已有真实成功凭证，且目标分支在所有工作树中均未检出。发布前 Hub 先持久保存 `publishIntent`，设备发布日志在 CAS 前落盘、成功回执在清理会话前保存；启动与重连只回查，不自动重发 CAS。
 
-验证命令由已鉴权的账户所有者首次明确提交并冻结成计划；Bot 身份不能在代理入口丢失，也不能自行创建或修改授权计划。真实运行结果逐条核对命令、退出码、输出摘要及执行前后树，Hub 按白名单事实计算不可变凭证；成功后更换计划或重验需新建 Integration。目标 Bot 的命令权限和根占用仍生效，隔离工作树不等同操作系统安全沙盒。
-
-最终确认必须已有真实成功验证凭证，再核对交付、审查、契约版本、目标 SHA 和工作树完整性；prepared / failed 或旧记录中的单独 verified 标志不能直接发布。为避免覆盖正在编辑的文件，目标分支必须在所有工作树中均未检出，否则明确拒绝并提示先切离；实际更新只使用比较旧 SHA 的原子分支更新，不执行 hard reset、不自动推送。取消与确认不能互相覆盖终态；清理失败记录待清理，不伪装未应用。自定义 Git merge/filter 驱动与 hooks 受到限制，工作树会话的私有路径不下发浏览器。
-
-确认前，Hub 先持久保存绑定交付、Review、验证凭证、原设备 / Bot 身份、目标 ref 与旧 SHA 的 `publishIntent`；固定 commit 内容产生唯一候选 SHA。设备独立发布日志在 CAS 前落盘，成功回执在清理会话前保存，候选保留 ref 与回执均不随临时工作树删除。日志损坏、容量不足或写入失败在新的 CAS 前关闭准入。历史发布回执与当前分支观察分开显示，发布后的权限变更或分支移动不会抹去已观察到的效果。
-
-启动与重连只回查日志、原仓库身份和目标 ref，不自动重发 CAS；已有意图的重复确认也只返回当前记录。界面提供手动回查，只有账号所有者可在设备明确证明 CAS 未开始或已拒绝且停止后，按同一意图恢复；Bot 不能自批恢复。已开始但无回执的 CAS 保持未知，即使目标重新等于旧 SHA，也不能据此安全重试。取消持久封闭迟到写入，但未知的过去效果仍保持未知。旧记录不补造发布凭证。文件原子保存和刷新覆盖进程崩溃恢复，Windows 目录元数据与 Git 对象在突然掉电后的完整事务持久性不作保证。详见 [`device-collaboration.md`](device-collaboration.md#23-发布意图与崩溃后回查)。
+**完整硬约束以 [`device-collaboration.md`](device-collaboration.md) 的 §2.1～§2.3 与 §8 为唯一事实源**（WAL 事务、契约 / Manifest、凭证白名单、CAS 回查、隔离工作树边界、交付 ≠ 验收），特别是 [`§2.3 发布意图与崩溃后回查`](device-collaboration.md#23-发布意图与崩溃后回查)。本文只保留本机落盘布局、容量 / 预算上限与兼容边界这类操作细节。历史遗留的机制描述（任务执行与恢复、交付与审查等节）尚未完全迁出，属已知文案债：**机制变更只改 `device-collaboration.md`，不要在这里补定义**（债项登记见 [`agent-bot-design.md`](agent-bot-design.md#15-实现状态首批落地)）。
 
 ## 大文件分块传输
 
@@ -248,7 +273,51 @@ Hub 等待绑定当前设备 WS 的 executor ACK 才移除交互；拒绝或 5 �
 
 浏览器打开的是本机 `/device-lan/<设备ID>/__open` 一次性票据包装页，远端内容仍处于不含 `allow-same-origin` 的沙箱，通过随机能力路径加载；复用 Hub 路径入口的 HTML 重写、CORS、CSP 和头部净化，支持本机反代路径前缀。授权到期按需续签，连接器断开或解除绑定时撤销相关通道和连接；取消单次授权只撤销该次密钥，不影响其他连接。浏览器独立标签页与 Electron 独立窗口也使用相同选择逻辑。
 
-没有可达私网地址、端口受阻或对端版本尚不支持时，自动使用原 Hub 票据。已打开页面断线后先重新协商局域网，仍不可达才申请新 Hub 票据并回退。直接在独立 Hub 页面打开的固定设备入口仍沿用 Hub 中继；局域网探测由已配对的本机 pi-web-ui 服务发起。事实源为 `server/device-center/device-lan.ts`（设备加密通道与并行探测）、`device-lan-access.ts`（本机隔离入口）和 `web/src/device-access.ts`（统一打开入口）。
+没有可达私网地址或端口受阻时，尝试下述 P2P；对端不支持或打洞失败时使用原 Hub 票据。已打开页面断线后先重新协商局域网，仍不可达则尝试 P2P，失败才申请新 Hub 票据并回退。以上 TLS 探测由已配对的本机服务发起；未安装本机服务的浏览器使用下述独立 WebRTC 通道。事实源为 `server/device-center/device-lan.ts`（设备加密通道与并行探测）、`device-lan-access.ts`（本机隔离入口）和 `web/src/device-access.ts`（统一打开入口）。
+
+## P2P 设备访问
+
+本机服务在局域网探测失败后，自动尝试设备间 WebRTC P2P，失败再使用 Hub 中继。群成员的「打开设备」和「远程桌面」共用该流程。这条原生路径要求两端运行 pi-web-ui；纯浏览器路径见下节。群组持久记录、排序、审批、任务租约与设备授权继续由 Hub 管理。
+
+Hub 通过已认证的 `device_lan` RPC 协商能力（兼容旧响应），通过 `device_p2p` RPC 定向转发有界 SDP。原生协商仍只接受现有人工设备凭据，验证账号与设备归属，不接受普通浏览器 Cookie。每次会话拥有独立 ICE/DTLS 身份与短期 TLS-PSK 授权；原生路径的 SDP、地址与 PSK 不返回浏览器。目标助手只连接本次授权的固定回环网关，不接收任意 TCP 目标。
+
+Go/Pion 助手通过 stdio 受 Node 管理，使用 UDP IPv4/IPv6 ICE、STUN 和可靠 DataChannel；一条 HTTP/TLS 或 WebSocket 连接对应一条数据通道。发送分块 16 KiB、单流高水位 256 KiB、SCTP 接收上限 1 MiB；没有假数据预热。每个助手最多 32 条活跃流和 32 条待建立流，Node 全局最多 16 个助手、每个目标连接器最多 8 个会话。总协商时限 25 秒，Hub 信令 10 秒，目标候选收集 8 秒，加密隧道验证 8 秒；各阶段仍受总时限及调用方取消约束。ICE connected 只表示底层连接，必须随后通过实际 DataChannel 上的 TLS-PSK 握手及 HTTP 健康请求才宣布 P2P 可用。队列达到高水位后等待排空，发送量仍在下降时继续等待，连续 30 秒没有进展才关闭该流；轮询同时覆盖低水位通知丢失的情况。UDP 使用系统分配的临时端口，避免狭窄固定端口段冲突。绑定代次改变、连接器断开、授权撤销、助手退出和关闭页面均清理相关连接。
+
+直连页继续使用 `/device-lan/` 隔离能力 URL，保留现有 CSP、路径白名单、Origin 和凭据净化。显示通路由实际完成连接的结果决定：`lan` / `p2p` / `hub`。包装页卸载时发送有能力校验、按页面代次区分的释放请求，保留 2 秒刷新宽限，重新加载不会误撤销新页面；恢复连接时申请新票据并报告新通路。未确认的上传、键鼠和任务命令不会由传输层自动重放。
+
+完整 npm P2P 包附带 Windows x64、macOS arm64/x64、Linux arm64/x64 助手及 SHA-256 清单，使用时校验；macOS/Linux 使用私有临时目录中的可执行副本，避免 Windows 制作的 npm 包丢失执行权限。用户无需安装 Go；不支持的平台、旧 Hub/设备、缺失助手或打洞失败均回退 Hub。源码构建的完整分发入口是 `npm run pack:p2p`，需要 Go ≥1.24；普通 Web 构建不强制安装 Go，也不保证包含助手。桌面安装包由 `.github/workflows/desktop-release.yml` 的三个平台 job 各自 `npm run build:device-p2p -- --host` 后再打包（`bin/` 在 electron-builder 白名单内），测试 `tests/unit/p2p-helper-release.test.ts` 守卫这条链路。源码目录直接 `npm start` 时必须先跑一次 `npm run build:device-p2p -- --host`，否则本机没有助手、P2P 永远退回 Hub，日志为 `helper-missing`。
+
+设备侧设置：`PI_DEVICE_P2P=0` 禁用；`PI_DEVICE_P2P_STUN` 为最多 4 个逗号分隔的 `stun:host:port`，默认 `stun:stun.l.google.com:19302,stun:stun.miwifi.com:3478,stun:stun.cloudflare.com:3478`，助手并行探测。默认值给多个服务器的原因：只写一个 STUN 时，该服务器被墙或黑洞（曾在国内网络实测 `stun.cloudflare.com:3478` 超时）就收集不到 srflx 候选，打洞必然失败且界面上只显示中继。打洞失败按阶段记录一行日志（`helper-missing` / `ice-config` / `gather-failed` / `signal-rejected` / `ice-failed` / `tunnel-failed` / `cancelled`），前缀 `[DeviceCenter] Device <id> P2P failed: <reason>; using Hub relay`；目标端不报能力时记录 `target reports no helper`。Hub 浏览器入口使用下述浏览器协商流程。可使用自建 coturn 的 STUN 服务；无法直连时走原 Hub。
+
+### 纯浏览器访问 Hub 的直连通道
+
+控制端无需安装 pi-web-ui、RustDesk 或浏览器扩展，只需浏览器登录 Hub；被控端运行带 P2P 助手的新版本。Hub 包装页用浏览器 `RTCPeerConnection` 与目标助手协商，ICE 在同局域网可选 host 通路、跨网可选打洞通路。**首屏不等协商**：包装页一打开就把 Hub 中转地址挂到子框架（约 2 秒出页面），直连在后台继续协商，连上后新请求自动走直连、页面长连接由应用自身重连切过去（会重开一次 WebSocket），协商失败或直连中断则保持/回到中转。顶部状态先显示「服务器中转（后台尝试直连…）」，切换后按实际选中的候选显示「局域网直连」「P2P 直连」「TURN 中转」或「服务器中转」，不会用 ICE connected 代替业务健康检查。浏览器的默认 STUN 为小米与 Cloudflare；设备助手继续使用设备端配置。选中 TURN 时仍是中转，不能称为直连。
+
+事实源：`browser-peer-client.ts`（包装页/沙箱内的 fetch、WebSocket 桥）、`browser-peer-gateway.ts`（设备端协议与额度）、`device-p2p.ts`（助手与授权生命周期）、`relay.ts`（能力路径信令）。Hub 先核验现有账号归属和随机能力路径，才允许 `__browser_p2p` 提交有界 SDP；信令只接受 Hub Origin 或具有有效能力路径的 opaque 子框架。浏览器只得到这次设备会话的短期网关密钥，不得到本机凭据或 TLS-PSK。目标固定转发至已有 PSK 授权网关，并复用管理路径禁令、头部净化和桌面输入限制。每次会话最长 30 分钟，设备断开/重绑、助手退出和页面关闭均回收；旧页面迟到的关闭请求不能撤销新连接。
+
+页面 HTML、脚本等静态资源仍由 Hub 加载；直连承担对话/桌面 WebSocket 与动态 fetch（包括文件分块上传下载）。群组授权、任务记录等 Hub 管理操作仍归 Hub。浏览器原生链接下载和未经过 fetch 的请求仍可走 Hub，不能声称所有流量都绕开服务器。远程会话内切换另一设备使用独立能力包装页，仍由当前控制浏览器连接目标设备，不借第一台设备充当控制端。
+
+连接失效后关闭在途通道并切回 Hub；失败的提交、文件分块或键鼠输入不自动重放，避免重复执行。应用原有重连负责重新建立 WebSocket。直连协商有 20 秒上限（超时只影响是否升级，不影响页面已经可用）；一次打开只协商一次，关闭直连后需重新打开设备入口才再次尝试直连。浏览器不支持 WebRTC、旧设备不认识信令、缺少助手、UDP/NAT 不允许直连时均保留中转。普通 HTTP Hub 可协商 DataChannel；剪贴板权限、WebCodecs 硬解码和本机目录授权依旧受浏览器安全上下文限制，使用 HTTPS 才能获得相应能力。
+
+更新 Hub 和被控端并重启实际服务，从 Hub 重新打开设备即可测试；控制端仅刷新浏览器。`node --import tsx tests/device-browser-p2p-test.mjs` 用真实 Chrome/Pion 验证直连 HTTP/WS、上传下载、取消、嵌套设备、权限和中转回退；加 `--insecure-origin` 使用实际私网 HTTP 地址，检查非安全上下文也能建立通道。这些测试不代表所有公网 NAT 组合或 120/240 Hz 桌面性能。
+
+### TURN 中继
+
+某些对称 NAT、CGNAT 或 UDP 受限的网络会导致直连失败。两端可配置 `PI_DEVICE_TURN`（最多三个地址）、`PI_DEVICE_TURN_USERNAME`、`PI_DEVICE_TURN_CREDENTIAL`，助手把 TURN 作为额外 ICE 服务器并分配 relay 候选；选定中继路径时流量经自建 coturn 转发。TURN 也不可用时仍回退 Hub。
+
+TURN 地址支持 `turn:host:3478?transport=udp`、`turn:host:3478?transport=tcp` 和 `turns:host:5349?transport=tcp`，Node 与原生助手采用一致的协议、IPv6、端口及凭据验证。`native/device-p2p/ice_tcp_test.go` 使用只监听 TCP 的真实本地 TURN 服务验证候选获取。
+
+运行 `pi-web-ui desktop diagnose --p2p` 可获得不含 SDP、IP、凭据的诊断：助手可用性、TURN 配置状态、host/srflx/relay 候选数量。它只验证本机候选收集，不代表对端可达；此命令不检测浏览器自身的 ICE 候选和连接。协商超时按 `gather-timeout`、`signal-timeout`、`ice-timeout`、`tunnel-timeout` 区分，只有调用方取消才报告 `cancelled`。
+
+新版目标可返回白名单故障码，如 `target-busy`、`target-helper-missing`、`target-unavailable`、`target-gather-timeout`；Hub RPC 失败区分 `signal-timeout` 与 `signal-failed`。不回传异常堆栈、凭据或任意错误文本。旧目标空响应仍记为 `signal-rejected`。`node --import tsx tests/device-p2p-latency-test.mjs` 在真实 DataChannel 与 TLS 握手间注入双向延迟，覆盖超过原 2 秒验证窗口的正常连接和错误密钥拒绝；运行前需构建本平台 P2P 助手。
+
+- 只有配置了 TURN 才允许 relay 候选：没配时助手看到 relay 对直接判定失败，避免流量莫名绕第三方。
+- 中继生效时日志写一行 `[DeviceCenter] Device <id> P2P is relayed through TURN`；界面通路仍显示 `p2p`（它确实不是 Hub 中继，只是经你自己的服务器转发）。
+- 只配地址不配凭据会直接报 `ice-config`，不会静默降级成"没有中继"。
+- 带宽：H.264 通道 1440p60 约 12 Mbps、1440p120 约 18 Mbps，coturn 只需按这个量级准备带宽与 UDP 端口段（`min-port`/`max-port`）；TURN over TLS（`turns:`）需要额外证书，且延迟更高，优先 `turn:` + UDP。
+- 部署示例见 [设备中心部署](device-center-deployment.md#turncoturn)。服务器只升级 Hub 就能承担信令，无需安装桌面环境。`PI_DEVICE_P2P_HELPER` 是受信任管理员/开发测试用的绝对路径覆盖，绕过随包校验；浏览器与 Hub 信令不能设置它。
+
+`node --import tsx tests/device-p2p-test.mjs` 使用临时数据目录、两份独立助手进程和实际 Hub RPC/本机访问 API，验证 LAN 不可达时选择 P2P、HTTP/桌面/聊天并发、密钥不进入浏览器、并发会话、回退和撤销。本机回环验证不代表跨网打洞或实际桌面帧率。完整实机验收仍需 Mac/Windows 不同网络、UDP 禁止、设备重连和平台权限检查。P2P 不解除桌面采集和编码的帧率限制。
 
 ## 浏览器远程桌面
 

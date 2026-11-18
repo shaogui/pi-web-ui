@@ -1,3 +1,5 @@
+[English](./group-orchestration.en.md) · **简体中文** · [繁體中文](./group-orchestration.zh-TW.md)
+
 # 群组独立 AI Router 与 Superagent
 
 群组 AI Router 负责理解消息、选择成员 Bot 和维护工单；Bot 负责在自己的设备、工作区和执行约束下完成任务。Superagent 0.1.3 是 GitHub / 飞书的内置渠道模块：验签、转换事件和回写原线程，模型推理、任务执行和持久调度均由宿主提供。
@@ -50,6 +52,8 @@ Router 只可使用独立配置中启用的工具：
 模型目录加载失败、设备离线、缺少运行设备 / 明确模型、模型不存在或推理失败均应显示或记录明确错误，不静默借用当前对话模型或切回主 Bot。运行设备离线时无法领取 / 推进 Router job；恢复连接后按持久队列和租约继续。配置页可刷新模型目录，失败记录用于定位后人工重试。禁用所需工具也会限制 Router 的实际能力，例如关闭 `dispatch` 后不能派发 Bot。
 
 ## 工单、事件和执行的关系
+
+> WAL / 事务 / 租约 / fence 的通用定义见 [`device-collaboration.md`](device-collaboration.md) §2 与 §7；本节只写工单与 Router 的四个集合。
 
 Hub 通过同一 WAL 事务体系持久化四个集合：
 
@@ -139,4 +143,4 @@ Superagent 随主程序内置，首次启动自动准备并加载，**无需额�
 - 本地 Hub 代理与 DTO 桥：`server/device-center/local.ts`；插件契约：`plugin-sdk/index.d.ts`；注册与公开入口：`server/plugins.ts`、`server/index.ts`。
 - UI：统一入口 `web/src/components/DeviceCenter.tsx`，渠道内嵌 `DeviceChannels.tsx`，群组管理 `DeviceGroupManager.tsx`；复用 `GroupRouterSettings.tsx`、`GroupWorkItems.tsx` 及聊天入口 `GroupWorkspaceActions.tsx`；渠道适配与配置：[Superagent README](../plugins/superagent/README.md)。
 
-对应单测包括 `group-router`、`group-router-runtime`、`group-router-worker`、`group-router-ui`、`work-items`、`hub-orchestration` 和 `superagent-plugin`。渠道测试注入 fetch、使用伪 host 触发真实插件路由，覆盖验签、授权、重放、租约与回写恢复；这些 mock 证据不能替代真实凭据、真实网络和渠道投递验证。本文仅补充文档，不声明本轮重新执行过上述全部测试。
+对应单测包括 `group-router`、`group-router-runtime`、`group-router-worker`、`group-router-ui`、`work-items`、`hub-orchestration` 和 `superagent-plugin`。渠道测试注入 fetch、使用伪 host 触发真实插件路由，覆盖验签、授权、重放、租约与回写恢复；这些 mock 证据不能替代真实凭据、真实网络和渠道投递验证。本文仅补充文档，不声明本轮重新执行过上述全部测试。真实凭据与公网回调的人工验收清单见 [`agent-bot-design.md`](agent-bot-design.md) 的「P2 验收基线（渠道）」。

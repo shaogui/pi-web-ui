@@ -1,3 +1,5 @@
+[English](./env-vars.en.md) · **简体中文** · [繁體中文](./env-vars.zh-TW.md)
+
 # 环境变量
 
 `PI_WEB_LOAD_TIMING=1` 可开启历史对话打开的服务端分段计时（默认关闭，也接受 `true` / `on` / `yes`）。服务端控制台输出 `[load-timing]` JSON，包含修复、SDK 打开、分支校准、预览、运行环境初始化、绑定和快照发送阶段的耗时，不含会话路径、ID 或正文。它不测量浏览器渲染及网络送达时间。详见 [加载性能说明](loading-performance.md)。
@@ -76,9 +78,11 @@
 
 ## 设备中心远程桌面
 
-| 变量                | 默认       | 作用                                                                                                                                      |
-| ------------------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `PI_DEVICE_DESKTOP` | 空（关闭） | `1` 强制启用本机原生远程桌面；未设置时读取 `<dataDir>/desktop-settings.json` 的启用偏好，默认关闭。本机关闭偏好不能覆盖环境变量强制启用。 |
+| 变量                      | 默认                                               | 作用                                                                                                                                      |
+| ------------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `PI_DEVICE_DESKTOP`       | 空（关闭）                                         | `1` 强制启用本机原生远程桌面；未设置时读取 `<dataDir>/desktop-settings.json` 的启用偏好，默认关闭。本机关闭偏好不能覆盖环境变量强制启用。 |
+| `PI_DESKTOP_SERVICE_AUTO` | 空（自动）                                         | Windows x64 全局安装与交互启动时自动安装/更新内置桌面组件；`0` 禁用自动安装。需要管理员授权，不改变远程访问开关。                         |
+| `PI_DESKTOP_FFMPEG`       | `bin/ffmpeg/<platform>-<arch>/ffmpeg(.exe)` → PATH | H.264 桌面通道使用的 ffmpeg 绝对路径；只接受绝对路径，用于开发调试或自备带 NVENC 的构建。缺失时自动退回 JPEG。                            |
 
 远程桌面参考 [krd](https://github.com/zzjcool/krd) 的原生捕获与键鼠注入方式，画面和输入复用既有 WebSocket 中继，无需 noVNC、VNC 服务或额外桌面端口。Windows 使用 GDI + SendInput；macOS 使用 Swift 原生助手，通过 ScreenCaptureKit `SCScreenshotManager` 捕获、CoreGraphics 注入输入，需要 macOS 14+、Swift CLI 和屏幕录制权限，控制时还需辅助功能权限；Linux X11 使用 ffmpeg + xdotool，仅查看时可不安装 xdotool。Wayland 暂不支持，后续需接入 Desktop Portal。只读权限由后端强制执行。
 
@@ -96,3 +100,17 @@
 可配：访问口令 token、监听地址 host、端口 port、Host 白名单、额外 Origin 白名单。
 落盘 `<dataDir>/server-config.json`，优先级：命令行旗标 > 环境变量 > 本文件 > 默认值。
 token 修改立即生效（含 WS）；host/port/白名单需 `pi-web-ui server restart` 后生效。
+
+## 设备间 P2P
+
+| 变量                        | 默认值                                                                                 | 用途                                                                                  |
+| --------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `PI_DEVICE_P2P`             | 启用可用助手                                                                           | `0` 禁用 P2P，保留 LAN 和 Hub 回退                                                    |
+| `PI_DEVICE_P2P_STUN`        | `stun:stun.l.google.com:19302,stun:stun.miwifi.com:3478,stun:stun.cloudflare.com:3478` | 最多四个逗号分隔的 STUN 地址，并行探测；可配置自建 coturn                             |
+| `PI_DEVICE_TURN`            | 空（关闭）                                                                             | 最多三个逗号分隔的 `turn:` / `turns:` 地址；两端都要配置。对称 NAT 下唯一能直连的办法 |
+| `PI_DEVICE_TURN_USERNAME`   | 空                                                                                     | TURN 长期凭据用户名；与 `PI_DEVICE_TURN_CREDENTIAL` 必须成对出现                      |
+| `PI_DEVICE_TURN_CREDENTIAL` | 空                                                                                     | TURN 凭据密码；配了地址但缺凭据会直接报配置错误，不会静默退回无中继                   |
+| `PI_DEVICE_P2P_HELPER`      | 随包助手                                                                               | 受信任管理员/开发用的绝对路径覆盖；绕过随包哈希校验                                   |
+| `PI_DEVICE_P2P_GO`          | `go`                                                                                   | 仅编译脚本使用的 Go 可执行程序路径；使用 npm 包无需 Go                                |
+
+`PI_DEVICE_P2P_TEST_LOOPBACK=1` 仅用于隔离集成测试，限制 ICE 为回环候选且禁用 STUN/TURN，不能用于跨机器部署。协议与分发见 [P2P 设备访问](device-center.md#p2p-设备访问)。

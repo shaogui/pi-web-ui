@@ -13,6 +13,44 @@ export function createWebhookToken(): string {
 	return randomBytes(24).toString("hex");
 }
 
+// 出站 webhook 不允许指向云厂商的元数据 / 链路本地地址：这类地址没有任何合法 webhook 用例，
+// 却是 SSRF 的头号目标（窃取实例凭据/节点身份）。判定前先把宿主名归一化：
+// 去掉 IPv6 方括号与结尾的点（`metadata.google.internal.` 与不带点等价）、
+// 把 IPv4-mapped IPv6（`[::ffff:169.254.169.254]`）折回点分 IPv4。
+const METADATA_HOSTS = new Set(["100.100.100.200", "0.0.0.0", "::"]);
+// AWS IMDS / GCP metadata 的 IPv6 端点（以及它们所在的 /64）。
+const METADATA_V6_HOSTS = new Set(["fd00:ec2::254", "fd20:ce::254"]);
+const METADATA_V6_PREFIXES = ["fd00:ec2:", "fd20:ce:"];
+
+function normalizeWebhookHost(hostname: string): string {
+	const host = hostname
+		.replace(/^\[|\]$/g, "")
+		.toLowerCase()
+		.replace(/\.+$/, "");
+	const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
+	if (!mapped) return host;
+	const high = Number.parseInt(mapped[1]!, 16);
+	const low = Number.parseInt(mapped[2]!, 16);
+	return `${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`;
+}
+
+function isMetadataHost(host: string): boolean {
+	if (METADATA_HOSTS.has(host)) return true;
+	if (host === "metadata.google.internal" || host.endsWith(".metadata.google.internal")) return true;
+	if (METADATA_V6_HOSTS.has(host) || METADATA_V6_PREFIXES.some((prefix) => host.startsWith(prefix))) return true;
+	// 169.254.0.0/16 是链路本地：云元数据 169.254.169.254 与 ECS 任务凭据 169.254.170.2 都在里面，
+	// 可路由环境下没有合法 webhook 用途。
+	return /^169\.254\.\d{1,3}\.\d{1,3}$/.test(host);
+}
+
+function assertNotMetadataTarget(parsed: URL): void {
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+		throw new Error(`Webhook target must be an http(s) URL (${parsed.protocol})`);
+	}
+	const host = normalizeWebhookHost(parsed.hostname);
+	if (isMetadataHost(host)) throw new Error(`Webhook target must not point at a metadata endpoint (${host})`);
+}
+
 export function validateWebhookInput(
 	input: unknown,
 	isUpdate = false,
@@ -75,7 +113,11 @@ export function validateWebhookInput(
 				throw new Error();
 			}
 			result.url = parsed.href;
-		} catch {
+			// 元数据端点拒绝要抛出自己的原因：包进上面的 catch 会变成
+			// 「must be a valid http or https URL」——URL 本身是合法的，运维会看不明白。
+			assertNotMetadataTarget(parsed);
+		} catch (err) {
+			if (err instanceof Error && err.message.includes("metadata")) throw err;
 			throw new Error("Target URL must be a valid http or https URL");
 		}
 	} else if (!isUpdate && result.type === "outgoing") {
@@ -112,6 +154,31 @@ export function validateWebhookInput(
 
 export function isIncomingWebhookRequest(req: Request): boolean {
 	return req.method === "POST" && /^\/api\/rooms\/[^/]+\/webhooks\/incoming\/[^/]+$/.test(req.path);
+}
+
+/**
+ * 入站 webhook 的凭据来源单源：query `token` / `Authorization: Bearer` / `x-webhook-token` / body `token`。
+ *
+ * Hub 侧用它做严格比对；主 Web app 的全局认证（`server/index.ts`）用它判断"这条请求自带凭据"。
+ * 两边各写一遍就会漂移：历史上主 app 只认本机口令，公网回调因此被提前拒成 401。
+ */
+export function incomingWebhookToken(req: Request): string | undefined {
+	const bearer = req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : undefined;
+	const queryToken = typeof req.query?.token === "string" ? req.query.token : undefined;
+	const headerToken = typeof req.headers["x-webhook-token"] === "string" ? req.headers["x-webhook-token"] : undefined;
+	const bodyToken = typeof req.body?.token === "string" ? req.body.token : undefined;
+	return queryToken ?? bearer ?? headerToken ?? bodyToken;
+}
+
+/**
+ * 「自带凭据的入站 webhook」判定：鉴权责任在 Hub 的 token 比对，不在本机口令。
+ *
+ * 只认这一条精确路径（`POST /api/rooms/:id/webhooks/incoming/:webhookId`），不放宽到整个 `/api/rooms`。
+ */
+export function isSelfAuthenticatedWebhook(req: Request): boolean {
+	if (!isIncomingWebhookRequest(req)) return false;
+	const token = incomingWebhookToken(req);
+	return typeof token === "string" && token.length > 0;
 }
 
 export function secureCompareTokens(given: string, expected: string): boolean {
@@ -156,6 +223,8 @@ export function dispatchGroupWebhook(
 	} catch {}
 }
 
+const MAX_WEBHOOK_REDIRECTS = 3;
+
 async function postWebhook(
 	url: string,
 	secret: string | undefined,
@@ -173,17 +242,41 @@ async function postWebhook(
 		headers["X-Pi-Signature"] = `sha256=${hmac}`;
 	}
 
-	try {
-		const res = await fetch(url, {
-			method: "POST",
-			headers,
-			body: payloadStr,
-			signal: AbortSignal.timeout(5000),
-		});
+	// fetch 默认自动跟随重定向：公网目标 302 跳内网/元数据端点即可绕过一切 URL 校验。
+	// 改为手动跟随，且只跟 307/308（保持 POST 语义），每一跳都重新过元数据校验；
+	// 301/302/303 原样上报，由调用方（连通性测试/健康检查）看到真实状态。
+	let target = url;
+	for (let hop = 0; hop <= MAX_WEBHOOK_REDIRECTS; hop++) {
+		let parsed: URL;
+		try {
+			parsed = new URL(target);
+			assertNotMetadataTarget(parsed);
+		} catch (err: any) {
+			return { success: false, error: err?.message ?? "Invalid webhook target URL" };
+		}
+		let res: Response;
+		try {
+			res = await fetch(parsed.href, {
+				method: "POST",
+				headers,
+				body: payloadStr,
+				signal: AbortSignal.timeout(5000),
+				redirect: "manual",
+			});
+		} catch (err: any) {
+			return { success: false, error: err?.message ?? "Request failed" };
+		}
+		if ((res.status === 307 || res.status === 308) && res.headers.get("location")) {
+			try {
+				target = new URL(res.headers.get("location")!, parsed).href;
+			} catch {
+				return { success: false, status: res.status, error: "Webhook redirect location is invalid" };
+			}
+			continue;
+		}
 		return { success: res.ok, status: res.status };
-	} catch (err: any) {
-		return { success: false, error: err?.message ?? "Request failed" };
 	}
+	return { success: false, error: "Webhook redirected too many times" };
 }
 
 export async function testOutgoingWebhook(webhook: {

@@ -7,6 +7,8 @@ import type { PluginManager } from "./plugins.js";
 import { buildPluginJobArgs, inspectInstallSpec, type PluginInstaller } from "./plugin-installer.js";
 import { syncPluginCatalog } from "./plugin-catalog-sync.js";
 import type { ServerLang } from "./i18n.js";
+import { collectExtensionInventory, mcpServersToInput } from "./extension-inventory.js";
+import { getSdkBuiltinExtensionFactories } from "./sdk-builtin-extensions.js";
 
 export interface PluginDispatchContext {
 	pluginMgr: PluginManager;
@@ -204,11 +206,6 @@ export function handlePluginMessage(msg: ClientMessage, ctx: PluginDispatchConte
 		case "plugin_job_cancel":
 			pluginInstaller.cancel(String(msg.jobId ?? ""));
 			return true;
-		case "plugin_api_catalog": {
-			const requestId = String(msg.requestId ?? "");
-			send({ type: "plugin_api_catalog_result", requestId, catalog: pluginMgr.getApiCatalog() });
-			return true;
-		}
 		case "plugin_install_inspect": {
 			const requestId = String(msg.requestId ?? "");
 			const source = String(msg.source ?? "");
@@ -314,6 +311,79 @@ export function handlePluginMessage(msg: ClientMessage, ctx: PluginDispatchConte
 			);
 			cs?.emitNotice?.("info", `已撤销 ${removed} 条能力授权`, `Revoked ${removed} permission grant(s)`);
 			pushPluginPermissions();
+			return true;
+		}
+		case "extension_inventory": {
+			// #885 T1/健康/自动刷新：只读聚合三类来源，不改运行时、不触发重载。
+			// 健康来自 listMcpServers 已有 status/error/tools（bridge 连接结果，只读，不新建连接）。
+			// 首次查询即启动 mcp.json 监听（gitWatch 式防抖），变化发 extension_inventory_changed，前端自动重拉。
+			const reqId = typeof msg.reqId === "number" ? msg.reqId : 0;
+			void (async () => {
+				try {
+					const [sdkBuiltins, plugins] = await Promise.all([
+						getSdkBuiltinExtensionFactories().catch((error) => {
+							throw error;
+						}),
+						pluginMgr.list(() => cs?.getLang?.() ?? "en").catch(() => []),
+					]);
+					const settingsLike = (
+						cs as unknown as {
+							settingsSvc?: { current: { disabledExtensions?: unknown; disabledPlugins?: unknown } };
+							listMcpServers?: () => { servers: import("./protocol.js").UiMcpServer[] };
+						}
+					)?.settingsSvc?.current;
+					const disabledExtensions = Array.isArray(settingsLike?.disabledExtensions)
+						? (settingsLike.disabledExtensions as string[])
+						: [];
+					const disabledPlugins = Array.isArray(settingsLike?.disabledPlugins)
+						? (settingsLike.disabledPlugins as string[])
+						: [];
+					let mcpServers: import("./protocol.js").UiMcpServer[] = [];
+					try {
+						const maybeList = (
+							cs as unknown as { listMcpServers?: () => { servers: import("./protocol.js").UiMcpServer[] } }
+						)?.listMcpServers;
+						if (typeof maybeList === "function") mcpServers = maybeList.call(cs).servers ?? [];
+					} catch {
+						mcpServers = [];
+					}
+					try {
+						(cs as unknown as { watchMcpInventory?: () => void })?.watchMcpInventory?.();
+					} catch {}
+					const { entries, errors } = await collectExtensionInventory({
+						getSdkBuiltins: () =>
+							sdkBuiltins.map((b) => ({ name: b.name, replaceable: b.replaceable, hidden: b.hidden })),
+						getDisabledExtensions: () => disabledExtensions,
+						getPlugins: () =>
+							plugins.map((p) => ({
+								id: p.id,
+								name: p.name,
+								version: p.version,
+								description: p.description,
+								error: p.error,
+								active: p.active,
+							})),
+						getDisabledPlugins: () => disabledPlugins,
+						getMcpServers: () => mcpServersToInput(mcpServers),
+						// 只读 probe 预留：生产直接用 list 信息，不新建连接；单测注入失败 probe 验证 error 不抛。
+					});
+					send({
+						type: "extension_inventory_data",
+						reqId,
+						ok: errors.length === 0,
+						entries,
+						...(errors.length > 0 ? { error: errors.join("; ") } : {}),
+					});
+				} catch (error) {
+					send({
+						type: "extension_inventory_data",
+						reqId,
+						ok: false,
+						entries: [],
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			})();
 			return true;
 		}
 		case "plugin_catalog_sync": {

@@ -33,6 +33,7 @@ export const DELEGATE_TASK_TOOL_NAME = "delegate_task";
 export const ASK_USER_QUESTION_TOOL_NAME = "ask_user_question";
 export const BROWSER_PAGE_TOOL_NAME = "browser_page";
 export const BROWSER_SCRIPT_TOOL_NAME = "browser_script";
+export const BROWSER_DESIGN_TOOL_NAME = "browser_design";
 export const PHONE_TOOL_NAME = "phone";
 export const CONVERSATION_READ_TOOL_NAME = CONVERSATION_TOOL_NAME;
 export const SKILL_TOOL_NAME = "skill";
@@ -49,6 +50,10 @@ export const MCP_MANAGE_TOOL_NAME = "mcp_manage";
 export const SANDBOX_TOOL_NAME = "sandbox";
 export const WORKTREE_TOOL_NAME = "worktree";
 export const DEVICE_COLLAB_TOOL_NAME = "device_collab";
+/** Bot 个人记忆（独立 memory 目录）。只对"有记忆目录的 Bot 执行"注册，不进普通设置目录。 */
+export const BOT_MEMORY_TOOL_NAME = "memory";
+/** 一句话创建 Bot：只写待确认草案，不直接建 Bot。 */
+export const AGENT_BOT_TOOL_NAME = "agent_bot";
 export const CODEMODE_TOOL_NAME = "codemode";
 export const TOOL_SEARCH_TOOL_NAME = "tool_search";
 export const LOAD_TOOLS_TOOL_NAME = "load_tools";
@@ -149,6 +154,15 @@ export const AGENT_TOOL_CATALOG: AgentToolEntry[] = [
 		offHintKey: "browserScriptOffHint",
 	},
 	{
+		// 改浏览器自己的新标签页 / 主题。默认关：等于允许模型重写一个和内部页同权的本地页面。
+		name: BROWSER_DESIGN_TOOL_NAME,
+		group: "other",
+		defaultOn: false,
+		dshVisible: false,
+		descKey: "browserDesignEnabledDesc",
+		offHintKey: "browserDesignOffHint",
+	},
+	{
 		// 让智能体操作手机（无障碍服务）。默认关：等于把整台手机交给模型，必须用户显式打开。
 		name: PHONE_TOOL_NAME,
 		group: "other",
@@ -172,6 +186,15 @@ export const AGENT_TOOL_CATALOG: AgentToolEntry[] = [
 		dshVisible: true,
 		descKey: "planUpdateEnabledDesc",
 		offHintKey: "planUpdateOffHint",
+	},
+	{
+		// 一句话创建智能体：默认常驻（轻量），但只会产出"待确认草案"，不能自建自授权。
+		name: AGENT_BOT_TOOL_NAME,
+		group: "other",
+		defaultOn: true,
+		dshVisible: false,
+		descKey: "agentBotToolEnabledDesc",
+		offHintKey: "agentBotToolOffHint",
 	},
 	{
 		name: PATCH_TOOL_NAME,
@@ -288,6 +311,14 @@ export const GROUP_BOT_TOOL_CATALOG: readonly AgentToolEntry[] = [
 		dshVisible: false,
 		descKey: "toolsDeviceCollabDesc",
 		offHintKey: "toolsDeviceCollabOffHint",
+	},
+	{
+		// 记忆是 Bot 私产：开关由 Bot 的工具白名单决定，不在用户 Web 设置里出现。
+		name: BOT_MEMORY_TOOL_NAME,
+		group: "other",
+		defaultOn: false,
+		allowAgentToggle: false,
+		dshVisible: false,
 	},
 ] as const;
 

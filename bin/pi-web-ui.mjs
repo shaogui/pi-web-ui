@@ -12,6 +12,15 @@ if (process.argv[2] === "hub") {
 		process.exitCode = 1;
 	}
 }
+if (process.argv[2] === "desktop") {
+	try {
+		const { runDesktopCli } = await import("./desktop-cli.mjs");
+		await runDesktopCli(process.argv.slice(3));
+	} catch (error) {
+		console.error(`[desktop] ${error.message}`);
+		process.exitCode = 1;
+	}
+}
 
 import {
 	chmodSync,
@@ -33,7 +42,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { fileURLToPath } from "node:url";
 
-const isHubCommand = process.argv[2] === "hub";
+const isHubCommand = ["hub", "desktop"].includes(process.argv[2]);
 const { frpCmd } = isHubCommand ? {} : await import("./frp-manager.mjs");
 const {
 	ensureBackup: ensurePluginBackup,
@@ -409,6 +418,7 @@ function resolveCliAuthToken(opts) {
 }
 
 async function startForeground(opts) {
+	await (await import("./desktop-bootstrap.mjs")).ensureDesktopService();
 	if (opts.port) process.env.PI_WEB_PORT = opts.port;
 	if (opts.cwd) process.env.PI_WEB_CWD = resolve(opts.cwd);
 	if (opts.dataDir) process.env.PI_WEB_DATA_DIR = resolve(opts.dataDir);
@@ -3675,6 +3685,8 @@ async function serverCmd(argv) {
 		return;
 	}
 	const action = positionals[0];
+	if (["install", "start", "restart"].includes(action) && !opts.print)
+		await (await import("./desktop-bootstrap.mjs")).ensureDesktopService();
 	if (positionals.length > 1)
 		fail(
 			ZH ? `多余的参数: ${positionals.slice(1).join(" ")}` : `Unexpected argument: ${positionals.slice(1).join(" ")}`,

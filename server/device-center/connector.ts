@@ -1,9 +1,11 @@
 import http, { type ClientRequest } from "node:http";
+import { desktopDownloadLimit } from "./desktop-files-protocol.js";
 import type { DeviceTaskActivity, DeviceTaskClaim } from "../protocol.js";
 import { projectTaskActivity } from "./task-progress.js";
 import https from "node:https";
 import { WebSocket } from "ws";
 import { createDeviceLanServer } from "./device-lan.js";
+import { createDeviceP2PTarget, createDeviceBrowserP2PTarget, deviceP2PAvailable } from "./device-p2p.js";
 import { deviceTaskFailure } from "./task-error.js";
 import type { TaskRecoveryManager, TaskOutboxEntry } from "./task-recovery.js";
 import type { TaskReportOutbox, TaskReportUploadEntry } from "./task-report-outbox.js";
@@ -69,6 +71,8 @@ export function createDeviceConnector(options: DeviceConnectorOptions) {
 	endpoint.protocol = hub.protocol === "https:" || hub.protocol === "wss:" ? "wss:" : "ws:";
 	endpoint.searchParams.set("deviceId", options.deviceId);
 	const deviceLan = createDeviceLanServer({ localOrigin: local.origin, localAuthToken: options.localAuthToken });
+	const deviceP2P = createDeviceP2PTarget(deviceLan);
+	const browserP2P = createDeviceBrowserP2PTarget(deviceLan);
 	let closed = false;
 	let tasksDisabled = false;
 	const waitingForHumanTaskIds = new Set<string>();
@@ -213,6 +217,22 @@ export function createDeviceConnector(options: DeviceConnectorOptions) {
 		});
 		socket = ws;
 		const rpc = createCommandChannel(ws, async (action, payload, signal) => {
+			if (action === "device_browser_p2p") {
+				const result = await browserP2P.accept(payload, signal);
+				if (signal.aborted || closed || socket !== ws || ws.readyState !== WebSocket.OPEN) {
+					if (result) await browserP2P.accept({ op: "close", session: result.key }, signal);
+					return null;
+				}
+				return result;
+			}
+			if (action === "device_p2p") {
+				const result = await deviceP2P.accept(payload, signal);
+				if (signal.aborted || closed || socket !== ws || ws.readyState !== WebSocket.OPEN) {
+					if (result && "grant" in result) deviceP2P.revoke(result.grant.identity);
+					return null;
+				}
+				return result;
+			}
 			if (action !== "device_lan") {
 				if (!options.onCommand) throw new Error("Device command unavailable");
 				return options.onCommand(action, payload, signal);
@@ -223,6 +243,8 @@ export function createDeviceConnector(options: DeviceConnectorOptions) {
 				if (grant) deviceLan.revoke(grant.identity);
 				throw new Error("Device connection changed");
 			}
+			if (payload && typeof payload === "object" && Reflect.get(payload, "p2p") === 1)
+				return { deviceLan: grant, deviceP2P: await deviceP2PAvailable() };
 			return grant;
 		});
 		const messages = createWsMessageChannel(ws);
@@ -696,7 +718,8 @@ export function createDeviceConnector(options: DeviceConnectorOptions) {
 										for await (const data of res) {
 											const chunk = Buffer.from(data);
 											bytes += chunk.length;
-											if (bytes > RELAY_LIMITS.body) throw new Error("Response too large");
+											if (bytes > (desktopDownloadLimit(frame.path, frame.method as string) ?? RELAY_LIMITS.body))
+												throw new Error("Response too large");
 											for (let offset = 0; offset < chunk.length; offset += RELAY_LIMITS.chunk) {
 												while (ws.bufferedAmount > RELAY_LIMITS.queue / 2) {
 													if (!streams.has(id) || ws.readyState !== WebSocket.OPEN) throw new Error("Cancelled");
@@ -788,6 +811,8 @@ export function createDeviceConnector(options: DeviceConnectorOptions) {
 			if (socket !== ws) return;
 			socket = undefined;
 			deviceLan.close();
+			deviceP2P.reset();
+			browserP2P.reset();
 			stopTasks(false);
 			for (const id of streams.keys()) dispose(id);
 			if (!closed) {
@@ -828,6 +853,8 @@ export function createDeviceConnector(options: DeviceConnectorOptions) {
 		close() {
 			closed = true;
 			deviceLan.close();
+			deviceP2P.reset();
+			browserP2P.reset();
 			reportAbort.abort();
 			stopTasks(true);
 			clearInterval(heartbeat);

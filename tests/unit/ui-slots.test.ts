@@ -42,7 +42,7 @@ const ids = (entries: { id: string }[]) => entries.map((e) => e.id);
 
 describe("UI slot cardinality（P1-4）", () => {
 	it("所有现有挂载点都有显式 list 规格，新增 single 不会改变现有入口语义", () => {
-		expect(UI_SLOT_SPECS).toHaveLength(37);
+		expect(UI_SLOT_SPECS).toHaveLength(39);
 		expect(UI_SLOT_SPECS.every((spec) => spec.cardinality === "list")).toBe(true);
 		expect(new Set(UI_SLOT_SPECS.map((spec) => spec.slot)).size).toBe(UI_SLOT_SPECS.length);
 	});
@@ -188,14 +188,15 @@ describe("buildUiSlots / 第 1 层：宿主默认", () => {
 			order: 59,
 			align: "end",
 		});
-		expect(Object.keys(slots)).toHaveLength(37);
+		expect(Object.keys(slots)).toHaveLength(39);
 		expect(slots["composer.leading"]).toEqual([]);
 		expect(ids(slots["composer.actions"])).toEqual([
 			"host:composer-upload",
-			"host:composer-screenshot",
 			"host:composer-templates",
+			"host:composer-screenshot",
 			"host:composer-model",
 			"host:composer-thinking",
+			"host:composer-claude-perm",
 			"host:composer-dsh-perm",
 			"host:composer-dsh-preset",
 			"host:composer-send",
@@ -258,6 +259,7 @@ describe("buildUiSlots / 第 1 层：宿主默认", () => {
 			"composer.leading",
 			"composer.actions",
 			"rightpanel.tabs",
+			"bottomdock.tabs",
 			"terminal.toolbar",
 			"scm.toolbar",
 			"bottombar",
@@ -267,6 +269,7 @@ describe("buildUiSlots / 第 1 层：宿主默认", () => {
 			"contextmenu.session",
 			"contextmenu.project",
 			"contextmenu.file",
+			"contextmenu.search",
 			"contextmenu.toolcall",
 			"tool.card.footer",
 			"settings.pages",
@@ -283,7 +286,11 @@ describe("buildUiSlots / 第 1 层：宿主默认", () => {
 	it("kind=view 的条目带 view 目标（宿主据此切视图）", () => {
 		const slots = build([]);
 		expect(slots["topbar.primary"].find((e) => e.id === "host:git")?.view).toBe("git");
-		expect(slots["rightpanel.tabs"].map((e) => [e.id, e.view])).toEqual([["host:right-files", "files"]]);
+		expect(slots["rightpanel.tabs"].map((e) => [e.id, e.view])).toEqual([
+			["host:right-files", "files"],
+			["host:right-scm", "scm"],
+		]);
+		expect(slots["bottomdock.tabs"].map((e) => [e.id, e.view])).toEqual([["host:bottom-terminal", "terminal"]]);
 	});
 
 	it("同 order 时保持声明顺序（稳定排序）", () => {
@@ -313,10 +320,11 @@ describe("buildUiSlots / 第 1 层：宿主默认", () => {
 		expect(ids(slots["composer.leading"])).toEqual(["third:a", "third:b"]);
 		expect(ids(slots["composer.actions"])).toEqual([
 			"host:composer-upload",
-			"host:composer-screenshot",
 			"host:composer-templates",
+			"host:composer-screenshot",
 			"host:composer-model",
 			"host:composer-thinking",
+			"host:composer-claude-perm",
 			"host:composer-dsh-perm",
 			"host:composer-dsh-preset",
 			"host:composer-send",
@@ -332,11 +340,12 @@ describe("buildUiSlots / 第 1 层：宿主默认", () => {
 		]);
 		expect(ids(slots["composer.actions"])).toEqual([
 			"host:composer-upload",
-			"host:composer-screenshot",
 			"p:x",
 			"host:composer-templates",
+			"host:composer-screenshot",
 			"host:composer-model",
 			"host:composer-thinking",
+			"host:composer-claude-perm",
 			"host:composer-dsh-perm",
 			"host:composer-dsh-preset",
 			"host:composer-send",
@@ -437,7 +446,7 @@ describe("buildUiSlots / 第 2 层：插件贡献", () => {
 			arrange: [],
 		});
 		const slots = build([dirty]);
-		expect(Object.keys(slots)).toHaveLength(37);
+		expect(Object.keys(slots)).toHaveLength(39);
 		expect(ids(Object.values(slots).flat()).some((id) => id === "dirty:bad")).toBe(false);
 	});
 });
@@ -977,7 +986,6 @@ describe("面板 chrome 宿主条目（file.preview / goalbar / scm / terminal /
 			"host:scm-history",
 			"host:scm-refresh",
 			"host:scm-branch",
-			"host:scm-switch",
 			"host:scm-push",
 			"host:scm-pull",
 			"host:scm-input",
@@ -1384,5 +1392,54 @@ describe("左栏插件自定义分区（P4 · leftpanel.sections 接受 kind=vie
 		expect(entry.userOverrides).toEqual([]);
 		expect(entry.arrangedBy).toEqual([]);
 		expect(entry.when).toEqual(["disabled"]);
+	});
+});
+
+describe("输入框动作栏：截图按钮的位置", () => {
+	it("默认排在附件与模板之后（左侧第三个位）", () => {
+		const slots = build([]);
+		expect(ids(slots["composer.actions"])).toEqual([
+			"host:composer-upload",
+			"host:composer-templates",
+			"host:composer-screenshot",
+			"host:composer-model",
+			"host:composer-thinking",
+			"host:composer-claude-perm",
+			"host:composer-dsh-perm",
+			"host:composer-dsh-preset",
+			"host:composer-send",
+		]);
+	});
+	it("老布局的 order 未登记截图时，锚定到模板之后", () => {
+		const slots = build([], {
+			layout: {
+				order: [
+					"host:composer-upload",
+					"voice-input:mic",
+					"host:composer-templates",
+					"host:composer-model",
+					"host:composer-thinking",
+				],
+			},
+		});
+		expect(ids(slots["composer.actions"]).slice(0, 5)).toEqual([
+			"host:composer-upload",
+			"host:composer-templates",
+			"host:composer-screenshot",
+			"host:composer-model",
+			"host:composer-thinking",
+		]);
+	});
+	it("没有模板按钮时锚定到附件之后，已有排序保持不变", () => {
+		const slots = build([], { layout: { order: ["host:composer-upload", "host:composer-model"] } });
+		expect(ids(slots["composer.actions"]).slice(0, 3)).toEqual([
+			"host:composer-upload",
+			"host:composer-screenshot",
+			"host:composer-model",
+		]);
+		const ranked = build([], {
+			layout: { order: ["host:composer-screenshot", "host:composer-upload", "host:composer-model"] },
+		});
+		expect(ids(ranked["composer.actions"]).slice(0, 2)).toEqual(["host:composer-screenshot", "host:composer-upload"]);
 	});
 });

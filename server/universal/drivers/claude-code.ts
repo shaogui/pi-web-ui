@@ -1,19 +1,79 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
+import type { Writable } from "node:stream";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { probeEngineCliVersion, resolveEngineCliLaunch } from "../../engine-cli.js";
+import { killPidTree } from "../../process-utils.js";
 import { BaseAgentDriver, type AgentCapabilities, type AgentEventSink, type AgentTurnMeta } from "../driver-base.js";
 import type { PromptAttachment, SlashCommandInfo } from "../../protocol.js";
 import {
 	resolveProviderCredential,
 	listCustomModelsFromConfig,
 	isModelProtocolSupportedByEngine,
+	anthropicBaseUrlFromOpenAi,
+	resolveModelProtocol,
 } from "../../model-resolver.js";
 import { discoverDiskSkills } from "../../skill-discovery.js";
 import { decodeInlineImage, describeCliAttachment } from "../universal-attachments.js";
 import { collectEnabledMcpServers, toClaudeMcpConfig } from "../engine-mcp.js";
+
+/** Legal values of Claude Code's `--permission-mode` (there is no "default"). */
+const CLAUDE_PERMISSION_MODES = ["acceptEdits", "auto", "manual", "dontAsk", "plan", "bypassPermissions"] as const;
+
+/**
+ * How long `forkSession` waits for `system/init` before poking the CLI with a throwaway turn.
+ * CLIs that report the new session id at startup never need the poke, which keeps the forked
+ * transcript free of a meaningless user message.
+ */
+const FORK_PROBE_GRACE_MS = 1_500;
+/** Hard cap for the fork handshake: past this the caller gets "" and forks without an engine id. */
+const FORK_TIMEOUT_MS = 15_000;
+
+/**
+ * Default mode. Stays `bypassPermissions` on purpose: that is what the engine did before the
+ * permission bridge existed (`--dangerously-skip-permissions`), and anything else would turn
+ * "prompt for a tool" into "deny it" wherever nobody can answer — durable/background runs,
+ * scheduler/plugin-driven conversations, subagents — i.e. the same hang this bridge fixes,
+ * only silent. A prompting mode is opt-in (composer chip or env).
+ */
+const DEFAULT_PERMISSION_MODE = "bypassPermissions";
+
+/**
+ * Build the permission flags for the CLI.
+ *
+ * `--permission-prompt-tool stdio` is what makes the CLI raise `control_request`/`can_use_tool`
+ * for us to answer; without it the CLI silently denies tools itself and a host-side approval
+ * dialog can never appear.
+ *
+ * Env:
+ * - PI_WEB_CLAUDE_PERMISSION_MODE   bypassPermissions (default) | acceptEdits | auto | manual | dontAsk | plan
+ * - PI_WEB_CLAUDE_PERMISSION_PROMPTS host (default) | none  ("none" auto-denies anything that would prompt)
+ */
+let permissionModeOverride: string | null = null;
+
+/** Set by the UI setting (process-wide, which matches the single global setting). */
+export function setClaudePermissionMode(mode: string | null): void {
+	permissionModeOverride = mode;
+}
+
+export const CLAUDE_PERMISSION_MODE_OPTIONS = [...CLAUDE_PERMISSION_MODES];
+
+/** Current effective mode (UI override > env > default). */
+export function currentClaudePermissionMode(): string {
+	const raw = (permissionModeOverride ?? process.env.PI_WEB_CLAUDE_PERMISSION_MODE ?? DEFAULT_PERMISSION_MODE).trim();
+	return (CLAUDE_PERMISSION_MODES as readonly string[]).includes(raw) ? raw : DEFAULT_PERMISSION_MODE;
+}
+
+function buildPermissionArgs(): string[] {
+	const mode = currentClaudePermissionMode();
+	const prompts = (process.env.PI_WEB_CLAUDE_PERMISSION_PROMPTS ?? "host").trim();
+	const args = ["--permission-mode", mode];
+	if (prompts === "none") args.push("--permission-prompts", "none");
+	else args.push("--permission-prompt-tool", "stdio");
+	return args;
+}
 
 export interface ClaudeCodeDriverOptions {
 	executablePath?: string;
@@ -89,7 +149,9 @@ export class ClaudeCodeDriver extends BaseAgentDriver {
 	readonly name = "Claude Code";
 	readonly maxInlineImageBytes = CLAUDE_MAX_INLINE_IMAGE_BYTES;
 	readonly capabilities: AgentCapabilities = {
-		supportsTreeFork: false,
+		// `forkSession` forks the CLI transcript, so the fork point is the end of it rather than
+		// the message the UI forked from — close enough for the tree-fork entry, hence `true`.
+		supportsTreeFork: true,
 		supportsHistoryEdit: false,
 		supportsToolPromptOverride: false,
 		supportsModelSwitch: true,
@@ -98,7 +160,7 @@ export class ClaudeCodeDriver extends BaseAgentDriver {
 	};
 
 	private readonly executablePath: string | undefined;
-	private readonly extraArgs: string[];
+	private readonly staticExtraArgs: string[];
 	private readonly agentDir: string;
 	private readonly dataDir: string | undefined;
 	private currentModel: string;
@@ -116,14 +178,33 @@ export class ClaudeCodeDriver extends BaseAgentDriver {
 	private nativeSlashCommands: string[] = [];
 	private nativeSkills = new Set<string>();
 	private slashCommandsChanged = false;
+	/** Per-turn stdin: must stay open so we can answer permission requests. */
+	private activeStdin: Writable | null = null;
+	/** control_request id currently waiting for a human answer. */
+	private pendingRequestId: string | null = null;
 
 	constructor(cwd: string, opts?: ClaudeCodeDriverOptions) {
 		super(cwd);
 		this.executablePath = opts?.executablePath;
-		this.extraArgs = opts?.extraArgs ?? ["--dangerously-skip-permissions"];
+		// Only non-permission args are fixed at construction. Permission flags are rebuilt per
+		// turn (see sendPrompt) so switching the mode in the UI applies to the next prompt without
+		// a restart. Building them here once would freeze the mode from construction time.
+		this.staticExtraArgs = opts?.extraArgs ?? [];
 		this.currentModel = normalizeClaudeModelId(opts?.defaultModel ?? "default");
 		this.agentDir = opts?.agentDir || process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 		this.dataDir = opts?.dataDir;
+	}
+
+	permissionModeOptions(): string[] {
+		return CLAUDE_PERMISSION_MODE_OPTIONS;
+	}
+
+	currentPermissionMode(): string {
+		return currentClaudePermissionMode();
+	}
+
+	setPermissionMode(mode: string): void {
+		setClaudePermissionMode(mode);
 	}
 
 	async createSession(): Promise<string> {
@@ -135,6 +216,111 @@ export class ClaudeCodeDriver extends BaseAgentDriver {
 
 	async resumeSession(sessionId: string): Promise<void> {
 		this.activeSessionId = sessionId || null;
+	}
+
+	/**
+	 * Fork an existing CLI session into a new session id (tree-fork from the UI).
+	 *
+	 * The CLI forks the transcript it resumes, so the fork point is the END of the engine
+	 * history, not the message the UI forked from: forking from an earlier message leaves the
+	 * model with a superset of the cloned UI messages.
+	 */
+	async forkSession(sessionId: string): Promise<string> {
+		if (!sessionId) return "";
+		const args = [
+			"-p",
+			"--input-format",
+			"stream-json",
+			"--output-format",
+			"stream-json",
+			"--verbose",
+			"--resume",
+			sessionId,
+			"--fork-session",
+			...this.staticExtraArgs,
+			...buildPermissionArgs(),
+		];
+
+		let isOfficial = true;
+		let targetProvider: string | null = null;
+		if (this.currentModel.includes("/")) {
+			const slash = this.currentModel.indexOf("/");
+			const provider = this.currentModel.slice(0, slash);
+			if (provider !== "claude-code") {
+				isOfficial = false;
+				targetProvider = provider;
+			}
+		}
+		const launch = resolveEngineCliLaunch("claude", { executablePath: this.executablePath, cwd: this.cwd });
+		const proc = spawn(launch.file, [...launch.args, ...args], {
+			cwd: this.cwd,
+			env: this.buildSpawnEnv(isOfficial, targetProvider),
+			detached: process.platform !== "win32",
+			windowsHide: true,
+		});
+
+		return new Promise<string>((resolve) => {
+			let newSid = "";
+			let done = false;
+			let probe: NodeJS.Timeout | null = null;
+			const kill = () => {
+				// The CLI spawns children of its own (MCP servers, hooks), so take the whole tree with
+				// it; the direct handle only covers a spawn that never got a pid.
+				if (proc.pid) void killPidTree(proc.pid);
+				else {
+					try {
+						proc.kill();
+					} catch {}
+				}
+			};
+			const finish = () => {
+				if (done) return;
+				done = true;
+				clearTimeout(timer);
+				if (probe) clearTimeout(probe);
+				resolve(newSid);
+			};
+			const timer = setTimeout(() => {
+				kill();
+				finish();
+			}, FORK_TIMEOUT_MS);
+
+			if (proc.stdout) {
+				const rl = createInterface({ input: proc.stdout, terminal: false });
+				rl.on("line", (line) => {
+					const trimmed = line.trim();
+					if (!trimmed.startsWith("{")) return;
+					try {
+						const event = JSON.parse(trimmed) as Record<string, unknown>;
+						if (
+							event.type === "system" &&
+							event.subtype === "init" &&
+							typeof event.session_id === "string" &&
+							event.session_id
+						) {
+							newSid = event.session_id;
+							// Got the fork target: we don't need the CLI to finish a turn.
+							kill();
+							finish();
+						}
+					} catch {}
+				});
+			}
+			proc.on("close", finish);
+			proc.on("error", finish);
+			if (!proc.stdin) return;
+			proc.stdin.on("error", () => {});
+			// The fork happens while the CLI loads the resumed session and the new id arrives in
+			// `system/init` — usually before any input, so staying quiet keeps the forked transcript
+			// clean. The probe turn is only for CLIs that report init once a turn starts.
+			probe = setTimeout(() => {
+				if (done) return;
+				proc.stdin?.write(
+					`${JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text: "fork session" }] } })}\n`,
+				);
+				proc.stdin?.end();
+			}, FORK_PROBE_GRACE_MS);
+		});
 	}
 
 	getActiveSessionId(): string | null {
@@ -183,7 +369,8 @@ export class ClaudeCodeDriver extends BaseAgentDriver {
 			"--output-format",
 			"stream-json",
 			"--verbose",
-			...this.extraArgs,
+			...this.staticExtraArgs,
+			...buildPermissionArgs(),
 		];
 
 		let targetModel = this.currentModel;
@@ -235,8 +422,11 @@ export class ClaudeCodeDriver extends BaseAgentDriver {
 				windowsHide: true,
 			});
 			if (proc.stdin) {
+				// Keep stdin open: in non-bypass modes the CLI asks for permission over stdin and
+				// finishes only after the turn's `result` event closes it (see handleClaudeEvent).
+				this.activeStdin = proc.stdin;
 				proc.stdin.on("error", () => {});
-				proc.stdin.end(`${JSON.stringify(userMessage)}\n`);
+				proc.stdin.write(`${JSON.stringify(userMessage)}\n`);
 			}
 		} catch (err: unknown) {
 			cleanup();
@@ -285,6 +475,8 @@ export class ClaudeCodeDriver extends BaseAgentDriver {
 
 			proc.on("close", (code: number | null) => {
 				cleanup();
+				this.activeStdin = null;
+				this.pendingRequestId = null;
 				if (mySeq !== this.turnSeq) {
 					resolve();
 					return;
@@ -324,6 +516,68 @@ export class ClaudeCodeDriver extends BaseAgentDriver {
 		this.slashCommandsChanged = true;
 	}
 
+	/**
+	 * Claude Code -> host control channel. Permission requests go to the UI; every other
+	 * subtype (e.g. `initialize`) must still be acknowledged or the CLI blocks the turn.
+	 */
+	private handleControlRequest(event: Record<string, unknown>, sink: AgentEventSink): void {
+		const requestId = typeof event.request_id === "string" ? event.request_id : "";
+		if (!requestId) return;
+		const request = (event.request ?? {}) as Record<string, unknown>;
+		const subtype = String(request.subtype ?? "");
+
+		if (subtype !== "can_use_tool") {
+			this.writeControlResponse(requestId, {});
+			return;
+		}
+
+		this.pendingRequestId = requestId;
+		const toolName = String(request.tool_name ?? "tool");
+		const params = request.input && typeof request.input === "object" ? (request.input as Record<string, unknown>) : {};
+		const suggestions = Array.isArray(request.permission_suggestions) ? request.permission_suggestions : undefined;
+
+		if (sink.supportsApproval !== true || typeof sink.onApprovalRequest !== "function") {
+			// No UI channel (subagent/headless): deny instead of hanging the turn forever.
+			void this.respondApproval(requestId, "deny", undefined, "no approval channel");
+			return;
+		}
+		sink.onApprovalRequest(requestId, toolName, params, { suggestions });
+	}
+
+	private writeControlResponse(requestId: string, response: Record<string, unknown>): boolean {
+		const stdin = this.activeStdin;
+		if (!stdin || stdin.destroyed) return false;
+		try {
+			stdin.write(
+				`${JSON.stringify({ type: "control_response", response: { subtype: "success", request_id: requestId, response } })}\n`,
+			);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	async respondApproval(
+		requestId: string,
+		decision: "approve" | "edit" | "deny",
+		editedParams?: Record<string, unknown>,
+		reason?: string,
+	): Promise<boolean> {
+		const id = requestId || this.pendingRequestId;
+		if (!id) return false;
+		this.pendingRequestId = null;
+		const allow = decision === "approve" || decision === "edit";
+		const response = allow
+			? {
+					behavior: "allow",
+					...(decision === "edit" && editedParams && typeof editedParams === "object"
+						? { updatedInput: editedParams }
+						: {}),
+				}
+			: { behavior: "deny", message: reason || "User denied this tool use." };
+		return this.writeControlResponse(id, response);
+	}
+
 	private handleClaudeEvent(event: Record<string, unknown>, sink: AgentEventSink): void {
 		if (event.type === "stream_event" && event.event && typeof event.event === "object") {
 			this.handleClaudeEvent(event.event as Record<string, unknown>, sink);
@@ -331,6 +585,11 @@ export class ClaudeCodeDriver extends BaseAgentDriver {
 		}
 
 		const type = String(event.type ?? "");
+
+		if (type === "control_request") {
+			this.handleControlRequest(event, sink);
+			return;
+		}
 
 		if (type === "system") {
 			this.noteSessionId(event.session_id, sink);
@@ -409,6 +668,11 @@ export class ClaudeCodeDriver extends BaseAgentDriver {
 				return;
 			}
 			this.turnCompleteEmitted = true;
+			// In `-p` mode the CLI exits on stdin EOF; close it once the turn's result arrived.
+			try {
+				this.activeStdin?.end();
+			} catch {}
+			this.activeStdin = null;
 			sink.onTurnComplete({
 				usage: usage ? { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, costUSD } : undefined,
 				costUSD,
@@ -445,7 +709,7 @@ export class ClaudeCodeDriver extends BaseAgentDriver {
 				: { providerId: targetProvider };
 
 			if (cred.baseUrl) {
-				spawnEnv.ANTHROPIC_BASE_URL = cred.baseUrl;
+				spawnEnv.ANTHROPIC_BASE_URL = anthropicBaseUrlFromOpenAi(cred.baseUrl);
 			}
 			if (cred.apiKey) {
 				spawnEnv.ANTHROPIC_API_KEY = cred.apiKey;
@@ -485,9 +749,12 @@ export class ClaudeCodeDriver extends BaseAgentDriver {
 		const official = [...CLAUDE_CODE_MODELS];
 		if (!this.agentDir) return official;
 
-		const custom = listCustomModelsFromConfig(this.agentDir, (entry) =>
-			isModelProtocolSupportedByEngine("claude", entry),
-		);
+		const custom = listCustomModelsFromConfig(this.agentDir, (entry) => {
+			// 回环网关（Magpie 等）单端口做协议转换：OpenAI 条目按 claude-gateway 收进来；
+			// 非回环严格只认 anthropic-messages。
+			const nativeAnthropic = resolveModelProtocol(entry.api, entry.providerId, entry.modelId) === "anthropic-messages";
+			return isModelProtocolSupportedByEngine(nativeAnthropic ? "claude" : "claude-gateway", entry, entry.baseUrl);
+		});
 		const customRows = custom.map((c) => ({
 			id: `${c.providerId}/${c.modelId}`,
 			name: c.name,

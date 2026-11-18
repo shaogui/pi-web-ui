@@ -54,8 +54,7 @@ import { useNarrowLayout } from "./settings-mobile/use-narrow-layout";
 import "./settings-mobile/settings-mobile.css";
 import { sortAgentPresets, presetText } from "./DshPresetBar";
 import { DSH_PERMISSION_ORDER, permDescKey, permLabelKey } from "./DshPermissionBar";
-import { PluginPage } from "./PluginPage";
-import { PluginSettingsForm } from "./PluginSettingsForm";
+import { InstalledPluginsPanel } from "./InstalledPluginsPanel";
 import { ToolPromptEditor } from "./ToolPromptEditor";
 import { McpServersPanel } from "./McpServersPanel";
 import { DeviceExecutionSettings } from "./DeviceExecutionSettings";
@@ -101,6 +100,7 @@ import {
 } from "../prompt-history";
 import { randomUuid } from "../uuid";
 import { QuickAskSettings, type QuickAskPatch } from "./QuickAskSettings";
+import type { UiExtensionInventoryEntry } from "../types";
 import { SubagentTemplateWizard } from "./SubagentTemplateWizard";
 import { formatTokenDraft, parseTokenInput } from "../token-input";
 import { useWideChat, saveChatWidthSettings, useHideModelRow, saveHideModelRowSettings } from "../chat-width-settings";
@@ -129,7 +129,7 @@ import {
 	type UiDiagnostic,
 	type UiSlotEntry,
 } from "../ui-slots";
-import { ICON_EDIT_ALIGNS, sideAlignLabel } from "../ui-layout-edit";
+import { ICON_EDIT_ALIGNS, alignLabel } from "../ui-layout-edit";
 import type {
 	CatalogSyncState,
 	PluginInstallInspectState,
@@ -142,22 +142,17 @@ import type {
 import { PresetShareModal, type PresetShareTab } from "./PresetShareModal";
 import { appSend, useAppGlobals, useEngineStatuses } from "../app-globals";
 import { reconcileOverrideDraft, releaseConfirmedDrafts, useSettingsSync } from "../settings-sync";
-import { countPluginPhases, pluginPhase, type PluginPhase } from "../plugin-phase";
-import {
-	PLUGIN_LOG_LEVELS,
-	getPluginLogs,
-	pluginLogsClearRequest,
-	pluginLogsFetch,
-	subscribePluginLogs,
-	type PluginLogLevel,
-} from "../plugin-logs";
-import { QUICK_PHRASE_DEFAULTS } from "../quick-phrases";
+import { quickPhraseDefaults } from "../quick-phrases";
 import {
 	DEFAULT_PROMPT_TEMPLATE,
 	DEFAULT_PROMPT_DISABLED,
 	PROMPT_TOKENS,
 	estimatePromptTokens,
+	collectTemplateTokens,
+	effectiveTemplate,
 	isReadonlyPromptSource,
+	isLegacyPromptToken,
+	overrideOf,
 } from "../../../server/prompt-composer.js";
 import { isWindowsPlatform } from "../notify";
 import { AGENT_TOOL_CATALOG, filterToolsByPreset, presetShowsSkillCatalog } from "../../../server/tool-manager.js";
@@ -288,11 +283,6 @@ function rememberCatalogSyncUrl(url: string): string[] {
 	return next;
 }
 
-function rankPromptToken(tk: string): number {
-	if (tk === "append") return 0;
-	return isReadonlyPromptSource(tk) ? 2 : 1;
-}
-
 function ToggleRow({
 	title,
 	subtitle,
@@ -346,16 +336,6 @@ function ToggleRow({
 	);
 }
 
-function phaseLabelKey(ph: PluginPhase): string {
-	if (ph === "active") return "pluginPhaseActive";
-	if (ph === "disabled") return "pluginPhaseDisabled";
-	if (ph === "failed") return "pluginPhaseFailed";
-	return "pluginPhaseIdle";
-}
-function InvDot({ phase, label }: { phase: PluginPhase; label: string }) {
-	return <span className={`inv-dot inv-dot-${phase}`} title={label} aria-label={label} />;
-}
-
 export const OFFICIAL_PLUGINS_REPO_URL = "https://github.com/xing-shuyin/pi-web-ui-plugins";
 export const OFFICIAL_PLUGIN_CATALOG_URL = "https://xing-shuyin.github.io/pi-web-ui-plugins/catalog.json";
 
@@ -377,29 +357,6 @@ export function pluginOfficialUrl(entry?: { homepage?: string; source?: string }
 		return `https://github.com/${parts[0]}/${parts[1]}/tree/main/${parts.slice(2).join("/")}`;
 	}
 	return null;
-}
-
-function PluginInventoryStrip({ plugins, disabledIds }: { plugins: UiPluginInfo[]; disabledIds: ReadonlySet<string> }) {
-	const t = useT();
-	const counts = countPluginPhases(plugins, disabledIds);
-	const labels: Record<PluginPhase, string> = {
-		active: t("pluginPhaseActive"),
-		disabled: t("pluginPhaseDisabled"),
-		failed: t("pluginPhaseFailed"),
-		idle: t("pluginPhaseIdle"),
-	};
-	const order: PluginPhase[] = ["active", "disabled", "failed", "idle"];
-	return (
-		<div className="smart-inv-bar">
-			{order.map((ph) => (
-				<span key={ph} className={`smart-inv-chip ${ph}`} title={labels[ph]}>
-					<InvDot phase={ph} label={labels[ph]} />
-					<span className="smart-inv-label">{labels[ph]}</span>
-					<span className="smart-inv-count">{counts[ph]}</span>
-				</span>
-			))}
-		</div>
-	);
 }
 
 function FieldRow({
@@ -491,52 +448,6 @@ function PromptOverrideEditor({
 	);
 }
 
-function PluginLogView({ pluginId }: { pluginId: string }) {
-	const t = useT();
-	const [level, setLevel] = useState<"all" | PluginLogLevel>("all");
-	const all = getPluginLogs(pluginId);
-	const shown = level === "all" ? all : all.filter((e) => e.level === level);
-	return (
-		<>
-			<div className="set-log-filter">
-				<span className="set-log-filter-label">{t("pluginLogLevel")}</span>
-				{(["all", ...PLUGIN_LOG_LEVELS] as const).map((lv) => (
-					<button
-						key={lv}
-						type="button"
-						className={`set-log-filter-btn${level === lv ? " on" : ""}`}
-						onClick={() => setLevel(lv)}
-					>
-						{lv === "all" ? t("pluginLogAll") : lv.toUpperCase()}
-					</button>
-				))}
-				<button
-					type="button"
-					className="set-log-clear"
-					title={t("pluginLogClear")}
-					onClick={() => appSend(pluginLogsClearRequest(pluginId))}
-				>
-					<FiTrash2 />
-					{t("pluginLogClear")}
-				</button>
-			</div>
-			{shown.length === 0 ? (
-				<p className="set-empty">{t("pluginLogEmpty")}</p>
-			) : (
-				<ul className="set-diag-list set-log-list">
-					{shown.map((e, i) => (
-						<li key={`${pluginId}-${e.ts}-${i}`}>
-							<span className="set-log-time">{new Date(e.ts).toLocaleTimeString()}</span>{" "}
-							<span className={`set-log-level lv-${e.level}`}>{e.level.toUpperCase()}</span>{" "}
-							<span className="set-log-text">{e.text}</span>
-						</li>
-					))}
-				</ul>
-			)}
-		</>
-	);
-}
-
 type SettingsTab =
 	| "models"
 	| "prompt"
@@ -551,7 +462,7 @@ type SettingsTab =
 	| "quick"
 	| "markers"
 	| "skills"
-	| "extensions"
+	| "dsh-extensions"
 	| "plugins"
 	| "mcp"
 	| "layout"
@@ -561,8 +472,7 @@ type SettingsTab =
 	| "dsh-presets"
 	| "subagent-templates"
 	| "device-collab"
-	| "desktop"
-	| `plugin-page:${string}`;
+	| "desktop";
 
 interface SettingsPatch extends QuickAskPatch {
 	nativeCliInheritModel?: UiSettingsState["nativeCliInheritModel"];
@@ -709,7 +619,10 @@ function LoadedSettingsModal({
 		if (narrow && !wasNarrow.current) setMobileHome(true);
 		wasNarrow.current = narrow;
 	}, [narrow]);
-	const [pluginSub, setPluginSub] = useState<"official" | "community" | "installed">("official");
+	const [pluginTab, setPluginTab] = useState<"installed" | "market">("installed");
+	const [marketOrigin, setMarketOrigin] = useState<"official" | "community">("official");
+	// 派生给已有市场段复用：子页 installed 时沿用 "installed"，市场子页才是官方/社区分区。
+	const pluginSub: "official" | "community" | "installed" = pluginTab === "installed" ? "installed" : marketOrigin;
 	const bodyRef = useRef<HTMLDivElement>(null);
 	useEffect(() => {
 		bodyRef.current?.scrollTo({ top: 0 });
@@ -802,8 +715,8 @@ function LoadedSettingsModal({
 	const overrideCommitTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
 	const templateFocus = useRef(false);
 	const overrideFocus = useRef<string | null>(null);
-	const orderedPromptTokens = [...PROMPT_TOKENS].sort((a, b) => rankPromptToken(a) - rankPromptToken(b));
 	const [editingSource, setEditingSource] = useState<string | null>(null);
+	const [openSource, setOpenSource] = useState<string | null>(null);
 	const [defaultOpen, setDefaultOpen] = useState<Record<string, boolean>>({});
 	const [dshCustomPromptDraft, setDshCustomPromptDraft] = useState("");
 	const [dshPromptMode, setDshPromptMode] = useState<"append" | "replace">("append");
@@ -936,7 +849,6 @@ function LoadedSettingsModal({
 		const id = window.setTimeout(() => setPhClearConfirm(false), 3000);
 		return () => window.clearTimeout(id);
 	}, [phClearConfirm]);
-	const [confirmUninstall, setConfirmUninstall] = useState<string | null>(null);
 	const [confirmEngineUninstallId, setConfirmEngineUninstallId] = useState<string | null>(null);
 	const [confirmUiUninstall, setConfirmUiUninstall] = useState<string | null>(null);
 	// 确认态 5s 后自动回退，避免过一会儿再点同一颗按钮误卸
@@ -945,11 +857,6 @@ function LoadedSettingsModal({
 		const id = window.setTimeout(() => setConfirmUiUninstall(null), 5000);
 		return () => window.clearTimeout(id);
 	}, [confirmUiUninstall]);
-	const [diagOpen, setDiagOpen] = useState<string | null>(null);
-	const [logOpen, setLogOpen] = useState<string | null>(null);
-	const [settingsOpen, setSettingsOpen] = useState<Record<string, boolean>>({});
-	const [, bumpLogSeq] = useState(0);
-	useEffect(() => subscribePluginLogs(() => bumpLogSeq((n) => n + 1)), []);
 	const [catSource, setCatSource] = useState("");
 	const [catId, setCatId] = useState("");
 	const [catName, setCatName] = useState("");
@@ -1092,15 +999,6 @@ function LoadedSettingsModal({
 		diagnostics: uiDiagnostics,
 	});
 
-	const pluginPages: { entry: UiSlotEntry; plugin: UiPluginInfo }[] = [];
-	for (const entry of uiSlots["settings.pages"]) {
-		if (entry.source === "host" || entry.hidden || entry.kind === "divider") continue;
-		const plugin = chat.plugins.find((p) => p.id === entry.source.slice("plugin:".length));
-		if (!plugin) continue;
-		pluginPages.push({ entry, plugin });
-	}
-	const pluginPageTabId = (entryId: string): SettingsTab => `plugin-page:${entryId}`;
-
 	const disabledTools = new Set(settings.disabledAgentTools ?? []);
 	const disabledToolsCount = disabledTools.size;
 
@@ -1156,7 +1054,6 @@ function LoadedSettingsModal({
 		label: string;
 		count?: number;
 		dot?: boolean;
-		pluginPage?: { plugin: UiPluginInfo; entry: UiSlotEntry };
 		hint?: string;
 	}[] = [
 		...(onOpenManageModels
@@ -1210,32 +1107,6 @@ function LoadedSettingsModal({
 		...(isPi
 			? [{ id: "skills" as const, icon: <FiCpu />, label: t("settingsSkills"), count: settings.skills.length }]
 			: []),
-		...(isDsh
-			? [
-					{
-						id: "extensions" as const,
-						icon: <FiPackage />,
-						label: t("dshPlugins"),
-						count: chat.dshPatches?.files.length,
-					},
-				]
-			: isPi
-				? [
-						{
-							id: "extensions" as const,
-							icon: <FiPackage />,
-							label: t("settingsExtensions"),
-							count: settings.extensions.length,
-						},
-					]
-				: []),
-		{
-			id: "plugins",
-			icon: <FiBox />,
-			label: t("settingsUiPlugins"),
-			count: chat.plugins.length,
-			dot: hasBuiltinPluginUpdate || hasAnyPluginUpdate,
-		},
 		...(isPi
 			? [
 					{
@@ -1247,13 +1118,38 @@ function LoadedSettingsModal({
 					},
 				]
 			: []),
+		{
+			id: "plugins",
+			icon: <FiBox />,
+			label: t("settingsExtensions"),
+			count: chat.plugins.length + settings.extensions.length,
+			dot: hasBuiltinPluginUpdate || hasAnyPluginUpdate,
+		},
+		...(isDsh
+			? [
+					{
+						id: "dsh-extensions" as const,
+						icon: <FiPackage />,
+						label: t("dshPlugins"),
+						count: chat.dshPatches?.files.length,
+					},
+				]
+			: []),
 		{ id: "layout", icon: <FiSliders />, label: t("uiLayoutTitle") },
 		...(isClaude || isCodex
 			? []
 			: [{ id: "review" as const, icon: <FiZap />, label: t("settingsReview"), count: settings.reviewSkills.length }]),
 		...(isPi ? [{ id: "vision" as const, icon: <FiEye />, label: t("settingsVisionBridge") }] : []),
 		...(isPi
-			? [{ id: "presets" as const, icon: <FiSliders />, label: t("settingsPresets"), count: settings.presets.length }]
+			? [
+					{
+						id: "presets" as const,
+						icon: <FiSliders />,
+						label: t("settingsPresets"),
+						// 提示词模板（scope:"prompt"）展示在「系统提示词」页的模板库里，不占预设计数
+						count: settings.presets.filter((p) => p.scope !== "prompt").length || undefined,
+					},
+				]
 			: []),
 		...(isDsh
 			? [
@@ -1295,18 +1191,6 @@ function LoadedSettingsModal({
 					},
 				]
 			: []),
-		...pluginPages.map((p) => ({
-			id: pluginPageTabId(p.entry.id),
-			icon: p.entry.iconSvg ? (
-				<PluginIcon iconSvg={p.entry.iconSvg} />
-			) : p.entry.icon && !/[a-z]/i.test(p.entry.icon) ? (
-				<span>{p.entry.icon}</span>
-			) : (
-				<FiBox />
-			),
-			label: p.entry.label,
-			pluginPage: { plugin: p.plugin, entry: p.entry },
-		})),
 	];
 
 	const [tabSearchQuery, setTabSearchQuery] = useState("");
@@ -1348,10 +1232,8 @@ function LoadedSettingsModal({
 		question: "tools",
 		mcp: "tools",
 		skills: "tools",
-		extensions: "tools",
-
+		plugins: "tools",
 		layout: "ui",
-		plugins: "ui",
 		display: "ui",
 		sound: "ui",
 		quick: "ui",
@@ -1360,106 +1242,42 @@ function LoadedSettingsModal({
 		"prompt-history": "advanced",
 		scheduler: "advanced",
 		review: "advanced",
+		"dsh-extensions": "advanced",
 		"device-collab": "advanced",
 	};
 
-	const TAB_KEYWORDS: Record<string, string[]> = {
-		models: [
-			"模型",
-			"服务商",
-			"baseurl",
-			"api key",
-			"provider",
-			"token",
-			"deepseek",
-			"claude",
-			"openai",
-			"gemini",
-			"ollama",
-			"glm",
-			"minimax",
-			"qwen",
-			"中转",
-			"自定义模型",
-			"推理",
-			"r1",
-		],
-		prompt: ["系统提示词", "system prompt", "前缀", "角色", "instructions", "设定", "提示词", "自定义提示词"],
-		"quick-ask": ["随手问", "解释", "选中文字", "小窗", "quick ask", "explain", "popup"],
-		"prompt-history": ["历史", "输入历史", "prompt history", "记录", "清除历史", "对话历史"],
-		scheduler: ["定时", "定时任务", "cron", "scheduler", "自动化", "后台", "排期", "计划任务"],
-		tools: [
-			"工具",
-			"bash",
-			"终端",
-			"read",
-			"edit",
-			"write",
-			"延迟加载",
-			"lazy",
-			"只读",
-			"powershell",
-			"grep",
-			"find",
-			"目录",
-			"工具开关",
-			"prompt cache",
-			"前缀缓存",
-		],
-		"approval-rules": [
-			"审批",
-			"安全",
-			"规则",
-			"approval",
-			"deny",
-			"allow",
-			"二次确认",
-			"白名单",
-			"权限",
-			"拦截",
-			"高危",
-		],
-		question: ["问卷", "提问", "questionnaire", "dsh"],
-		display: ["显示", "排版", "宽屏", "wide", "隐藏模型", "avatar", "头像", "折叠", "紧凑", "样式", "气泡", "字号"],
-		sound: ["声音", "音效", "语音", "tts", "朗读", "音量", "提示音", "静音", "播报"],
-		quick: ["快捷", "短语", "quick phrase", "常用语", "快捷短语", "快捷回复"],
-		skills: ["技能", "skills", "slash", "斜杠", "技能库", "市场"],
-		extensions: ["扩展", "extensions", "补丁", "patches", "dsh"],
-		plugins: ["插件", "ui plugins", "市场", "catalog", "更新", "组件"],
-		mcp: ["mcp", "servers", "stdio", "sse", "协议", "服务器", "外部工具"],
-		layout: ["布局", "layout", "顶栏", "底栏", "图标", "icons", "排列", "按钮", "侧栏", "dock"],
-		review: ["审查", "review", "目标", "gate", "审阅"],
-		vision: ["视觉", "vision", "截图", "图片", "视觉桥", "屏幕"],
-		presets: ["预设", "presets", "分享", "导出", "导入", "社区预设"],
-		"dsh-presets": ["dsh", "预设", "权限", "ptc", "极简模式"],
-		"subagent-templates": ["子代理", "subagent", "templates", "模板", "并发", "角色模板"],
-		"device-collab": [
-			"群组",
-			"群任务",
-			"设备",
-			"协作",
-			"并发",
-			"调度",
-			"派发",
-			"配额",
-			"限制",
-			"文件同步",
-			"上下文",
-			"黑板",
-			"锁",
-			"bot",
-			"mention",
-			"device",
-			"group",
-			"collaboration",
-			"scheduler",
-			"dispatch",
-			"quota",
-			"sync",
-			"blackboard",
-			"lock",
-		],
-	};
+	// 页签搜索同义词：译文随界面语言切换，每条 key 用逗号分隔（中英文逗号都认）。
+	const tabKeywords = useMemo<Record<string, string[]>>(() => {
+		const split = (value: string) =>
+			value
+				.split(/[,，]/)
+				.map((word) => word.trim())
+				.filter(Boolean);
+		return {
+			models: split(t("settingsSearchKeywordsModels")),
+			prompt: split(t("settingsSearchKeywordsPrompt")),
+			"quick-ask": split(t("settingsSearchKeywordsQuickAsk")),
+			"prompt-history": split(t("settingsSearchKeywordsPromptHistory")),
+			scheduler: split(t("settingsSearchKeywordsScheduler")),
+			tools: split(t("settingsSearchKeywordsTools")),
+			"approval-rules": split(t("settingsSearchKeywordsApprovalRules")),
+			question: split(t("settingsSearchKeywordsQuestion")),
+			display: split(t("settingsSearchKeywordsDisplay")),
+			sound: split(t("settingsSearchKeywordsSound")),
+			quick: split(t("settingsSearchKeywordsQuick")),
+			skills: split(t("settingsSearchKeywordsSkills")),
+			extensions: split(t("settingsSearchKeywordsExtensions")),
+			plugins: split(t("settingsSearchKeywordsPlugins")),
+			mcp: split(t("settingsSearchKeywordsMcp")),
+			layout: split(t("settingsSearchKeywordsLayout")),
+			review: split(t("settingsSearchKeywordsReview")),
+			vision: split(t("settingsSearchKeywordsVision")),
+			presets: split(t("settingsSearchKeywordsPresets")),
+			"dsh-presets": split(t("settingsSearchKeywordsDshPresets")),
+			"subagent-templates": split(t("settingsSearchKeywordsSubagentTemplates")),
+			"device-collab": split(t("settingsSearchKeywordsDeviceCollab")),
+		};
+	}, [t]);
 
 	const GROUP_LABELS = {
 		core: t("settingsGroupCore"),
@@ -1475,11 +1293,11 @@ function LoadedSettingsModal({
 		if (!q) return tabs;
 		return tabs.filter((t) => {
 			if (t.label.toLowerCase().includes(q) || t.id.toLowerCase().includes(q)) return true;
-			const kw = TAB_KEYWORDS[t.id];
+			const kw = tabKeywords[t.id];
 			if (kw && kw.some((k) => k.toLowerCase().includes(q) || q.includes(k.toLowerCase()))) return true;
 			return false;
 		});
-	}, [tabs, tabSearchQuery]);
+	}, [tabs, tabKeywords, tabSearchQuery]);
 
 	useEffect(() => {
 		if (!tabSearchQuery.trim()) return;
@@ -1533,10 +1351,6 @@ function LoadedSettingsModal({
 		}
 	}, [tabs, tab]);
 
-	const activePluginPage = tab.startsWith("plugin-page:")
-		? (pluginPages.find((p) => pluginPageTabId(p.entry.id) === tab) ?? null)
-		: null;
-
 	const disabledSkills = new Set(settings.disabledSkills);
 	const disabledExts = new Set(settings.disabledExtensions);
 
@@ -1583,6 +1397,85 @@ function LoadedSettingsModal({
 		else next.add(e.id);
 		setPartial({ disabledExtensions: [...next] });
 	};
+
+	// #885 统一清单：服务端 inventory 优先（extension_inventory_data，含健康），缺席时用本地快照兜底聚合。
+	// 自动刷新：extension_inventory_changed（mcp.json 监听 + broadcastMcpServers）触发重拉，前端防抖由服务端 600ms 承担。
+	const inventoryDirty = (chat as { extensionInventoryDirty?: number }).extensionInventoryDirty ?? 0;
+	const inventoryEntries: UiExtensionInventoryEntry[] = useMemo(() => {
+		const server = (chat as { extensionInventory?: UiExtensionInventoryEntry[] | null }).extensionInventory;
+		if (Array.isArray(server) && server.length > 0) return server;
+		const out: UiExtensionInventoryEntry[] = [];
+		for (const e of settings.extensions ?? []) {
+			out.push({
+				name: e.id,
+				source: "cli",
+				enabled: e.enabled,
+				description: e.path ? `${t("settingsInventoryCliDesc")} ${e.path}` : t("settingsInventoryCliDesc"),
+			});
+		}
+		for (const p of chat.plugins ?? []) {
+			out.push({
+				name: p.id,
+				source: "webui",
+				enabled: !(settings.disabledPlugins ?? []).includes(p.id),
+				version: p.version,
+				description: p.description?.trim() ? p.description.trim() : t("settingsInventoryWebuiDesc"),
+				...(p.error?.trim() ? { error: p.error.trim() } : {}),
+			});
+		}
+		for (const s of settings.mcpServers ?? []) {
+			const err =
+				typeof (s as { error?: unknown }).error === "string" && ((s as { error?: string }).error ?? "").trim()
+					? ((s as { error?: string }).error ?? "").trim()
+					: undefined;
+			const status =
+				typeof (s as { status?: unknown }).status === "string" ? ((s as { status?: string }).status ?? "") : "";
+			const health = err
+				? ("error" as const)
+				: s.enabled === false
+					? ("stopped" as const)
+					: status === "running"
+						? ("online" as const)
+						: status === "error"
+							? ("error" as const)
+							: status === "stopped"
+								? ("offline" as const)
+								: undefined;
+			const tools = Array.isArray((s as { tools?: unknown }).tools)
+				? ((s as { tools?: unknown[] }).tools ?? [])
+				: undefined;
+			out.push({
+				name: `mcp:${s.scope}:${s.name}`,
+				source: "external",
+				enabled: s.enabled !== false,
+				description:
+					typeof (s as { description?: unknown }).description === "string" &&
+					((s as { description?: string }).description ?? "").trim()
+						? ((s as { description?: string }).description ?? "").trim()
+						: t("settingsInventoryMcpDesc", { scope: s.scope }),
+				...(err ? { error: err } : {}),
+				...(health ? { health } : {}),
+				...(typeof tools?.length === "number" ? { toolCount: tools.length } : {}),
+			});
+		}
+		out.sort((a, b) => a.source.localeCompare(b.source) || a.name.localeCompare(b.name));
+		return out;
+	}, [chat, settings, t]);
+
+	useEffect(() => {
+		if (tab === "plugins") {
+			try {
+				appSend({ type: "extension_inventory", reqId: Date.now() % 1_000_000_000 } as never);
+			} catch {}
+		}
+	}, [tab]);
+
+	useEffect(() => {
+		if (tab !== "plugins" || inventoryDirty === 0) return;
+		try {
+			appSend({ type: "extension_inventory", reqId: Date.now() % 1_000_000_000 } as never);
+		} catch {}
+	}, [tab, inventoryDirty]);
 
 	const onDemandTools = settings.toolOnDemandTools ?? [];
 	const onDemandToolNames = new Set(onDemandTools);
@@ -1647,8 +1540,6 @@ function LoadedSettingsModal({
 		if (needMaster && !toolFlowMasterOn) (patch as Record<string, unknown>).toolLazyLoading = true;
 		setPartial(patch);
 	};
-	const disabledPluginTools = new Set(settings.disabledPluginTools ?? []);
-
 	const disabledMarkers = new Set(settings.disabledMarkers ?? []);
 	// 标记没有独立的全局开关：只要还剩一个开着就是启用，全关 = 不再注入/解析标记。
 	const markersOn = (settings.markers ?? []).filter((m) => m.enabled).length;
@@ -1700,7 +1591,6 @@ function LoadedSettingsModal({
 	};
 
 	const runUninstall = (pkgName: string) => {
-		setConfirmUninstall(null);
 		runTerminalCommand(`${t("uninstallTitle")} ${pkgName}`, `pi remove npm:${pkgName}`);
 	};
 
@@ -1810,6 +1700,7 @@ function LoadedSettingsModal({
 		{ slot: "composer.leading", labelKey: "uiLayoutComposerLeading" },
 		{ slot: "composer.actions", labelKey: "uiLayoutComposer" },
 		{ slot: "rightpanel.tabs", labelKey: "uiLayoutRightPanel" },
+		{ slot: "bottomdock.tabs", labelKey: "uiLayoutBottomDock" },
 		{ slot: "terminal.toolbar", labelKey: "uiLayoutTerminal" },
 		{ slot: "scm.toolbar", labelKey: "uiLayoutScm" },
 		{ slot: "bottombar", labelKey: "uiLayoutBottombar" },
@@ -1819,6 +1710,7 @@ function LoadedSettingsModal({
 		{ slot: "contextmenu.session", labelKey: "uiLayoutContextSession" },
 		{ slot: "contextmenu.project", labelKey: "uiLayoutContextProject" },
 		{ slot: "contextmenu.file", labelKey: "uiLayoutContextFile" },
+		{ slot: "contextmenu.search", labelKey: "uiLayoutContextSearch" },
 		{ slot: "contextmenu.toolcall", labelKey: "uiLayoutContextToolcall" },
 		{ slot: "tool.card.footer", labelKey: "uiLayoutToolCardFooter" },
 		{ slot: "settings.pages", labelKey: "uiLayoutSettingsPages" },
@@ -1975,22 +1867,6 @@ function LoadedSettingsModal({
 	/** 服务端已确认的模板值（未回执前不得被服务端快照覆盖） */
 	const templateSentRef = useRef<string | null>(null);
 
-	const commitTemplate = () => {
-		if (templateDebounceTimer.current) {
-			clearTimeout(templateDebounceTimer.current);
-			templateDebounceTimer.current = null;
-		}
-		const cur = promptTemplateDraftRef.current;
-		if (cur === (serverSettings?.promptTemplate ?? "")) {
-			// 与服务端已一致：不需要发送，也不需要占用草稿
-			templateDirtyRef.current = false;
-			return;
-		}
-		templateDirtyRef.current = true;
-		templateSentRef.current = cur;
-		setPartial({ promptTemplate: cur });
-	};
-
 	const clearOverrideTimer = (token: string) => {
 		const timer = overrideCommitTimers.current.get(token);
 		if (timer) {
@@ -2080,18 +1956,111 @@ function LoadedSettingsModal({
 		});
 	};
 
-	const appendTokenToTemplate = (token: string) => {
+	/* ── 拼装来源（开关式组合模板）：开关/排序都落到 promptTemplate / promptDisabled ──
+	 * 模板为空 = 默认模板（自然拼装顺序，零开销）；此时开关走 promptDisabled。
+	 * 首次调整顺序或自定义模板下编辑开关 → 序列化成 "{{a}}\n\n{{b}}" 形式（等同默认串时归零回 ""）。
+	 */
+	const templateCustom = useMemo(() => {
+		const raw = promptTemplateDraft.trim();
+		if (!raw || raw === DEFAULT_PROMPT_TEMPLATE) return null;
+		const all = collectTemplateTokens(raw);
+		const toks = all.filter((tk) => (PROMPT_TOKENS as readonly string[]).includes(tk) && !isLegacyPromptToken(tk));
+		const rest = raw.replace(/\{\{\s*[\w]+\s*\}\}/g, " ").trim();
+		const unknown = all.some((tk) => !(PROMPT_TOKENS as readonly string[]).includes(tk) || isLegacyPromptToken(tk));
+		return { toks, hasExtras: rest.length > 0 || unknown };
+	}, [promptTemplateDraft]);
+
+	const assemblyRows: readonly string[] = templateCustom ? templateCustom.toks : PROMPT_TOKENS;
+	const sourceEnabled = (tk: string) =>
+		templateCustom ? templateCustom.toks.includes(tk) : !(settings.promptDisabled ?? []).includes(tk);
+	const offSourceChips = templateCustom ? PROMPT_TOKENS.filter((tk) => !templateCustom.toks.includes(tk)) : [];
+
+	const setTemplateValue = (nextRaw: string) => {
 		if (templateDebounceTimer.current) {
 			clearTimeout(templateDebounceTimer.current);
 			templateDebounceTimer.current = null;
 		}
-		const cur = promptTemplateDraftRef.current;
-		const next = cur.trim() ? `${cur}\n\n{{${token}}}` : `{{${token}}}`;
+		// 恰为默认模板串时归零：空模板走 SDK 默认分支（零开销），也避免面板把默认串当成「已自定义」
+		const next = nextRaw === DEFAULT_PROMPT_TEMPLATE ? "" : nextRaw;
 		setPromptTemplateDraft(next);
 		promptTemplateDraftRef.current = next;
+		if (next === (serverSettings?.promptTemplate ?? "")) {
+			templateDirtyRef.current = false;
+			return;
+		}
 		templateDirtyRef.current = true;
 		templateSentRef.current = next;
 		setPartial({ promptTemplate: next });
+	};
+
+	const toggleSource = (tk: string, on: boolean) => {
+		if (templateCustom) {
+			const toks = templateCustom.toks.filter((x) => x !== tk);
+			if (on) toks.push(tk);
+			setTemplateValue(toks.map((k) => `{{${k}}}`).join("\n\n"));
+			return;
+		}
+		const cur = new Set(settings.promptDisabled ?? []);
+		if (on) cur.delete(tk);
+		else cur.add(tk);
+		setPartial({ promptDisabled: [...cur] });
+	};
+
+	const moveSource = (idx: number, dir: 1 | -1) => {
+		const j = idx + dir;
+		if (j < 0 || j >= assemblyRows.length) return;
+		const list = [...assemblyRows];
+		[list[idx], list[j]] = [list[j], list[idx]];
+		if (templateCustom) {
+			setTemplateValue(list.map((k) => `{{${k}}}`).join("\n\n"));
+			return;
+		}
+		// 默认模板下的首次排序：物化为自定义模板（默认停用段不进模板；promptDisabled 保持不动）
+		const dis = new Set(settings.promptDisabled ?? []);
+		setTemplateValue(
+			list
+				.filter((k) => !dis.has(k))
+				.map((k) => `{{${k}}}`)
+				.join("\n\n"),
+		);
+	};
+
+	/* ── 提示词模板库 = 只捕获 prompt 字段组的预设（scope:"prompt"）──
+	 * 切换 = apply_preset（只回写 prompt 组字段）；删除/分享复用预设通道。
+	 */
+	const promptTemplates = useMemo(() => settings.presets.filter((p) => p.scope === "prompt"), [settings.presets]);
+
+	const templateActive = (p: (typeof settings.presets)[number]) => {
+		if (effectiveTemplate(p.promptTemplate) !== effectiveTemplate(serverSettings?.promptTemplate)) return false;
+		const normOv = (m: Record<string, string> | undefined) =>
+			Object.entries(m ?? {})
+				.filter(([, v]) => v.trim())
+				.map(([k, v]) => `${k}=${v.trim()}`)
+				.sort()
+				.join("|");
+		if (normOv(p.promptOverrides) !== normOv(serverSettings?.promptOverrides)) return false;
+		const normList = (l: string[] | undefined) => [...(l ?? [])].sort().join("|");
+		return normList(p.promptDisabled) === normList(serverSettings?.promptDisabled);
+	};
+
+	const templateMeta = (p: (typeof settings.presets)[number]) => {
+		const toks = collectTemplateTokens(effectiveTemplate(p.promptTemplate));
+		const est = toks.reduce(
+			(n, tk) =>
+				n + estimatePromptTokens(overrideOf(p.promptOverrides, tk) || settings.promptSourceDefaults?.[tk] || ""),
+			0,
+		);
+		const ovs = Object.values(p.promptOverrides ?? {}).filter((v) => v.trim()).length;
+		const off = (p.promptDisabled ?? []).length;
+		return `≈${est.toLocaleString()} · ${t("promptTemplateMetaOv", { n: ovs })}${off ? ` · ${t("promptTemplateMetaOff", { n: off })}` : ""}`;
+	};
+
+	const [promptTemplateName, setPromptTemplateName] = useState("");
+	const savePromptTemplate = () => {
+		const n = promptTemplateName.trim();
+		if (!n) return;
+		appSend({ type: "save_preset", name: n, groups: ["prompt"] });
+		setPromptTemplateName("");
 	};
 
 	const flushAllDrafts = () => {
@@ -2680,290 +2649,324 @@ function LoadedSettingsModal({
 								)}
 								{!isDsh ? (
 									<>
-										<div className="set-field">
-											<label className="set-field-label">{t("promptTemplateLabel")}</label>
-											<textarea
-												className="set-prompt-input"
-												rows={4}
-												spellCheck={false}
-												placeholder={DEFAULT_PROMPT_TEMPLATE}
-												value={promptTemplateDraft}
-												onFocus={() => (templateFocus.current = true)}
-												onBlur={() => {
-													templateFocus.current = false;
-													commitTemplate();
-												}}
-												onChange={(e) => {
-													const val = e.target.value;
-													templateDirtyRef.current = true;
-													setPromptTemplateDraft(val);
-													promptTemplateDraftRef.current = val;
-													if (templateDebounceTimer.current) clearTimeout(templateDebounceTimer.current);
-													templateDebounceTimer.current = setTimeout(() => {
-														templateDebounceTimer.current = null;
-														templateSentRef.current = val;
-														if (val !== (serverSettings?.promptTemplate ?? "")) {
-															setPartial({ promptTemplate: val });
-														}
-													}, 800);
-												}}
-											/>
-											<div className="compose-toolbar">
-												<span className="set-field-label set-muted">{t("promptInsertTokens")}</span>
-												{orderedPromptTokens.map((tk) => (
+										<details className="set-field prompt-templates set-fold">
+											<summary className="prompt-templates-head">
+												<span className="set-field-label">{t("promptTemplateLibLabel")}</span>
+												<HintTip text={t("promptTemplateLibHint")} />
+												<span className="set-count">{promptTemplates.length}</span>
+												<span className="set-fold-chev" aria-hidden="true">
+													▾
+												</span>
+											</summary>
+											<div className="prompt-templates-body">
+												<div className="prompt-templates-actions">
 													<button
-														key={tk}
 														type="button"
-														className="token-chip"
-														title={tt(`promptTok_${tk}_desc`)}
-														onClick={() => appendTokenToTemplate(tk)}
+														className="set-btn-mini"
+														onClick={() => setPresetShareFor({ name: "", tab: "import" })}
 													>
-														{`{{${tk}}}`}
+														{t("presetShareImportBtn")}
 													</button>
-												))}
+												</div>
+												{promptTemplates.length === 0 ? (
+													<p className="set-hint">{t("promptTemplateEmpty")}</p>
+												) : (
+													<div className="prompt-template-list">
+														{promptTemplates.map((p) => {
+															const active = templateActive(p);
+															return (
+																<div className={`prompt-template-row${active ? " active" : ""}`} key={p.name}>
+																	<span className="prompt-template-name">{p.name}</span>
+																	{active && <span className="prompt-template-badge">{t("promptTemplateActive")}</span>}
+																	<span className="set-muted prompt-template-meta">{templateMeta(p)}</span>
+																	<span className="prompt-template-actions">
+																		{!active && (
+																			<button
+																				type="button"
+																				className="set-btn-mini"
+																				onClick={() => appSend({ type: "apply_preset", name: p.name })}
+																			>
+																				{t("promptTemplateApply")}
+																			</button>
+																		)}
+																		<button
+																			type="button"
+																			className="set-icon-btn"
+																			title={t("presetShare")}
+																			onClick={() => setPresetShareFor({ name: p.name, tab: "export" })}
+																		>
+																			<FiShare2 />
+																		</button>
+																		<button
+																			type="button"
+																			className="set-icon-btn danger"
+																			title={t("deletePreset")}
+																			onClick={() => appSend({ type: "delete_preset", name: p.name })}
+																		>
+																			<FiTrash2 />
+																		</button>
+																	</span>
+																</div>
+															);
+														})}
+													</div>
+												)}
+												<div className="set-preset-save">
+													<input
+														className="set-input"
+														placeholder={t("promptTemplateSaveNamePh")}
+														value={promptTemplateName}
+														onChange={(e) => setPromptTemplateName(e.target.value)}
+														onKeyDown={(e) => {
+															if (e.key === "Enter") savePromptTemplate();
+														}}
+													/>
+													<button
+														type="button"
+														className="set-save-btn"
+														disabled={!promptTemplateName.trim()}
+														onClick={savePromptTemplate}
+													>
+														<FiPlus /> {t("promptTemplateSaveBtn")}
+													</button>
+												</div>
 											</div>
-										</div>
-										<div className="set-field">
-											<label className="set-field-label">{t("promptSourcesLabel")}</label>
-											{orderedPromptTokens.map((tk) => {
-												const v = promptOverridesDraft[tk] ?? "";
-												const def = settings.promptSourceDefaults?.[tk] ?? "";
-												const editing = editingSource === tk;
-												const isLong = def.split("\n").length > 6 || def.length > 480;
-												const tkDisabled = (settings.promptDisabled ?? []).includes(tk);
-												const tkEffTokens = tkDisabled ? 0 : estimatePromptTokens(v.trim() ? v : def);
-												if (isReadonlyPromptSource(tk)) {
-													const shown = v.trim() ? v : def;
+										</details>
+										<div className="set-field prompt-sources">
+											<div className="prompt-sources-head">
+												<label className="set-field-label">{t("promptAssemblyLabel")}</label>
+												<HintTip text={t("promptAssemblyHint")} />
+												<span className="set-muted prompt-assembly-count">
+													{assemblyRows.filter((tk) => sourceEnabled(tk)).length}/{PROMPT_TOKENS.length}
+												</span>
+											</div>
+											{templateCustom?.hasExtras && (
+												<p className="prompt-assembly-warn">{t("promptAssemblyLegacyWarn")}</p>
+											)}
+											<div className="prompt-src-list" role="group" aria-label={t("promptSourcesLabel")}>
+												{assemblyRows.map((tk, idx) => {
+													const v = promptOverridesDraft[tk] ?? "";
+													const def = settings.promptSourceDefaults?.[tk] ?? "";
+													const on = sourceEnabled(tk);
+													const open = openSource === tk;
+													const edited = Boolean(v.trim());
+													const readonly = isReadonlyPromptSource(tk);
+													const isLong = def.split("\n").length > 6 || def.length > 480;
+													const effTokens = on ? estimatePromptTokens(v.trim() ? v : def) : 0;
+													const shownDef = readonly && edited ? v : def;
 													return (
-														<div className="override-row readonly" key={tk}>
-															<div className="override-row-head">
-																<label className="set-check">
-																	<input
-																		type="checkbox"
-																		checked={!(settings.promptDisabled ?? []).includes(tk)}
-																		title={t("promptToggleEnabled")}
-																		onChange={(e) => {
-																			const cur = new Set(settings.promptDisabled ?? []);
-																			if (e.target.checked) cur.delete(tk);
-																			else cur.add(tk);
-																			setPartial({ promptDisabled: [...cur] });
-																		}}
-																	/>
-																	{t("promptToggleEnabled")}
-																</label>
-																{`{{${tk}}}`}
-																<span className="set-muted">
-																	{tt(`promptTok_${tk}`)} <HintTip text={tt(`promptTok_${tk}_desc`)} /> · ≈
-																	{tkEffTokens.toLocaleString()}
-																</span>
-																{v.trim() ? (
+														<div
+															className={`prompt-src${on ? "" : " off"}${open ? " open" : ""}`}
+															data-token={tk}
+															key={tk}
+														>
+															<div className="prompt-src-row">
+																<button
+																	type="button"
+																	role="switch"
+																	aria-checked={on}
+																	className={`set-switch${on ? " on" : ""}`}
+																	title={t("promptToggleEnabled")}
+																	onClick={() => toggleSource(tk, !on)}
+																>
+																	<span className="set-switch-knob" />
+																</button>
+																<button
+																	type="button"
+																	className="prompt-src-main"
+																	aria-expanded={open}
+																	onClick={() => {
+																		const next = open ? null : tk;
+																		setOpenSource(next);
+																		if (next) setEditingSource(next);
+																	}}
+																>
+																	<span className="prompt-src-name">{tt(`promptTok_${tk}`)}</span>
+																	<span className="prompt-src-desc">{tt(`promptTok_${tk}_desc`)}</span>
+																</button>
+																{edited ? (
+																	<span className="prompt-src-flag edited">{t("promptSecEdited")}</span>
+																) : (
+																	<span
+																		className="prompt-src-flag"
+																		title={readonly ? t("promptReadonlyBadge") : undefined}
+																	>
+																		{t("promptAutoBadge")}
+																	</span>
+																)}
+																<span className="prompt-src-meta">≈{effTokens.toLocaleString()}</span>
+																<span className="prompt-src-move">
 																	<button
 																		type="button"
 																		className="set-btn-mini"
-																		title={t("promptReadonlyLockedHint")}
-																		onClick={() => resetOverride(tk)}
+																		disabled={idx === 0}
+																		title={t("promptMoveUp")}
+																		onClick={() => moveSource(idx, -1)}
 																	>
-																		{t("promptResetSource")}
+																		↑
 																	</button>
-																) : (
-																	<span className="set-muted">{t("promptReadonlyBadge")}</span>
-																)}
+																	<button
+																		type="button"
+																		className="set-btn-mini"
+																		disabled={idx === assemblyRows.length - 1}
+																		title={t("promptMoveDown")}
+																		onClick={() => moveSource(idx, 1)}
+																	>
+																		↓
+																	</button>
+																</span>
+																<span className={`prompt-src-chev${open ? " open" : ""}`} aria-hidden="true">
+																	▾
+																</span>
 															</div>
-															<div
-																className={`source-default readonly${shown.trim() ? "" : " empty"}`}
-																title={t("promptReadonlyTitle")}
-															>
-																{shown.trim() ? (
-																	<>
-																		<pre
-																			className={`source-default-text${
-																				isLong ? (defaultOpen[tk] ? " expanded" : " clamped") : ""
-																			}`}
-																		>
-																			{shown}
-																		</pre>
-																		{isLong && (
-																			<span
-																				className="source-default-toggle"
-																				role="button"
-																				tabIndex={0}
-																				onClick={(e) => {
-																					e.stopPropagation();
-																					toggleDefault(tk);
-																				}}
-																				onKeyDown={(e) => {
-																					if (e.key === "Enter" || e.key === " ") {
-																						e.preventDefault();
-																						e.stopPropagation();
-																						toggleDefault(tk);
-																					}
-																				}}
-																			>
-																				{defaultOpen[tk] ? t("promptSourceCollapse") : t("promptSourceExpand")}
-																			</span>
-																		)}
-																	</>
-																) : (
-																	<span className="source-default-empty">{t("promptSourceDefaultEmpty")}</span>
-																)}
-															</div>
-														</div>
-													);
-												}
-												return (
-													<div className="override-row" key={tk}>
-														<div className="override-row-head">
-															<label className="set-check">
-																<input
-																	type="checkbox"
-																	checked={!(settings.promptDisabled ?? []).includes(tk)}
-																	title={t("promptToggleEnabled")}
-																	onChange={(e) => {
-																		const cur = new Set(settings.promptDisabled ?? []);
-																		if (e.target.checked) cur.delete(tk);
-																		else cur.add(tk);
-																		setPartial({ promptDisabled: [...cur] });
-																	}}
-																/>
-																{t("promptToggleEnabled")}
-															</label>
-															{`{{${tk}}}`}
-															<span className="set-muted">
-																{tt(`promptTok_${tk}`)} <HintTip text={tt(`promptTok_${tk}_desc`)} /> · ≈
-																{tkEffTokens.toLocaleString()}
-															</span>
-															{v.trim() ? (
-																<button type="button" className="set-btn-mini" onClick={() => resetOverride(tk)}>
-																	{t("promptResetSource")}
-																</button>
-															) : (
-																<span className="set-muted">{t("promptAutoBadge")}</span>
-															)}
-														</div>
-														{v.trim() || editing ? (
-															<>
-																<textarea
-																	className="set-prompt-input override-input"
-																	rows={Math.min(10, Math.max(1, v.split("\n").length))}
-																	autoFocus={editing}
-																	placeholder={t("promptOverridePlaceholder")}
-																	value={v}
-																	onFocus={(e) => {
-																		overrideFocus.current = tk;
-																		setEditingSource(tk);
-																		const el = e.currentTarget as HTMLTextAreaElement;
-																		if (el.value && el.value === def)
-																			el.setSelectionRange(el.value.length, el.value.length);
-																	}}
-																	onBlur={() => {
-																		if (overrideFocus.current === tk) overrideFocus.current = null;
-																		const val = promptOverridesDraftRef.current[tk] ?? "";
-																		if (val.trim() && val === def) {
-																			resetOverride(tk);
-																			return;
-																		}
-																		commitOverride(tk);
-																		if (!val.trim()) setEditingSource(null);
-																	}}
-																	onChange={(e) => {
-																		const val = e.target.value;
-																		overridesDirtyRef.current.add(tk);
-																		setPromptOverridesDraft((p) => {
-																			const next = { ...p, [tk]: val };
-																			promptOverridesDraftRef.current = next;
-																			return next;
-																		});
-																		scheduleOverrideCommit(tk);
-																	}}
-																/>
-																<div className="override-edit-foot">
-																	<div className="override-edit-foot-head">
-																		<span className="set-muted">{t("promptSourceRefLabel")}</span>
-																		{isLong && (
-																			<button
-																				type="button"
-																				className="source-default-toggle"
-																				onClick={() => toggleDefault(tk)}
-																			>
-																				{defaultOpen[tk] ? t("promptSourceCollapse") : t("promptSourceExpand")}
-																			</button>
-																		)}
+															{open && (
+																<div className="prompt-src-body">
+																	<div className="prompt-src-label">
+																		<span>{tt(`promptSec_${tk}_edit`)}</span>
+																		<em>{tt(`promptSec_${tk}_hint`)}</em>
 																	</div>
-																	{def.trim() ? (
-																		<pre
-																			className={`source-default-text${
-																				isLong ? (defaultOpen[tk] ? " expanded" : " clamped") : ""
-																			}`}
-																		>
-																			{def}
-																		</pre>
+																	{readonly ? (
+																		<>
+																			<div
+																				className={`source-default readonly${shownDef.trim() ? "" : " empty"}`}
+																				title={t("promptReadonlyTitle")}
+																			>
+																				{shownDef.trim() ? (
+																					<>
+																						<pre
+																							className={`source-default-text${
+																								isLong ? (defaultOpen[tk] ? " expanded" : " clamped") : ""
+																							}`}
+																						>
+																							{shownDef}
+																						</pre>
+																						{isLong && (
+																							<button
+																								type="button"
+																								className="source-default-toggle"
+																								onClick={() => toggleDefault(tk)}
+																							>
+																								{defaultOpen[tk] ? t("promptSourceCollapse") : t("promptSourceExpand")}
+																							</button>
+																						)}
+																					</>
+																				) : (
+																					<span className="source-default-empty">{t("promptSourceDefaultEmpty")}</span>
+																				)}
+																			</div>
+																			{edited && (
+																				<div className="prompt-src-foot">
+																					<button
+																						type="button"
+																						className="set-btn-mini"
+																						title={t("promptReadonlyLockedHint")}
+																						onClick={() => resetOverride(tk)}
+																					>
+																						{t("promptResetSource")}
+																					</button>
+																				</div>
+																			)}
+																		</>
 																	) : (
-																		<span className="source-default-empty">{t("promptSourceDefaultEmpty")}</span>
-																	)}
-																	{!v.trim() && def.trim() && (
-																		<button
-																			type="button"
-																			className="override-seed-btn"
-																			title={t("promptSourceSeedTip")}
-																			onClick={() => seedFromDefault(tk, def)}
-																		>
-																			{t("promptSourceSeedButton")}
-																		</button>
+																		<>
+																			<textarea
+																				className="set-prompt-input override-input"
+																				rows={Math.min(10, Math.max(1, v.split("\n").length))}
+																				autoFocus={editingSource === tk}
+																				placeholder={t("promptOverridePlaceholder")}
+																				value={v}
+																				onFocus={(e) => {
+																					overrideFocus.current = tk;
+																					setEditingSource(tk);
+																					const el = e.currentTarget as HTMLTextAreaElement;
+																					if (el.value && el.value === def)
+																						el.setSelectionRange(el.value.length, el.value.length);
+																				}}
+																				onBlur={() => {
+																					if (overrideFocus.current === tk) overrideFocus.current = null;
+																					const val = promptOverridesDraftRef.current[tk] ?? "";
+																					if (val.trim() && val === def) {
+																						resetOverride(tk);
+																						return;
+																					}
+																					commitOverride(tk);
+																				}}
+																				onChange={(e) => {
+																					const val = e.target.value;
+																					overridesDirtyRef.current.add(tk);
+																					setPromptOverridesDraft((p) => {
+																						const next = { ...p, [tk]: val };
+																						promptOverridesDraftRef.current = next;
+																						return next;
+																					});
+																					scheduleOverrideCommit(tk);
+																				}}
+																			/>
+																			<div className="prompt-src-foot">
+																				{def.trim() ? (
+																					<button
+																						type="button"
+																						className="source-default-toggle"
+																						onClick={() => toggleDefault(tk)}
+																					>
+																						{defaultOpen[tk] ? t("promptSourceCollapse") : t("promptSecShowDefault")}
+																					</button>
+																				) : (
+																					<span className="set-muted">{t("promptSourceDefaultEmpty")}</span>
+																				)}
+																				<span className="prompt-src-foot-spacer" />
+																				{edited && (
+																					<button
+																						type="button"
+																						className="set-btn-mini"
+																						onClick={() => resetOverride(tk)}
+																					>
+																						{t("promptResetSource")}
+																					</button>
+																				)}
+																			</div>
+																			{defaultOpen[tk] && def.trim() && (
+																				<div className="prompt-src-ref" title={t("promptSourceDefaultEditHint")}>
+																					<div className="prompt-src-ref-head">
+																						<span className="set-muted">{t("promptSourceRefLabel")}</span>
+																					</div>
+																					<pre className="source-default-text expanded">{def}</pre>
+																					{!edited && (
+																						<button
+																							type="button"
+																							className="override-seed-btn"
+																							title={t("promptSourceSeedTip")}
+																							onClick={() => seedFromDefault(tk, def)}
+																						>
+																							{t("promptSourceSeedButton")}
+																						</button>
+																					)}
+																				</div>
+																			)}
+																		</>
 																	)}
 																</div>
-															</>
-														) : (
-															<div
-																className="source-default"
-																title={t("promptSourceDefaultEditHint")}
-																role="button"
-																tabIndex={0}
-																onClick={() => seedFromDefault(tk, def)}
-																onKeyDown={(e) => {
-																	if (e.key === "Enter" || e.key === " ") {
-																		e.preventDefault();
-																		seedFromDefault(tk, def);
-																	}
-																}}
-															>
-																{def.trim() ? (
-																	<>
-																		<pre
-																			className={`source-default-text${
-																				isLong ? (defaultOpen[tk] ? " expanded" : " clamped") : ""
-																			}`}
-																		>
-																			{def}
-																		</pre>
-																		{isLong && (
-																			<span
-																				className="source-default-toggle"
-																				role="button"
-																				tabIndex={0}
-																				onClick={(e) => {
-																					e.stopPropagation();
-																					toggleDefault(tk);
-																				}}
-																				onKeyDown={(e) => {
-																					if (e.key === "Enter" || e.key === " ") {
-																						e.preventDefault();
-																						e.stopPropagation();
-																						toggleDefault(tk);
-																					}
-																				}}
-																			>
-																				{defaultOpen[tk] ? t("promptSourceCollapse") : t("promptSourceExpand")}
-																			</span>
-																		)}
-																	</>
-																) : (
-																	<span className="source-default-empty">{t("promptSourceDefaultEmpty")}</span>
-																)}
-															</div>
-														)}
-													</div>
-												);
-											})}
+															)}
+														</div>
+													);
+												})}
+											</div>
+											{offSourceChips.length > 0 && (
+												<div className="compose-toolbar">
+													<span className="set-field-label set-muted">{t("promptAssemblyOff")}</span>
+													{offSourceChips.map((tk) => (
+														<button
+															key={tk}
+															type="button"
+															className="token-chip"
+															title={t("promptAssemblyAddHint")}
+															onClick={() => toggleSource(tk, true)}
+														>
+															{tt(`promptTok_${tk}`)}
+														</button>
+													))}
+												</div>
+											)}
 											<div className="compose-toolbar">
 												<button type="button" className="set-btn" onClick={resetAllPrompt} disabled={!hasPromptCustom}>
 													{t("promptResetAll")}
@@ -3611,7 +3614,7 @@ function LoadedSettingsModal({
 											<input
 												value={toolFlowQuery}
 												onChange={(e) => setToolFlowQuery(e.target.value)}
-												placeholder="搜索工具名 / 描述 / 插件…"
+												placeholder={t("settingsToolFlowSearch")}
 											/>
 											{toolFlowQuery && (
 												<button type="button" className="tpl-chip" onClick={() => setToolFlowQuery("")}>
@@ -3623,16 +3626,7 @@ function LoadedSettingsModal({
 								)}
 								{!isDsh &&
 									toolFlowCats.map((cat) => {
-										const title =
-											cat.id === "core"
-												? t("toolsSectionCore")
-												: cat.id === "terminal"
-													? `${t("toolsSectionTerminal")} · ${t("toolsSectionSubagent")}`
-													: cat.id === "other"
-														? t("toolsSectionOther")
-														: cat.id === "plugin"
-															? t("toolsSectionPlugin")
-															: cat.fallbackTitle;
+										const title = cat.titleKeys.map((key) => t(key)).join(" · ");
 										const kw = toolFlowQuery.trim().toLowerCase();
 										const items = cat.items.filter((it) => {
 											if (!kw) return true;
@@ -3674,7 +3668,7 @@ function LoadedSettingsModal({
 															const first = list[0];
 															return {
 																key: pid || "__unknown__",
-																label: first.pluginName ?? pid ?? "未知插件",
+																label: first.pluginName ?? pid ?? t("settingsToolFlowUnknownPlugin"),
 																sub: pid,
 																list,
 															};
@@ -3685,7 +3679,7 @@ function LoadedSettingsModal({
 											<div className="toolflow-cat" key={cat.id}>
 												<div className="toolflow-chead">
 													<b>{title}</b>
-													<span className="sub">{cat.sub}</span>
+													<span className="sub">{t(cat.subKey)}</span>
 													<span className="nums">
 														{(() => {
 															let rs = 0,
@@ -3699,21 +3693,27 @@ function LoadedSettingsModal({
 															}
 															return (
 																<>
-																	<span>常驻 {rs}</span>
-																	<span>按需 {lz}</span>
-																	<span>关闭 {of}</span>
+																	<span>
+																		{t("settingsToolFlowStateResident")} {rs}
+																	</span>
+																	<span>
+																		{t("settingsToolFlowStateLazy")} {lz}
+																	</span>
+																	<span>
+																		{t("settingsToolFlowStateOff")} {of}
+																	</span>
 																</>
 															);
 														})()}
 													</span>
 													<button type="button" className="tpl-chip" onClick={() => bulk("resident")}>
-														全常驻
+														{t("settingsBulkAllResident")}
 													</button>
 													<button type="button" className="tpl-chip" onClick={() => bulk("lazy")}>
-														全按需
+														{t("settingsBulkAllLazy")}
 													</button>
 													<button type="button" className="tpl-chip" onClick={() => bulk("off")}>
-														全关
+														{t("settingsBulkAllOff")}
 													</button>
 												</div>
 												{groups.map((g) => {
@@ -3731,13 +3731,13 @@ function LoadedSettingsModal({
 																	<span className="sub">{g.sub}</span>
 																	<span className="ops">
 																		<button type="button" className="tpl-chip" onClick={() => gBulk("resident")}>
-																			全常驻
+																			{t("settingsBulkAllResident")}
 																		</button>
 																		<button type="button" className="tpl-chip" onClick={() => gBulk("lazy")}>
-																			全按需
+																			{t("settingsBulkAllLazy")}
 																		</button>
 																		<button type="button" className="tpl-chip" onClick={() => gBulk("off")}>
-																			全关
+																			{t("settingsBulkAllOff")}
 																		</button>
 																	</span>
 																</div>
@@ -3757,9 +3757,14 @@ function LoadedSettingsModal({
 																			: item.descKey
 																				? String(t(item.descKey as never) ?? "")
 																				: item.group;
-																	const stateLabel = st === "resident" ? "常驻" : st === "lazy" ? "按需" : "关闭";
+																	const stateLabel =
+																		st === "resident"
+																			? t("settingsToolFlowStateResident")
+																			: st === "lazy"
+																				? t("settingsToolFlowStateLazy")
+																				: t("settingsToolFlowStateOff");
 																	const reason = neverLazy
-																		? "核心常驻"
+																		? t("settingsToolFlowStateCoreResident")
 																		: blocked
 																			? t("toolsBlockedByPreset", { name: piPresetName })
 																			: pluginOff
@@ -3807,7 +3812,9 @@ function LoadedSettingsModal({
 																					type="button"
 																					className={"editbtn" + (editedToolNames.has(n) ? " has-edit" : "")}
 																					title={
-																						editedToolNames.has(n) ? "文案已自定义，点一下继续改" : "改这个工具的提示词"
+																						editedToolNames.has(n)
+																							? t("settingsToolPromptCustomizedAction")
+																							: t("settingsToolPromptEditAction")
 																					}
 																					onClick={(e) => {
 																						e.stopPropagation();
@@ -3834,7 +3841,9 @@ function LoadedSettingsModal({
 											<b>{t("settingsMarkers")}</b>
 											<HintTip text={`${t("settingsMarkersDesc")}\n${t("markerRenameTip")}`} />
 											<span className="sub">
-												{markersOn === 0 ? "已全部关闭" : `${markersOn} / ${markersTotal} 已启用`}
+												{markersOn === 0
+													? t("settingsMarkersAllOff")
+													: t("settingsMarkersEnabledCount", { on: markersOn, total: markersTotal })}
 											</span>
 											<span className="ops">
 												<button
@@ -3857,7 +3866,7 @@ function LoadedSettingsModal({
 														setPartial({ disabledMarkers: [...keep] });
 													}}
 												>
-													全关
+													{t("settingsBulkAllOff")}
 												</button>
 											</span>
 										</div>
@@ -3872,7 +3881,8 @@ function LoadedSettingsModal({
 															: m.name === "action"
 																? t("markerGroupAction")
 																: m.name;
-												const detail = displayName + " · " + (m.enabled ? "启用" : "关闭");
+												const detail =
+													displayName + " · " + (m.enabled ? t("settingsMarkerStateOn") : t("settingsMarkerStateOff"));
 												const guide = (m.guidance ?? []).join(" ");
 												const capped = guide.length > 60 ? guide.slice(0, 60) + "…" : guide;
 												return (
@@ -3897,7 +3907,8 @@ function LoadedSettingsModal({
 														</div>
 														<div className="st">
 															<span className="st-text">
-																{m.enabled ? "启用" : "关闭"} · {m.pluginId ?? m.name}
+																{m.enabled ? t("settingsMarkerStateOn") : t("settingsMarkerStateOff")} ·{" "}
+																{m.pluginId ?? m.name}
 															</span>
 															<TipButton
 																className="qbtn"
@@ -4707,7 +4718,7 @@ function LoadedSettingsModal({
 										className="dd-refresh"
 										onClick={() => {
 											setQuickEdit(null);
-											setPartial({ quickPhrases: QUICK_PHRASE_DEFAULTS[locale] ?? QUICK_PHRASE_DEFAULTS.en });
+											setPartial({ quickPhrases: quickPhraseDefaults(t) });
 										}}
 									>
 										{t("quickPhrasesReset")}
@@ -5038,7 +5049,7 @@ function LoadedSettingsModal({
 							</div>
 						)}
 
-						{tab === "extensions" && isDsh && (
+						{tab === "dsh-extensions" && (
 							<div className="set-section dsh-market-container">
 								<div className="dsh-market-header">
 									<div className="dsh-market-title-group">
@@ -5463,58 +5474,6 @@ function LoadedSettingsModal({
 							</div>
 						)}
 
-						{tab === "extensions" && !isDsh && (
-							<div className="set-section">
-								<div className="set-section-title">
-									<FiPackage className="set-section-icon" />
-									{t("settingsExtensions")}
-									<span className="set-count">{settings.extensions.length}</span>
-								</div>
-								{settings.extensions.length === 0 ? (
-									<p className="set-empty">{t("noExtensions")}</p>
-								) : (
-									<div className="set-list">
-										{settings.extensions.map((e) => {
-											const pkgName = e.id.startsWith("npm:") ? e.id.slice(4) : null;
-											return (
-												<ToggleRow
-													key={e.id}
-													title={e.name}
-													subtitle={e.path}
-													enabled={e.enabled}
-													onToggle={() => toggleExtension(e)}
-													action={
-														pkgName ? (
-															confirmUninstall === e.id ? (
-																<button
-																	type="button"
-																	className="set-uninstall confirm"
-																	title={t("uninstallConfirmHint")}
-																	onClick={() => runUninstall(pkgName)}
-																>
-																	{t("uninstallConfirm")}
-																</button>
-															) : (
-																<button
-																	type="button"
-																	className="set-uninstall"
-																	title={t("uninstallHint")}
-																	onClick={() => setConfirmUninstall(e.id)}
-																>
-																	<FiTrash2 />
-																	{t("uninstallExt")}
-																</button>
-															)
-														) : undefined
-													}
-												/>
-											);
-										})}
-									</div>
-								)}
-							</div>
-						)}
-
 						{tab === "layout" && (
 							<div className="set-section">
 								<div className="set-section-title">
@@ -5659,19 +5618,11 @@ function LoadedSettingsModal({
 																onChange={(e) => setUiAlign(it.id, e.target.value)}
 																aria-label={t("uiLayoutAlign")}
 															>
-																{verticalAlignSlot(slot) ? (
-																	ICON_EDIT_ALIGNS.map((al) => (
-																		<option key={al} value={al}>
-																			{sideAlignLabel(t, al)}
-																		</option>
-																	))
-																) : (
-																	<>
-																		<option value="start">start</option>
-																		<option value="center">center</option>
-																		<option value="end">end</option>
-																	</>
-																)}
+																{ICON_EDIT_ALIGNS.map((al) => (
+																	<option key={al} value={al}>
+																		{alignLabel(t, al, verticalAlignSlot(slot))}
+																	</option>
+																))}
 															</select>
 														</label>
 													)}
@@ -5735,7 +5686,7 @@ function LoadedSettingsModal({
 													<Fragment key={seg.align ?? "all"}>
 														{seg.align && (
 															<div className="set-ui-slot-title set-ui-seg">
-																{verticalAlignSlot(slot) ? sideAlignLabel(t, seg.align as UiAlign) : seg.align}
+																{alignLabel(t, seg.align as UiAlign, verticalAlignSlot(slot))}
 															</div>
 														)}
 														{seg.items.map((it) => renderRow(it, seg.items))}
@@ -5772,8 +5723,8 @@ function LoadedSettingsModal({
 										) : pluginSub === "installed" ? (
 											<>
 												<FiBox className="set-section-icon" />
-												<span>{t("pluginListTab")}</span>
-												<span className="set-count">{chat.plugins.length}</span>
+												<span>{t("pluginsInstalledTab")}</span>
+												<span className="set-count">{chat.plugins.length + settings.extensions.length}</span>
 											</>
 										) : (
 											<>
@@ -5789,40 +5740,8 @@ function LoadedSettingsModal({
 											</>
 										)}
 									</div>
-									<div className="smart-market-tools">
-										{pluginSub === "installed" ? (
-											<>
-												<button
-													type="button"
-													className="smart-tool-btn"
-													title={t("pluginCheckUpdatesHint")}
-													disabled={chat.checkingPluginUpdates}
-													onClick={() => appSend({ type: "check_plugin_updates" })}
-												>
-													<FiRefreshCw className={chat.checkingPluginUpdates ? "set-job-spin" : ""} />
-													<span>{chat.checkingPluginUpdates ? t("checkingUpdate") : t("pluginCheckUpdates")}</span>
-												</button>
-												<button
-													type="button"
-													className="smart-tool-btn"
-													title={t("pluginRescanHint")}
-													onClick={() => appSend({ type: "plugins_reload" })}
-												>
-													<FiRefreshCw />
-													<span>{t("pluginRescan")}</span>
-												</button>
-												<a
-													href={OFFICIAL_PLUGINS_REPO_URL}
-													target="_blank"
-													rel="noreferrer noopener"
-													className="smart-tool-link"
-													title={t("pluginOfficialMarketHint")}
-												>
-													<FiExternalLink />
-													<span>{t("pluginOfficialMarket")}</span>
-												</a>
-											</>
-										) : (
+									<div className="smart-market-tools" style={{ display: pluginTab === "market" ? undefined : "none" }}>
+										{pluginSub === "installed" ? null : (
 											<>
 												<button
 													type="button"
@@ -6023,7 +5942,6 @@ function LoadedSettingsModal({
 									const communityCount = chat.pluginCatalog.filter(
 										(e) => (e.origin ?? (e.builtin ? "builtin" : "custom")) === "community",
 									).length;
-									const installedCount = chat.plugins.length;
 									const q = catalogSearch.trim().toLowerCase();
 									const filteredCatalog = chat.pluginCatalog.filter((e) => {
 										const origin = e.origin ?? (e.builtin ? "builtin" : "custom");
@@ -6040,13 +5958,6 @@ function LoadedSettingsModal({
 											e.source.toLowerCase().includes(q)
 										);
 									});
-									const filteredInstalled = chat.plugins.filter((p) => {
-										if (!q) return true;
-										const name = (p.name ?? "").toLowerCase();
-										const desc = (p.description ?? "").toLowerCase();
-										const id = (p.id ?? "").toLowerCase();
-										return name.includes(q) || desc.includes(q) || id.includes(q);
-									});
 
 									return (
 										<>
@@ -6055,51 +5966,72 @@ function LoadedSettingsModal({
 													<button
 														type="button"
 														role="tab"
-														data-tab="official"
-														aria-selected={pluginSub === "official"}
-														className={`smart-tab-pill${pluginSub === "official" ? " active" : ""}`}
-														onClick={() => {
-															setPluginSub("official");
-															bodyRef.current?.scrollTo({ top: 0 });
-														}}
-													>
-														{t("pluginCatalogTabBuiltin")}
-														<span className="smart-pill-count">{officialCount}</span>
-													</button>
-													<button
-														type="button"
-														role="tab"
-														data-tab="community"
-														aria-selected={pluginSub === "community"}
-														className={`smart-tab-pill${pluginSub === "community" ? " active" : ""}`}
-														onClick={() => {
-															setPluginSub("community");
-															bodyRef.current?.scrollTo({ top: 0 });
-														}}
-													>
-														{t("pluginCatalogTabCommunity")}
-														<span className="smart-pill-count">{communityCount}</span>
-													</button>
-													<button
-														type="button"
-														role="tab"
 														data-tab="installed"
-														aria-selected={pluginSub === "installed"}
-														className={`smart-tab-pill${pluginSub === "installed" ? " active" : ""}`}
+														aria-selected={pluginTab === "installed"}
+														className={`smart-tab-pill${pluginTab === "installed" ? " active" : ""}`}
 														onClick={() => {
-															setPluginSub("installed");
+															setPluginTab("installed");
 															bodyRef.current?.scrollTo({ top: 0 });
 														}}
 													>
-														{t("pluginListTab")}
-														<span className="smart-pill-count">{installedCount}</span>
+														{t("pluginsInstalledTab")}
+														<span className="smart-pill-count">{chat.plugins.length + settings.extensions.length}</span>
 														{(hasBuiltinPluginUpdate || hasAnyPluginUpdate) && (
 															<span className="update-dot" style={{ marginLeft: 4 }} />
 														)}
 													</button>
+													<button
+														type="button"
+														role="tab"
+														data-tab="market"
+														aria-selected={pluginTab === "market"}
+														className={`smart-tab-pill${pluginTab === "market" ? " active" : ""}`}
+														onClick={() => {
+															setPluginTab("market");
+															bodyRef.current?.scrollTo({ top: 0 });
+														}}
+													>
+														{t("pluginMarket")}
+														<span className="smart-pill-count">{officialCount + communityCount}</span>
+													</button>
+													{pluginTab === "market" && (
+														<>
+															<button
+																type="button"
+																role="tab"
+																data-tab="official"
+																aria-selected={marketOrigin === "official"}
+																className={`smart-tab-pill${marketOrigin === "official" ? " active" : ""}`}
+																onClick={() => {
+																	setMarketOrigin("official");
+																	bodyRef.current?.scrollTo({ top: 0 });
+																}}
+															>
+																{t("pluginCatalogTabBuiltin")}
+																<span className="smart-pill-count">{officialCount}</span>
+															</button>
+															<button
+																type="button"
+																role="tab"
+																data-tab="community"
+																aria-selected={marketOrigin === "community"}
+																className={`smart-tab-pill${marketOrigin === "community" ? " active" : ""}`}
+																onClick={() => {
+																	setMarketOrigin("community");
+																	bodyRef.current?.scrollTo({ top: 0 });
+																}}
+															>
+																{t("pluginCatalogTabCommunity")}
+																<span className="smart-pill-count">{communityCount}</span>
+															</button>
+														</>
+													)}
 												</div>
 
-												<div className="smart-search-wrap">
+												<div
+													className="smart-search-wrap"
+													style={{ display: pluginTab === "market" ? undefined : "none" }}
+												>
 													<FiSearch className="smart-search-icon" />
 													<input
 														type="text"
@@ -6329,263 +6261,25 @@ function LoadedSettingsModal({
 
 											{pluginSub === "installed" && (
 												<>
-													{chat.plugins.length > 0 && (
-														<PluginInventoryStrip plugins={chat.plugins} disabledIds={disabledPlugins} />
-													)}
-													{chat.plugins.length === 0 ? (
-														<p className="set-empty">{t("noUiPlugins")}</p>
-													) : filteredInstalled.length === 0 ? (
-														<p className="set-empty">{t("searchNoResults")}</p>
-													) : (
-														<div className="smart-plugin-list">
-															{filteredInstalled.map((p) => {
-																const upd = chat.pluginUpdates?.[p.id];
-																const isUpdatable = upd?.updatable === true;
-																const isRunning = Boolean(jobFor(p.id) && jobFor(p.id)?.phase !== "done");
-																const isDisabled = disabledPlugins.has(p.id);
-																const hasSettings = Boolean(p.settingsSchema && p.settingsSchema.length > 0);
-																const isSettingsOpen = Boolean(settingsOpen[p.id]);
-																const isLogOpen = logOpen === p.id;
-																const isDiagOpen = diagOpen === p.id;
-																const logsCount = getPluginLogs(p.id).length;
-																const diagCount = p.diagnostics?.length ?? 0;
-
-																return (
-																	<div key={p.id} className={`smart-installed-card${isDisabled ? " disabled" : ""}`}>
-																		<div className="smart-installed-head">
-																			<div className="smart-installed-lead">
-																				<InvDot
-																					phase={pluginPhase(p, isDisabled)}
-																					label={tt(phaseLabelKey(pluginPhase(p, isDisabled)))}
-																				/>
-																				<div className="smart-plugin-icon">
-																					<PluginIcon icon={p.icon} iconSvg={p.iconSvg} />
-																				</div>
-																				<div className="smart-installed-titles">
-																					<div className="smart-plugin-title-row">
-																						<span className="smart-plugin-name">{p.name}</span>
-																						{isUpdatable && (
-																							<span
-																								className="smart-badge smart-badge-update"
-																								title={
-																									upd?.latestVersion
-																										? `v${p.version ?? "0.0.0"} → v${upd.latestVersion}`
-																										: (upd?.remoteSha ?? "")
-																								}
-																							>
-																								{t("pluginUpdateAvailableBadge")}
-																								{upd?.latestVersion ? ` v${upd.latestVersion}` : ""}
-																							</span>
-																						)}
-																						<span className="smart-plugin-source" title={p.id}>
-																							{p.id}
-																						</span>
-																					</div>
-																					<div className="smart-plugin-desc">
-																						{p.error ? (
-																							<span className="smart-desc-error">{p.error}</span>
-																						) : (
-																							<span>
-																								{p.source ?? t("uiPluginNoSource")}
-																								{p.permissions?.length
-																									? ` · ${t("uiPluginPerms")}: ${p.permissions.join(", ")}`
-																									: ""}
-																							</span>
-																						)}
-																					</div>
-																				</div>
-																			</div>
-
-																			<div className="smart-installed-ctrls">
-																				{(() => {
-																					const url =
-																						pluginOfficialUrl(chat.pluginCatalog.find((c) => c.id === p.id)) ||
-																						pluginOfficialUrl(p);
-																					return url ? (
-																						<a
-																							href={url}
-																							target="_blank"
-																							rel="noreferrer noopener"
-																							className="smart-icon-btn"
-																							title={t("pluginOfficialLinkHint")}
-																						>
-																							<FiExternalLink />
-																						</a>
-																					) : null;
-																				})()}
-																				{p.source && isUpdatable && (
-																					<button
-																						type="button"
-																						className="smart-btn-action update"
-																						disabled={isRunning}
-																						title={
-																							upd?.latestVersion
-																								? t("pluginUpdateAvailableDetail", {
-																										version: `v${upd.latestVersion}`,
-																									})
-																								: t("pluginUpdateHint")
-																						}
-																						onClick={() => runUiPluginUpdate(p.id, p.source!)}
-																					>
-																						<FiRefreshCw className={isRunning ? "set-job-spin" : ""} />
-																						<span>{isRunning ? t("pluginJobRunning") : t("pluginUpdate")}</span>
-																					</button>
-																				)}
-																				{confirmUiUninstall === p.id ? (
-																					<button
-																						type="button"
-																						className="smart-btn-action danger"
-																						disabled={isRunning}
-																						title={t("pluginUninstallHint")}
-																						onClick={() => runUiPluginUninstall(p.id)}
-																					>
-																						{t("uninstallConfirm")}
-																					</button>
-																				) : (
-																					<button
-																						type="button"
-																						className="smart-icon-btn danger"
-																						disabled={isRunning}
-																						title={t("pluginUninstallHint")}
-																						onClick={() => setConfirmUiUninstall(p.id)}
-																					>
-																						<FiTrash2 />
-																					</button>
-																				)}
-																				<button
-																					type="button"
-																					role="switch"
-																					aria-checked={!isDisabled && !p.error}
-																					disabled={Boolean(p.error)}
-																					className={`set-switch${!isDisabled && !p.error ? " on" : ""}`}
-																					title={!isDisabled ? t("pluginPhaseActive") : t("pluginPhaseDisabled")}
-																					onClick={() => !p.error && togglePlugin(p)}
-																				>
-																					<span className="set-switch-knob" />
-																				</button>
-																			</div>
-																		</div>
-
-																		{renderJobStatus(p.id)}
-
-																		<div className="smart-installed-chips">
-																			{p.agentTools && p.agentTools.length > 0 && !isDsh && (
-																				<button
-																					type="button"
-																					className="smart-feature-chip"
-																					title={t("pluginToolOffHint")}
-																					onClick={() => setTab("tools")}
-																				>
-																					<FiTool className="smart-chip-icon" />
-																					<span>
-																						{t("pluginToolsSection")} ({p.agentTools.length})
-																					</span>
-																					{p.agentTools.some((tool) => disabledPluginTools.has(tool.name)) && (
-																						<span className="smart-chip-tag">{t("settingsDisabled")}</span>
-																					)}
-																					<span style={{ opacity: 0.6 }}>→</span>
-																				</button>
-																			)}
-
-																			{hasSettings && (
-																				<button
-																					type="button"
-																					className={`smart-feature-chip${isSettingsOpen ? " active" : ""}`}
-																					onClick={() => setSettingsOpen((prev) => ({ ...prev, [p.id]: !prev[p.id] }))}
-																				>
-																					<FiSliders className="smart-chip-icon" />
-																					<span>
-																						{t("pluginSettingsTitle")} ({p.settingsSchema!.length})
-																					</span>
-																					<span style={{ fontSize: 10, opacity: 0.7 }}>
-																						{isSettingsOpen ? "▲" : "▼"}
-																					</span>
-																				</button>
-																			)}
-
-																			<button
-																				type="button"
-																				className={`smart-feature-chip${isLogOpen ? " active" : ""}`}
-																				onClick={() => {
-																					if (isLogOpen) setLogOpen(null);
-																					else {
-																						setLogOpen(p.id);
-																						appSend(pluginLogsFetch(p.id));
-																					}
-																				}}
-																			>
-																				<FiFileText className="smart-chip-icon" />
-																				<span>
-																					{t("pluginLogTitle")} ({logsCount}) ·{" "}
-																					{isLogOpen ? t("pluginLogHide") : t("pluginLogShow")}
-																				</span>
-																				<span style={{ fontSize: 10, opacity: 0.7 }}>{isLogOpen ? "▲" : "▼"}</span>
-																			</button>
-
-																			{diagCount > 0 && (
-																				<button
-																					type="button"
-																					className={`smart-feature-chip warn${isDiagOpen ? " active" : ""}`}
-																					onClick={() => setDiagOpen(isDiagOpen ? null : p.id)}
-																				>
-																					<FiAlertTriangle className="smart-chip-icon" />
-																					<span>
-																						{t("pluginDiagTitle")} ({diagCount}) ·{" "}
-																						{isDiagOpen ? t("pluginDiagHide") : t("pluginDiagShow")}
-																					</span>
-																					<span style={{ fontSize: 10, opacity: 0.7 }}>{isDiagOpen ? "▲" : "▼"}</span>
-																				</button>
-																			)}
-
-																			{p.wantsDom && (
-																				<button
-																					type="button"
-																					className={`smart-feature-chip${p.domGranted ? " success" : " warn"}`}
-																					title={t("pluginDomDesc")}
-																					onClick={() =>
-																						appSend({
-																							type: "plugin_dom_consent",
-																							pluginId: p.id,
-																							granted: !p.domGranted,
-																						})
-																					}
-																				>
-																					<span>
-																						{p.domGranted
-																							? `✓ ${t("pluginDomGranted")} (${t("pluginDomRevoke")})`
-																							: `! ${t("pluginDomNeed")} (${t("pluginDomGrant")})`}
-																					</span>
-																				</button>
-																			)}
-																		</div>
-
-																		{isSettingsOpen && p.settingsSchema && (
-																			<div className="smart-card-drawer">
-																				<PluginSettingsForm plugin={p} models={settings?.subagentModels ?? []} />
-																			</div>
-																		)}
-
-																		{isLogOpen && (
-																			<div className="smart-card-drawer">
-																				<PluginLogView pluginId={p.id} />
-																			</div>
-																		)}
-
-																		{isDiagOpen && p.diagnostics && (
-																			<div className="smart-card-drawer">
-																				<ul className="set-diag-list">
-																					{p.diagnostics.map((d, i) => (
-																						<li key={`${p.id}-${i}`}>{d}</li>
-																					))}
-																				</ul>
-																			</div>
-																		)}
-																	</div>
-																);
-															})}
-														</div>
-													)}
-
+													<InstalledPluginsPanel
+														plugins={chat.plugins}
+														extensions={settings.extensions ?? []}
+														disabledPlugins={settings.disabledPlugins ?? []}
+														disabledExtensions={settings.disabledExtensions ?? []}
+														pluginUpdates={chat.pluginUpdates}
+														pluginJobs={chat.pluginJobs}
+														inventoryEntries={inventoryEntries}
+														models={settings?.subagentModels ?? []}
+														epoch={chat.pluginsEpoch}
+														onTogglePlugin={togglePlugin}
+														onToggleExtension={toggleExtension}
+														onUpdatePlugin={runUiPluginUpdate}
+														onUninstallPlugin={runUiPluginUninstall}
+														onInstallExtension={(spec) =>
+															runTerminalCommand(t("pluginInstall"), `pi install npm:${spec}`)
+														}
+														onUninstallExtension={runUninstall}
+													/>
 													{/* 目录授权 */}
 													<div className="set-section" style={{ marginTop: 24 }}>
 														<div className="set-section-title">
@@ -6906,14 +6600,19 @@ function LoadedSettingsModal({
 								<div className="set-section-title">
 									<FiSliders className="set-section-icon" />
 									{t("settingsPresets")}
-									<span className="set-count">{settings.presets.length}</span>
+									<span className="set-count">{settings.presets.filter((p) => p.scope !== "prompt").length}</span>
 								</div>
 								<div className="set-preset-share-actions">
 									<button
 										type="button"
 										className="set-preset-share-btn primary"
 										title={t("presetShareShareBtn")}
-										onClick={() => setPresetShareFor({ name: settings.presets[0]?.name ?? "", tab: "export" })}
+										onClick={() =>
+											setPresetShareFor({
+												name: settings.presets.find((p) => p.scope !== "prompt")?.name ?? "",
+												tab: "export",
+											})
+										}
 									>
 										<FiShare2 />
 										{t("presetShareShareBtn")}
@@ -6962,48 +6661,50 @@ function LoadedSettingsModal({
 										<FiPlus /> {t("saveAsPreset")}
 									</button>
 								</div>
-								{settings.presets.length === 0 ? (
+								{settings.presets.filter((p) => p.scope !== "prompt").length === 0 ? (
 									<p className="set-empty">{t("noPresets")}</p>
 								) : (
 									<div className="set-list">
-										{settings.presets.map((p) => (
-											<div className="set-row" key={p.name}>
-												<div className="set-row-info">
-													<div className="set-row-name">{p.name}</div>
-													<div className="set-row-desc">
-														{p.promptMode === "replace" ? t("promptModeReplace") : t("promptModeAppend")}
-														{p.disabledSkills.length > 0 && ` · ${t("settingsSkills")} ${p.disabledSkills.length}`}
-														{p.disabledExtensions.length > 0 &&
-															` · ${t("settingsExtensions")} ${p.disabledExtensions.length}`}
+										{settings.presets
+											.filter((p) => p.scope !== "prompt")
+											.map((p) => (
+												<div className="set-row" key={p.name}>
+													<div className="set-row-info">
+														<div className="set-row-name">{p.name}</div>
+														<div className="set-row-desc">
+															{p.promptMode === "replace" ? t("promptModeReplace") : t("promptModeAppend")}
+															{p.disabledSkills.length > 0 && ` · ${t("settingsSkills")} ${p.disabledSkills.length}`}
+															{p.disabledExtensions.length > 0 &&
+																` · ${t("settingsExtensions")} ${p.disabledExtensions.length}`}
+														</div>
+													</div>
+													<div className="set-row-actions">
+														<button
+															type="button"
+															className="set-icon-btn"
+															title={t("presetShare")}
+															onClick={() => setPresetShareFor({ name: p.name, tab: "export" })}
+														>
+															<FiShare2 />
+														</button>
+														<button
+															type="button"
+															className="set-uninstall"
+															onClick={() => appSend({ type: "apply_preset", name: p.name })}
+														>
+															{t("applyPreset")}
+														</button>
+														<button
+															type="button"
+															className="set-icon-btn danger"
+															title={t("deletePreset")}
+															onClick={() => appSend({ type: "delete_preset", name: p.name })}
+														>
+															<FiTrash2 />
+														</button>
 													</div>
 												</div>
-												<div className="set-row-actions">
-													<button
-														type="button"
-														className="set-icon-btn"
-														title={t("presetShare")}
-														onClick={() => setPresetShareFor({ name: p.name, tab: "export" })}
-													>
-														<FiShare2 />
-													</button>
-													<button
-														type="button"
-														className="set-uninstall"
-														onClick={() => appSend({ type: "apply_preset", name: p.name })}
-													>
-														{t("applyPreset")}
-													</button>
-													<button
-														type="button"
-														className="set-icon-btn danger"
-														title={t("deletePreset")}
-														onClick={() => appSend({ type: "delete_preset", name: p.name })}
-													>
-														<FiTrash2 />
-													</button>
-												</div>
-											</div>
-										))}
+											))}
 									</div>
 								)}
 							</div>
@@ -7568,15 +7269,6 @@ function LoadedSettingsModal({
 								)}
 							</div>
 						)}
-						{activePluginPage && (
-							<PluginPage
-								plugin={activePluginPage.plugin}
-								epoch={chat.pluginsEpoch}
-								send={appSend}
-								className="set-plugin-page"
-							/>
-						)}
-
 						{editingToolPrompt && (
 							<ToolPromptEditor
 								name={editingToolPrompt}

@@ -87,6 +87,7 @@ async function fixture(basePath = "/", desktop = false, browserScript = "") {
 	const grant = await transport.issueGrant();
 	const accessOptions: Parameters<typeof access.open>[1] = {
 		deviceId: "remote",
+		deviceLabel: "办公室 · DESKTOP-TEST",
 		hubUrl: "https://hub.example",
 		origin: sourceOrigin,
 		basePath,
@@ -114,6 +115,12 @@ async function fixture(basePath = "/", desktop = false, browserScript = "") {
 		wrapper,
 		wrapperUrl,
 		base,
+		setOpenDevice(open: NonNullable<typeof accessOptions.openDevice>) {
+			accessOptions.openDevice = open;
+		},
+		setListDevices(list: NonNullable<typeof accessOptions.listDevices>) {
+			accessOptions.listDevices = list;
+		},
 		setValid(value: boolean) {
 			valid = value;
 		},
@@ -129,6 +136,73 @@ async function fixture(basePath = "/", desktop = false, browserScript = "") {
 }
 
 describe("local capability portal over authenticated LAN", () => {
+	it("uses the access owner's projected device list and rejects stale or foreign access", async () => {
+		const f = await fixture();
+		const list = vi.fn(async () => [{ id: "other", name: "Other", online: true, credential: "must-not-be-exposed" }]);
+		f.setListDevices(list);
+		const endpoint = f.sourceOrigin + f.base + "__desktop_devices";
+		expect((await fetch(endpoint, { headers: { origin: "https://evil.example" } })).status).toBe(403);
+		expect(list).not.toHaveBeenCalled();
+		const response = await fetch(endpoint, { headers: { origin: "null" } });
+		expect(await response.json()).toEqual({ devices: [{ id: "other", name: "Other", online: true }] });
+		expect(f.received.some((request) => request.path.includes("devices"))).toBe(false);
+		f.setValid(false);
+		expect((await fetch(endpoint, { headers: { origin: "null" } })).status).toBe(403);
+	});
+	it("wraps nested desktops through a scoped Hub ticket and rejects foreign ticket origins", async () => {
+		const f = await fixture("/pi/");
+		const open = vi.fn(async () => `https://hub.example/device/other/__open?ticket=${"a".repeat(64)}`);
+		f.setOpenDevice(open);
+		const endpoint = f.sourceOrigin + f.base + "__desktop_target?device=other&preview=1";
+		expect((await fetch(endpoint, { headers: { origin: "https://evil.example" } })).status).toBe(403);
+		expect(open).not.toHaveBeenCalled();
+		const preview = await fetch(endpoint, { headers: { origin: "null" } });
+		expect(preview.status).toBe(200);
+		expect(await preview.text()).toContain("next=%2Fdesktop-preview");
+		expect(preview.headers.get("content-security-policy")).toContain("frame-src https://hub.example/device/other/");
+		expect(open).toHaveBeenCalledWith("other");
+		f.setOpenDevice(async () => `https://evil.example/device/other/__open?ticket=${"a".repeat(64)}`);
+		expect((await fetch(endpoint, { headers: { origin: "null" } })).status).toBe(502);
+		f.setValid(false);
+		expect((await fetch(endpoint, { headers: { origin: "null" } })).status).toBe(403);
+	});
+	it("opens an independent same-device desktop ticket without releasing the chat access", async () => {
+		const f = await fixture("/pi/");
+		const endpoint = f.sourceOrigin + f.base + "__desktop_open";
+		for (const origin of ["null", "https://other.example", ""]) {
+			expect((await fetch(endpoint, { method: "POST", headers: { origin } })).status).toBe(403);
+		}
+		expect((await fetch(endpoint, { headers: { origin: f.sourceOrigin } })).status).toBe(403);
+		const opened = await fetch(endpoint, { method: "POST", headers: { origin: f.sourceOrigin } });
+		expect(opened.status).toBe(200);
+		const { url } = await opened.json();
+		expect(new URL(url).pathname).toBe("/pi/device-lan/remote/__open");
+		const child = await fetch(url);
+		const html = await child.text();
+		const childBase = html.match(/\/pi\/device-lan\/remote\/__relay\/[a-f0-9]{64}\//)![0];
+		expect(childBase).not.toBe(f.base);
+		expect(html).toContain(childBase + "desktop");
+		expect((await fetch(url)).status).toBe(403);
+		await fetch(f.sourceOrigin + childBase + "__lan_close", { method: "POST", headers: { origin: f.sourceOrigin } });
+		expect((await fetch(f.sourceOrigin + childBase + "api/health", { headers: { origin: "null" } })).status).toBe(403);
+		expect((await fetch(f.sourceOrigin + f.base + "api/health", { headers: { origin: "null" } })).status).toBe(200);
+		f.setValid(false);
+		expect((await fetch(endpoint, { method: "POST", headers: { origin: f.sourceOrigin } })).status).toBe(403);
+	});
+	it("keeps preview routing through ticket exchange and LAN-to-Hub fallback", async () => {
+		const f = await fixture("/pi/", true);
+		const ticket = await f.freshUrl();
+		const wrapper = await fetch(ticket + "&next=%2Fdesktop-preview");
+		const html = await wrapper.text();
+		expect(html).toContain("desktop-preview");
+		const base = html.match(/\/pi\/device-lan\/remote\/__relay\/[a-f0-9]{64}\//)![0];
+		f.setLanAvailable(false);
+		const fallback = await fetch(f.sourceOrigin + base + "__lan_fallback", {
+			method: "POST",
+			headers: { origin: "null" },
+		});
+		expect((await fallback.json()).url).toContain("next=%2Fdesktop-preview");
+	});
 	it(
 		"loads a prefixed LAN UI inside the real opaque desktop iframe and falls back after losing LAN",
 		async () => {
@@ -200,7 +274,8 @@ describe("local capability portal over authenticated LAN", () => {
 		const f = await fixture();
 		expect(f.wrapper.status).toBe(200);
 		expect(f.html).toContain('sandbox="allow-scripts allow-forms allow-downloads"');
-		expect(f.html).toContain("LAN");
+		expect(f.html).toContain("<title>办公室 · DESKTOP-TEST · pi-web-ui</title>");
+		expect(f.html).toContain(`href="${f.base}favicon.svg"`);
 		expect((await fetch(f.wrapperUrl)).status).toBe(403);
 		expect((await fetch(f.wrapper.url)).status).toBe(200);
 		const page = await fetch(f.sourceOrigin + f.base, { headers: { Origin: "null", Cookie: "source-private=secret" } });
@@ -300,5 +375,30 @@ describe("local capability portal over authenticated LAN", () => {
 		expect(url).toMatch(new RegExp(`^${f.sourceOrigin}/pi/device-lan/remote/__open`));
 		expect((await fetch(url)).status).toBe(200);
 		expect(f.getFallbackCalls()).toBe(0);
+	});
+	it("releases a capability on wrapper unload but rejects unrelated origins and devices", async () => {
+		const f = await fixture("/", true);
+		expect(f.html).toContain("pagehide");
+		expect(f.html).toContain("keepalive:true");
+		expect(
+			(
+				await fetch(f.sourceOrigin + f.base + "__lan_close", {
+					method: "POST",
+					headers: { Origin: "https://unrelated.invalid" },
+				})
+			).status,
+		).toBe(403);
+		expect(
+			(
+				await fetch(f.sourceOrigin + f.base.replace("/remote/", "/other/") + "__lan_close", {
+					method: "POST",
+					headers: { Origin: "null" },
+				})
+			).status,
+		).toBe(403);
+		expect(
+			(await fetch(f.sourceOrigin + f.base + "__lan_close", { method: "POST", headers: { Origin: "null" } })).status,
+		).toBe(204);
+		expect((await fetch(f.sourceOrigin + f.base, { headers: { Origin: "null" } })).status).toBe(403);
 	});
 });

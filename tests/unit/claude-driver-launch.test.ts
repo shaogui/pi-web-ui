@@ -28,6 +28,8 @@ function setup(executablePath?: string) {
 		stdin: new PassThrough(),
 		stdout: new PassThrough(),
 		stderr: new PassThrough(),
+		// Real ChildProcess has kill(); forkSession relies on it.
+		kill: vi.fn(),
 	});
 	spawnMock.mockReturnValue(child);
 	const sink = {
@@ -37,6 +39,9 @@ function setup(executablePath?: string) {
 		onToolEnd: vi.fn(),
 		onTurnComplete: vi.fn(),
 		onError: vi.fn(),
+		onApprovalRequest: vi.fn(),
+		// Explicit opt-in: a bare sink must not be treated as having an approval channel.
+		supportsApproval: true,
 	};
 	const driver = new ClaudeCodeDriver(workspace, { executablePath, agentDir });
 	return { child, sink, driver };
@@ -84,7 +89,10 @@ describe("Claude Code CLI launch", () => {
 				"--output-format",
 				"stream-json",
 				"--verbose",
-				"--dangerously-skip-permissions",
+				"--permission-mode",
+				"bypassPermissions",
+				"--permission-prompt-tool",
+				"stdio",
 				"--effort",
 				"medium",
 			]);
@@ -242,5 +250,249 @@ describe("Claude Code native input", () => {
 	it("passes no --mcp-config when pi has no MCP servers", async () => {
 		const { args } = await run("hi");
 		expect(args).not.toContain("--mcp-config");
+	});
+});
+
+describe("Claude Code permission bridge", () => {
+	it("forwards can_use_tool to the sink and writes control_response back", async () => {
+		const { child, sink, driver } = setup();
+		let written = "";
+		child.stdin.on("data", (chunk) => {
+			written += chunk.toString();
+		});
+		const done = driver.sendPrompt("hi", undefined, sink);
+		written = "";
+
+		child.stdout.write(
+			`${JSON.stringify({
+				type: "control_request",
+				request_id: "req-1",
+				request: { subtype: "can_use_tool", tool_name: "Read", input: { file_path: "/etc/hostname" } },
+			})}\n`,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		expect(sink.onApprovalRequest).toHaveBeenCalledOnce();
+		expect(sink.onApprovalRequest.mock.calls[0][0]).toBe("req-1");
+		expect(sink.onApprovalRequest.mock.calls[0][1]).toBe("Read");
+		expect(sink.onApprovalRequest.mock.calls[0][2]).toEqual({ file_path: "/etc/hostname" });
+
+		await driver.respondApproval("req-1", "approve");
+		expect(JSON.parse(written.trim())).toEqual({
+			type: "control_response",
+			response: { subtype: "success", request_id: "req-1", response: { behavior: "allow" } },
+		});
+
+		child.emit("close", 0);
+		await done;
+	});
+
+	it("denies instead of hanging when the sink has no approval channel (subagent case)", async () => {
+		const { child, driver } = setup();
+		// A subagent sink: no `supportsApproval`, no `onApprovalRequest`.
+		const bareSink = {
+			onTextDelta: vi.fn(),
+			onThinkingDelta: vi.fn(),
+			onToolStart: vi.fn(),
+			onToolEnd: vi.fn(),
+			onTurnComplete: vi.fn(),
+			onError: vi.fn(),
+		} as unknown as Parameters<typeof driver.sendPrompt>[2];
+		let written = "";
+		child.stdin.on("data", (chunk) => {
+			written += chunk.toString();
+		});
+		const done = driver.sendPrompt("hi", undefined, bareSink);
+		written = "";
+
+		child.stdout.write(
+			`${JSON.stringify({
+				type: "control_request",
+				request_id: "req-bare",
+				request: { subtype: "can_use_tool", tool_name: "Bash", input: { command: "ls" } },
+			})}\n`,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		// Must auto-deny rather than wait for a human that will never answer.
+		expect(JSON.parse(written.trim())).toEqual({
+			type: "control_response",
+			response: {
+				subtype: "success",
+				request_id: "req-bare",
+				response: { behavior: "deny", message: "no approval channel" },
+			},
+		});
+
+		child.emit("close", 0);
+		await done;
+	});
+
+	it("acknowledges non-permission control requests so the CLI never blocks", async () => {
+		const { child, sink, driver } = setup();
+		let written = "";
+		child.stdin.on("data", (chunk) => {
+			written += chunk.toString();
+		});
+		const done = driver.sendPrompt("hi", undefined, sink);
+		written = "";
+
+		child.stdout.write(
+			`${JSON.stringify({ type: "control_request", request_id: "init-1", request: { subtype: "initialize" } })}\n`,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		expect(sink.onApprovalRequest).not.toHaveBeenCalled();
+		expect(JSON.parse(written.trim())).toEqual({
+			type: "control_response",
+			response: { subtype: "success", request_id: "init-1", response: {} },
+		});
+
+		child.emit("close", 0);
+		await done;
+	});
+
+	it("keeps stdin open until the turn result arrives", async () => {
+		const { child, sink, driver } = setup();
+		const done = driver.sendPrompt("hi", undefined, sink);
+		expect(child.stdin.writableEnded).toBe(false);
+
+		child.stdout.write(`${JSON.stringify({ type: "result", session_id: "s-1", usage: {} })}\n`);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(child.stdin.writableEnded).toBe(true);
+
+		child.emit("close", 0);
+		await done;
+	});
+
+	it("re-reads the permission mode per turn, so a UI switch applies without restart", async () => {
+		const { child, sink, driver } = setup();
+		const first = driver.sendPrompt("turn 1", undefined, sink);
+		let args = spawnMock.mock.calls[0][1];
+		expect(args).toContain("bypassPermissions");
+		child.emit("close", 0);
+		await first;
+
+		driver.setPermissionMode("manual");
+		const second = driver.sendPrompt("turn 2", undefined, sink);
+		args = spawnMock.mock.calls[1][1];
+		expect(args).toContain("manual");
+		expect(args).not.toContain("acceptEdits");
+		child.emit("close", 0);
+		await second;
+	});
+
+	it("denies instead of hanging when the sink has no approval channel", async () => {
+		const { child, driver } = setup();
+		let written = "";
+		child.stdin.on("data", (chunk) => {
+			written += chunk.toString();
+		});
+		const strictSink = {
+			onTextDelta: vi.fn(),
+			onThinkingDelta: vi.fn(),
+			onToolStart: vi.fn(),
+			onToolUpdate: vi.fn(),
+			onToolEnd: vi.fn(),
+			onTurnComplete: vi.fn(),
+			onError: vi.fn(),
+		} as unknown as Parameters<typeof driver.sendPrompt>[2];
+		const done = driver.sendPrompt("hi", undefined, strictSink);
+		written = "";
+
+		child.stdout.write(
+			`${JSON.stringify({
+				type: "control_request",
+				request_id: "req-deny",
+				request: { subtype: "can_use_tool", tool_name: "Bash", input: { command: "ls" } },
+			})}
+`,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		expect(JSON.parse(written.trim())).toEqual({
+			type: "control_response",
+			response: {
+				subtype: "success",
+				request_id: "req-deny",
+				response: { behavior: "deny", message: "no approval channel" },
+			},
+		});
+
+		child.emit("close", 0);
+		await done;
+	});
+
+	it("honours PI_WEB_CLAUDE_PERMISSION_MODE / _PROMPTS", async () => {
+		process.env.PI_WEB_CLAUDE_PERMISSION_MODE = "manual";
+		process.env.PI_WEB_CLAUDE_PERMISSION_PROMPTS = "none";
+		try {
+			const { child, sink, driver } = setup();
+			const done = driver.sendPrompt("hi", undefined, sink);
+			const [, args] = spawnMock.mock.calls[0];
+			expect(args).toContain("manual");
+			expect(args).toContain("--permission-prompts");
+			expect(args).not.toContain("--permission-prompt-tool");
+			child.emit("close", 0);
+			await done;
+		} finally {
+			delete process.env.PI_WEB_CLAUDE_PERMISSION_MODE;
+			delete process.env.PI_WEB_CLAUDE_PERMISSION_PROMPTS;
+		}
+	});
+});
+
+describe("Claude Code session fork", () => {
+	it("resumes with --fork-session and returns the new session id from init", async () => {
+		const { child, driver } = setup();
+		const forkPromise = driver.forkSession("old-session-id");
+		child.stdout.write(`${JSON.stringify({ type: "system", subtype: "init", session_id: "new-session-id" })}\n`);
+		const newSid = await forkPromise;
+
+		expect(newSid).toBe("new-session-id");
+		const [, args] = spawnMock.mock.calls[0];
+		expect(args).toContain("--resume");
+		expect(args).toContain("old-session-id");
+		expect(args).toContain("--fork-session");
+		expect(child.kill).toHaveBeenCalled();
+	});
+
+	it("stays quiet when init arrives first, so the fork transcript has no probe turn", async () => {
+		const { child, driver } = setup();
+		let written = "";
+		child.stdin.on("data", (chunk) => {
+			written += chunk.toString();
+		});
+		const forkPromise = driver.forkSession("old-session-id");
+		child.stdout.write(`${JSON.stringify({ type: "system", subtype: "init", session_id: "new-session-id" })}\n`);
+
+		await expect(forkPromise).resolves.toBe("new-session-id");
+		expect(written).toBe("");
+	});
+
+	it("sends a probe turn for CLIs that only report init once a turn starts", async () => {
+		// Fake only the grace timer: readline scheduling rides on setImmediate.
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		try {
+			const { child, driver } = setup();
+			let written = "";
+			child.stdin.on("data", (chunk) => {
+				written += chunk.toString();
+			});
+			const forkPromise = driver.forkSession("old-session-id");
+			await vi.advanceTimersByTimeAsync(1_500);
+
+			expect(JSON.parse(written.trim())).toMatchObject({ type: "user" });
+
+			child.stdout.write(`${JSON.stringify({ type: "system", subtype: "init", session_id: "new-session-id" })}\n`);
+			await expect(forkPromise).resolves.toBe("new-session-id");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("returns empty string when there is no session id", async () => {
+		const { driver } = setup();
+		await expect(driver.forkSession("")).resolves.toBe("");
 	});
 });

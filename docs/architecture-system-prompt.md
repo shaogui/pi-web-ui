@@ -1,3 +1,5 @@
+[English](./architecture-system-prompt.en.md) · **简体中文** · [繁體中文](./architecture-system-prompt.zh-TW.md)
+
 # 系统提示词组成与组合模板（compose）
 
 > 本文档说明 SDK（`@earendil-works/pi-coding-agent`）如何组装最终发给模型的系统提示词，
@@ -125,13 +127,32 @@
 
 ## 七、设置 UI（SettingsModal → 「系统提示词」页）
 
-    组合模板编辑框（{{token}} 可任意排序/穿插文字；placeholder = 默认模板）
-    一键插入 token 的 chips
-    每来源覆盖行：token + 说明 + 覆盖输入框（留空 = 自动）
-        单来源「恢复默认」按钮（清空该覆盖）
-    整体「恢复默认模板并清空所有覆盖」按钮
+    提示词模板库（只捕获 prompt 字段组的预设）：
+        save_preset 消息带 groups:["prompt"] → snapshotPreset 经 narrowPresetToGroups 裁剪成只含
+        prompt 组字段（promptMode/customSystemPrompt/promptTemplate/promptOverrides/promptDisabled/
+        reviewPrompt/reviewDisabledSkills）；推送时 settingsPresetToUi 用 isPromptOnlyPreset 打
+        scope:"prompt" 标记。面板按 scope 过滤：模板库只列 scope==="prompt"，预设页/预设计数只列
+        scope!=='"prompt"'。切换模板 = apply_preset（只回写 prompt 组字段）；删除/分享/导入全部复用
+        预设通道（preset_export / preset_import / PresetShareModal），导入的 prompt-only JSON 自动
+        进模板库。「使用中」判定：effectiveTemplate + 规范化覆盖 map + promptDisabled 集合与服务端
+        快照全等。
+    提示词来源（单列表：开关 + 中文名 + 一句话 + ↑↓；点名字就地展开编辑）：
+        每行 = 开关（是否进入提示词）+ 中文名/一句话说明 + 「已改|自动」标签 + ≈tokens + ↑↓。
+        点名字展开：可写来源给编辑区（小标题 promptSec_<token>_edit，提示 _hint，留空 = 自动内容）
+        + 「查看默认内容」折叠对照（可一键填入）；只读来源只展示系统生成内容与「恢复默认」。
+        展开区铺满整行（左右无留白，只有输入框自身内边距）—— .prompt-src-list / .prompt-src-body。
+        模板串语义不变：开关走 promptDisabled（与旧「启用」勾选同语义）；
+        自定义模板：模板串就是唯一事实源（collectTemplateTokens 取序），开关= 增删 token、
+        ↑↓ = 相邻交换；序列化 join("\n\n")，恰好等于默认串时归零回 ""（零开销默认分支）。
+        默认顺序下首次调整顺序 → 物化为自定义模板（默认停用段不进模板，promptDisabled 不动）。
+        旧模板含自由文字/未知 token 时展示警示：开关/顺序编辑后只保留已启用的来源段。
+        setTemplateValue 与旧编辑框同一套提交纪律（与 serverSettings 不一致才发，回执前保草稿）。
+    整体「恢复默认模板并清空所有覆盖」按钮（仍是逐 token 发空串，空对象补丁删不掉）
     「查看当前完整提示词」只读预览 = 组合渲染结果
-    文案键：promptTok_<token> / promptTok_<token>_desc（zh/en 同步）
+    文案键：promptTok_<token>（名称）/ promptTok_<token>_desc（一句话）
+        + promptSec_<token>_edit（编辑框小标题）/ promptSec_<token>_hint（留空提示）
+        + promptSecEdited / promptSecShowDefault + promptAssembly* / promptTemplate*
+        （zh/en 同步；其余 12 个语言包缺省回退英文，繁中包单独写繁体文案）
 
     保存与回执（事实源 web/src/settings-sync.ts，回归 tests/settings-prompt-save-test.mjs
     + tests/unit/settings-sync.test.ts）—— 改这块前必须读懂四条：

@@ -15,6 +15,7 @@ export async function startDeviceHub(env: NodeJS.ProcessEnv = process.env) {
 	const pkgRoot = env.PI_DEVICE_HUB_PACKAGE_ROOT ?? getPkgRoot();
 	const version = (JSON.parse(await readFile(join(pkgRoot, "package.json"), "utf8")) as { version: string }).version;
 	const publicUrl = env.PI_DEVICE_HUB_PUBLIC_URL;
+	const legacyOrigins = JSON.parse(env.PI_DEVICE_HUB_LEGACY_ORIGINS || "[]") as string[];
 	const deviceDomain = env.PI_DEVICE_HUB_DEVICE_DOMAIN || undefined;
 	const pathAccess = env.PI_DEVICE_HUB_PATH_ACCESS !== "0";
 	if (!publicUrl) throw new Error("Set PI_DEVICE_HUB_PUBLIC_URL; see docs/device-center.md");
@@ -33,6 +34,7 @@ export async function startDeviceHub(env: NodeJS.ProcessEnv = process.env) {
 	const hub = await createDeviceHub({
 		dataDir: resolve(env.PI_DEVICE_HUB_DATA_DIR ?? join(homedir(), ".pi-device-hub")),
 		publicUrl,
+		legacyOrigins,
 		deviceDomain,
 		pathAccess,
 		portals,
@@ -56,13 +58,20 @@ export async function startDeviceHub(env: NodeJS.ProcessEnv = process.env) {
 	relay = createDeviceRelay({
 		server: hub.server,
 		publicUrl,
+		legacyOrigins,
 		deviceDomain,
 		deviceOrigins: () => portals.origins(),
 		pathAccess,
 		authenticateDevice: (id, credential) => hub.store.authenticateDevice(id, credential),
 		getAccount: (req) => hub.getRelayAccount(req),
 		ownsDevice: (accountId, id) => hub.store.getDeviceOwner(id) === accountId,
+		getDeviceIds: (accountId) =>
+			hub.store
+				.snapshot()
+				.devices.filter((device) => device.accountId === accountId)
+				.map((device) => device.id),
 		getDeviceName: (id) => hub.store.getDevice(id)?.name,
+		getDeviceRemark: (id) => hub.store.getDevice(id)?.remark,
 		onTaskEvent: (id, event) => hub.acceptTaskEvent(id, event),
 		onDeviceConnect: async (id) => {
 			await Promise.all([hub.resumeQueuedTasks(id), hub.reconcilePendingPublications(id)]);

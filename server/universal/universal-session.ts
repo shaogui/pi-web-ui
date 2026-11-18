@@ -28,6 +28,7 @@ import { FilesService } from "../files-service.js";
 import { uploadLimitBytes } from "../payload-limits.js";
 import { TerminalManager, makePersistentTerminalTools } from "../terminals.js";
 import { TERMINAL_TOOL_NAMES } from "../tool-manager.js";
+import { unattendedApprovalTimeoutMs } from "../tool-approval.js";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { BgServerTracker } from "../bg-servers.js";
 import { ModelAdminService } from "../model-admin.js";
@@ -42,7 +43,13 @@ import {
 import { CodexDriver, probeCodex } from "./drivers/codex.js";
 import type { UniversalSessionStore } from "./session-store.js";
 import type { UniversalConversation } from "./universal-types.js";
-import { type ClientStateStore, normalizeUiLayout, type ClientSettings, settingsPresetToUi } from "../client-state.js";
+import {
+	type ClientStateStore,
+	normalizePathKey,
+	normalizeUiLayout,
+	type ClientSettings,
+	settingsPresetToUi,
+} from "../client-state.js";
 import { messageTextWithQuotes } from "../text-quote.js";
 import {
 	readModelsJson,
@@ -163,6 +170,13 @@ export class UniversalSession implements DispatchSession {
 	private deltaSeq = 0;
 	private snapshotTimer: NodeJS.Timeout | null = null;
 	private pendingToolResults: UiMessage[] = [];
+	/** Engine permission requests awaiting a human answer: approval id -> request info. */
+	private readonly pendingApprovals = new Map<
+		string,
+		{ requestId: string; toolName: string; driver?: BaseAgentDriver }
+	>();
+	/** Auto-deny timers for approvals nobody may answer (unattended runs). */
+	private readonly approvalTimers = new Map<string, NodeJS.Timeout>();
 	private readonly sessionDrafts = new Map<string, { text: string; ts: number }>();
 	private followUpQueue: QueuedMessageEntry[] = [];
 
@@ -203,6 +217,11 @@ export class UniversalSession implements DispatchSession {
 		this.store = opts.store;
 		this.stateStore = opts.stateStore;
 		this.driver = opts.driver;
+		// Restore the UI-selected permission mode (env stays the fallback when unset).
+		try {
+			const savedMode = this.stateStore?.getSettings(this.clientId)?.claudePermissionMode;
+			if (savedMode) this.driver.setPermissionMode?.(savedMode);
+		} catch {}
 		this.driverFactory = opts.driverFactory;
 		this.pluginCommandsProvider = opts.pluginCommandsProvider;
 		this.onQuit = opts.onQuit;
@@ -594,6 +613,7 @@ export class UniversalSession implements DispatchSession {
 
 	attachSink(send: (msg: ServerMessage) => void): void {
 		this.sinks.add(send);
+		this.pushClaudePermission();
 		this.pushSettings();
 		void this.pushSlashCommands();
 		const defModel = this.stateStore?.getDefaultModel(this.engine);
@@ -777,6 +797,24 @@ export class UniversalSession implements DispatchSession {
 				}
 				try {
 					const { convId } = await this.spawnSubagent(subPrompt, type, this.cwd);
+					// Record the dispatch itself: `/subagent …` is a task instruction, not a pure
+					// settings command, so without it the transcript shows a subagent appearing
+					// out of nowhere (and the notice above is transient).
+					const dispatchNow = Date.now();
+					const dispatchConv = targetConv;
+					if (dispatchConv) {
+						dispatchConv.messages.push({
+							id: `u-${dispatchNow}-${randomUUID().slice(0, 6)}`,
+							role: "user",
+							content: [{ type: "text", text }],
+							timestamp: dispatchNow,
+						});
+						dispatchConv.updatedAt = dispatchNow;
+						if (!dispatchConv.isEphemeral) {
+							this.store.saveConversation(this.cwd, dispatchConv);
+						}
+						this.flushSnapshot();
+					}
 					this.emitNotice(
 						"info",
 						`已派发子代理（ID: ${convId.slice(0, 8)}），可在左侧对话列表查看其流式进展`,
@@ -955,16 +993,26 @@ export class UniversalSession implements DispatchSession {
 					this.emitNotice("error", `执行出错: ${errText}`, `Execution error: ${errText}`);
 					this.finalizeTurn();
 				},
+				// Engine permission request (Claude Code `can_use_tool`) -> reuse the same
+				// tool_approval_* messages the pi engine already drives the approval dialog with.
+				// NOTE: do NOT flushSnapshot() here — the frontend merges `approval` from
+				// `snapshot.pendingApproval`, which this session never sets, so a snapshot right
+				// after this message wipes the dialog before it can be shown.
+				// An engine prompt has no durable rule store behind it, so the answer is always
+				// one-shot: "always allow for this conversation" would be a lie (scopeless).
+				supportsApproval: true,
+				onApprovalRequest: (requestId, toolName, params, options) => {
+					this.requestApproval(requestId, toolName, params, this.driver, {
+						idPrefix: "ua-",
+						suggestions: options?.suggestions,
+					});
+				},
 			};
 
 			try {
-				const guardedSink = new Proxy(sink, {
-					get:
-						(target, key: keyof AgentEventSink) =>
-						(...args: unknown[]) => {
-							if (isCurrent()) (target[key] as (...args: unknown[]) => void)?.(...args);
-						},
-				});
+				// Must return: async sink methods (onApprovalRequest wiring, future ones) rely on
+				// the value/promise; the original form swallowed it, so callers waited forever.
+				const guardedSink = this.guardSink(sink, isCurrent);
 				await this.driver.sendPrompt(
 					rebuiltContext ? `${rebuiltContext}\n\n${finalPrompt}` : finalPrompt,
 					effectiveAttachments,
@@ -1096,7 +1144,153 @@ export class UniversalSession implements DispatchSession {
 		}
 	}
 
+	/** UI setting: Claude Code permission mode (env stays the fallback). */
+	async setClaudePermissionMode(mode: string): Promise<void> {
+		const options = this.driver.permissionModeOptions?.() ?? [];
+		if (options.length === 0) return;
+		if (!options.includes(mode)) {
+			this.emitNotice(
+				"warning",
+				`未知权限模式「${mode}」，默认未改`,
+				`Unknown permission mode "${mode}"; setting unchanged`,
+			);
+			return;
+		}
+		this.driver.setPermissionMode?.(mode);
+		await this.stateStore?.saveSettings?.(this.clientId, { claudePermissionMode: mode });
+		this.pushClaudePermission();
+	}
+
+	private pushClaudePermission(): void {
+		const options = this.driver.permissionModeOptions?.();
+		if (!options || options.length === 0) return;
+		this.send({ type: "claude_permission", modes: options, current: this.driver.currentPermissionMode?.() ?? "" });
+	}
+
+	/** Approval reply routed here from dispatch (`tool_approval_response`). */
+	/**
+	 * Wrap a sink so late callbacks from a superseded turn are dropped.
+	 *
+	 * Only *functions* are wrapped: plain data such as `supportsApproval` must pass through
+	 * unchanged, otherwise `sink.supportsApproval === true` reads as a function and the
+	 * driver concludes there is no approval channel. The wrapper also has to return the
+	 * call's value, or async sink methods never resolve.
+	 */
+	private guardSink(sink: AgentEventSink, isCurrent: () => boolean): AgentEventSink {
+		return new Proxy(sink, {
+			get: (target, key: keyof AgentEventSink) => {
+				const value = target[key];
+				if (typeof value !== "function") return value;
+				return (...args: unknown[]) => {
+					if (!isCurrent()) return undefined;
+					return (value as (...args: unknown[]) => unknown).apply(target, args);
+				};
+			},
+		});
+	}
+
+	/**
+	 * Ask the UI to approve one engine tool call. Shared by the session driver and its
+	 * subagents: subagent prompts are surfaced in the parent conversation so a human can
+	 * answer them, and they keep the same safety rails (deny when nobody is attached,
+	 * watchdog for unattended clients).
+	 */
+	private requestApproval(
+		requestId: string,
+		toolName: string,
+		params: Record<string, unknown>,
+		driver: BaseAgentDriver,
+		opts?: {
+			idPrefix?: string;
+			reason?: string;
+			reasonEn?: string;
+			conversationTitle?: string;
+			suggestions?: unknown[];
+			conversationId?: string;
+		},
+	): void {
+		const id = `${opts?.idPrefix ?? ""}${requestId}`;
+		if (this.sinks.size === 0) {
+			void driver.respondApproval(requestId, "deny", undefined, "no attached client");
+			this.emitNotice(
+				"warning",
+				`无人可答的审批（该会话没有已连接的界面）：已拒绝工具 ${toolName}。`,
+				`Approval nobody can answer (no attached client): tool ${toolName} was denied.`,
+			);
+			return;
+		}
+		this.pendingApprovals.set(id, { requestId, toolName, driver });
+		const timeoutMs = unattendedApprovalTimeoutMs(this.clientId);
+		if (timeoutMs !== null) {
+			const timer = setTimeout(() => {
+				this.approvalTimers.delete(id);
+				const entry = this.pendingApprovals.get(id);
+				if (!entry) return;
+				this.pendingApprovals.delete(id);
+				void (entry.driver ?? driver).respondApproval(entry.requestId, "deny", undefined, "unattended timeout");
+				this.send({ type: "tool_approval_resolved", id });
+				this.emitNotice(
+					"warning",
+					`无人值守审批超时（${Math.round(timeoutMs / 1000)}s）：已拒绝工具 ${toolName}。`,
+					`Unattended approval timed out after ${Math.round(timeoutMs / 1000)}s: tool ${toolName} was denied.`,
+				);
+			}, timeoutMs);
+			timer.unref?.();
+			this.approvalTimers.set(id, timer);
+		}
+		const convId = opts?.conversationId ?? this.turnConvId ?? undefined;
+		this.send({
+			type: "tool_approval_pending",
+			id,
+			toolCallId: `tc-${requestId}`,
+			toolName,
+			params,
+			reason: opts?.reason ?? "",
+			reasonEn: opts?.reasonEn ?? "",
+			scopeless: true,
+			...(opts?.conversationTitle ? { conversationTitle: opts.conversationTitle } : {}),
+			...(convId ? { conversationId: convId } : {}),
+			...(opts?.suggestions ? { suggestions: opts.suggestions } : {}),
+		});
+	}
+
+	resolveToolApproval(
+		id: string,
+		decision: "approve" | "edit" | "deny",
+		editedParams?: Record<string, unknown>,
+		reason?: string,
+		_scope?: unknown,
+	): boolean {
+		const entry = this.pendingApprovals.get(id);
+		if (!entry) return false;
+		this.pendingApprovals.delete(id);
+		this.clearApprovalTimer(id);
+		// A subagent prompt must be answered on the subagent own driver (its own CLI process).
+		void (entry.driver ?? this.driver).respondApproval(entry.requestId, decision, editedParams, reason);
+		this.send({ type: "tool_approval_resolved", id });
+		return true;
+	}
+
+	private clearApprovalTimer(id: string): void {
+		const timer = this.approvalTimers.get(id);
+		if (!timer) return;
+		clearTimeout(timer);
+		this.approvalTimers.delete(id);
+	}
+
+	/** Deny every outstanding approval (turn aborted/ended) so the engine never hangs. */
+	private denyPendingApprovals(reason: string): void {
+		if (this.pendingApprovals.size === 0) return;
+		for (const [id, entry] of this.pendingApprovals) {
+			this.clearApprovalTimer(id);
+			void (entry.driver ?? this.driver).respondApproval(entry.requestId, "deny", undefined, reason);
+			this.send({ type: "tool_approval_resolved", id });
+		}
+		this.pendingApprovals.clear();
+	}
+
 	async abort(): Promise<void> {
+		this.denyPendingApprovals("aborted");
 		if (this.abortPromise) return this.abortPromise;
 		if (!this.isStreaming) return;
 		this.abortPromise = Promise.resolve().then(async () => {
@@ -1475,9 +1669,10 @@ export class UniversalSession implements DispatchSession {
 		await this.prompt(text, attachments, undefined, conv, context ? `Previous conversation context:\n${context}` : "");
 	}
 
-	async refreshSessions(): Promise<void> {
-		const memoryConvs = Array.from(this.conversations.values());
-		const diskConvs = this.store.listConversations(this.cwd);
+	private sessionConversations(targetCwd: string): UniversalConversation[] {
+		const memoryConvs =
+			normalizePathKey(targetCwd) === normalizePathKey(this.cwd) ? Array.from(this.conversations.values()) : [];
+		const diskConvs = this.store.listConversations(targetCwd);
 		const convMap = new Map<string, UniversalConversation>();
 		for (const c of diskConvs) {
 			convMap.set(c.id, c);
@@ -1486,13 +1681,16 @@ export class UniversalSession implements DispatchSession {
 			convMap.set(c.id, c);
 		}
 		for (const c of convMap.values()) {
-			const savedTitle = this.stateStore?.getSessionTitle(this.cwd, c.id);
+			const savedTitle = this.stateStore?.getSessionTitle(targetCwd, c.id);
 			if (savedTitle && !UniversalSession.isDefaultTitle(savedTitle)) {
 				c.title = savedTitle;
 			}
 		}
-		const allList = Array.from(convMap.values()).sort((a, b) => b.updatedAt - a.updatedAt);
+		return Array.from(convMap.values()).sort((a, b) => b.updatedAt - a.updatedAt);
+	}
 
+	async refreshSessions(): Promise<void> {
+		const allList = this.sessionConversations(this.cwd);
 		// ConversationSummary 是单源协议；会话身份（sessionId=会话 id）必须带上，
 		// 否则客户端无法把「运行中对话」和「历史会话」认成同一条，左栏会重复一遍。
 		// rowKind：universal 底座的会话全部已落盘（sessions 里都有一条），所以只有需要自占一行的
@@ -1524,6 +1722,30 @@ export class UniversalSession implements DispatchSession {
 		}));
 		this.send({ type: "conversations", conversations: convs, activeId: this.activeConvId });
 
+		this.sendSessionList(this.cwd, allList);
+	}
+
+	private readonly sessionListLimits = new Map<string, number>();
+	setSessionListLimit(cwd: string, limit?: number): number {
+		const key = normalizePathKey(cwd);
+		if (typeof limit === "number" && Number.isFinite(limit))
+			this.sessionListLimits.set(key, Math.max(20, Math.min(5000, Math.floor(limit))));
+		return this.sessionListLimits.get(key) ?? 200;
+	}
+
+	async pushSessionsForCwd(targetCwd: string): Promise<void> {
+		try {
+			this.sendSessionList(targetCwd, this.sessionConversations(targetCwd));
+		} catch {
+			this.emitNotice(
+				"error",
+				"无法读取项目历史会话，请检查目录权限后重试。",
+				"Could not read project sessions. Check directory permissions and retry.",
+			);
+		}
+	}
+
+	private sendSessionList(targetCwd: string, allList: UniversalConversation[]) {
 		const sessionSummaries: SessionSummary[] = allList
 			.filter((c) => !c.isSubagent || !c.isEphemeral)
 			.map((c) => {
@@ -1538,7 +1760,7 @@ export class UniversalSession implements DispatchSession {
 					path: c.id,
 					sessionId: c.id,
 					// Ids carry no project slug; without cwd the left panel attaches them to every project.
-					cwd: this.cwd,
+					cwd: targetCwd,
 					name: c.title,
 					displayName,
 					firstMessage: firstMsg,
@@ -1547,7 +1769,13 @@ export class UniversalSession implements DispatchSession {
 					pinned: Boolean(c.pinned),
 				};
 			});
-		this.send({ type: "sessions", sessions: sessionSummaries, cwd: this.cwd });
+		const limit = this.setSessionListLimit(targetCwd);
+		this.send({
+			type: "sessions",
+			sessions: sessionSummaries.slice(0, limit),
+			cwd: targetCwd,
+			hasMore: sessionSummaries.length > limit,
+		});
 	}
 
 	resolveSessionDisplayName(conv: UniversalConversation, firstMsg: string): string {
@@ -2327,7 +2555,7 @@ export class UniversalSession implements DispatchSession {
 			toolsWrap: s?.toolsWrap ?? false,
 			toolImagesEnabled: s?.toolImagesEnabled ?? true,
 			keepRecentMessages: s?.keepRecentMessages ?? 0,
-			showForkedParentSessions: false,
+			showForkedParentSessions: true,
 			retainFinishedConversations: false,
 			openRecentSessionOnProjectSwitch: true,
 			skillsFullText: [],
@@ -2959,6 +3187,24 @@ export class UniversalSession implements DispatchSession {
 		conv.messages.push(assistantMsg);
 
 		const sink: AgentEventSink = {
+			// Subagent prompts surface in the PARENT conversation. Without this the driver
+			// cannot tell it has a channel (see AgentEventSink.supportsApproval) and the CLI
+			// would wait forever on a prompt nobody answers.
+			supportsApproval: true,
+			onApprovalRequest: (requestId, toolName, params) => {
+				const title = conv.title || "子代理";
+				// Same rails as the parent: deny when nobody is attached, watchdog for
+				// unattended clients, and answer on the subagent's own driver.
+				this.requestApproval(requestId, toolName, params, subDriver, {
+					idPrefix: `sa-${conv.id}-`,
+					reason: `子代理请求执行（${title}）`,
+					reasonEn: `Subagent request (${title})`,
+					conversationTitle: title,
+					// The prompt is answered while the user sits in the parent conversation; `activeConvId`
+					// would send the dialog's "jump to conversation" to whatever tab happens to be open.
+					conversationId: conv.subagentParentId ?? this.activeConvId ?? undefined,
+				});
+			},
 			onSessionStarted: (sessionId) => {
 				conv.driverSessionId = sessionId;
 				if (!conv.isEphemeral) this.store.saveConversation(cwd, conv);
@@ -3068,14 +3314,7 @@ export class UniversalSession implements DispatchSession {
 				conv.driverSessionId = sid;
 			}
 			if (!isCurrent()) return;
-			const guardedSink = new Proxy(sink, {
-				get:
-					(target, key: keyof AgentEventSink) =>
-					(...args: unknown[]) => {
-						if (isCurrent()) (target[key] as (...args: unknown[]) => void)?.(...args);
-					},
-			});
-			await subDriver.sendPrompt(prompt, undefined, guardedSink);
+			await subDriver.sendPrompt(prompt, undefined, this.guardSink(sink, isCurrent));
 		} catch (err: unknown) {
 			if (!isCurrent()) return;
 			const msg = err instanceof Error ? err.message : String(err);

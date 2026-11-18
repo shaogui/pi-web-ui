@@ -1,9 +1,14 @@
 export const macDesktopScript = String.raw`
 import Foundation
 import CoreGraphics
+import Carbon
 import ImageIO
 import ApplicationServices
 import ScreenCaptureKit
+import CoreMedia
+import CoreVideo
+import CoreImage
+import VideoToolbox
 import Darwin
 
 func fail(_ message: String) -> Never {
@@ -12,7 +17,128 @@ func fail(_ message: String) -> Never {
 }
 guard #available(macOS 14.0, *) else { fail("Native capture requires macOS 14 or newer.") }
 let mode = CommandLine.arguments.last ?? "view"
-let readOnly = mode != "control"
+let readOnly = mode != "control" && mode != "video"
+let preview = mode == "preview"
+let videoMode = mode == "video"
+
+// H.264 硬编码（VideoToolbox）：供浏览器 WebCodecs 解码，码率仅为 JPEG 的十分之一。
+// 输出帧格式：[4 字节大端长度][0x02][标志位: 1=关键帧][Annex-B 数据]
+final class VideoEncoder {
+    private let session: VTCompressionSession
+    private var sps: Data?
+    private var pps: Data?
+    init(width: Int, height: Int, fps: Double, bitrate: Int) {
+        var created: VTCompressionSession?
+        let status = VTCompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            width: Int32(width), height: Int32(height),
+            codecType: kCMVideoCodecType_H264,
+            encoderSpecification: [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: true] as CFDictionary,
+            imageBufferAttributes: nil,
+            compressedDataAllocator: nil,
+            outputCallback: nil,
+            refcon: nil,
+            compressionSessionOut: &created)
+        guard status == noErr, let session = created else { fail("Cannot create H.264 encoder (\(status)).") }
+        self.session = session
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Baseline_AutoLevel)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: NSNumber(value: Int(fps)))
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: fps))
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: bitrate))
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: [NSNumber(value: bitrate / 4), NSNumber(value: 1)] as CFArray)
+        VTCompressionSessionPrepareToEncodeFrames(session)
+    }
+    private func parameterSets(_ sample: CMSampleBuffer) {
+        guard let format = CMSampleBufferGetFormatDescription(sample) else { return }
+        var count = 0
+        guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: 0, parameterSetPointerOut: nil, parameterSetSizeOut: nil, parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil) == noErr, count >= 2 else { return }
+        var sets: [Data] = []
+        for index in 0..<count {
+            var pointer: UnsafePointer<UInt8>?
+            var size = 0
+            guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: index, parameterSetPointerOut: &pointer, parameterSetSizeOut: &size, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil) == noErr, let base = pointer else { continue }
+            sets.append(Data(bytes: base, count: size))
+        }
+        if sets.count >= 2 { sps = sets[0]; pps = sets[1] }
+    }
+    /// AVCC（长度前缀）转 Annex-B，关键帧前插入 SPS/PPS。
+    private func annexB(_ sample: CMSampleBuffer) -> (Data, Bool)? {
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[CFString: Any]]
+        let keyframe = !(attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
+        guard let block = CMSampleBufferGetDataBuffer(sample) else { return nil }
+        var length = 0
+        var pointer: UnsafeMutablePointer<Int8>?
+        guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &pointer) == noErr, let base = pointer else { return nil }
+        var out = Data()
+        if keyframe { parameterSets(sample) }
+        if keyframe, let s = sps, let p = pps {
+            out.append(contentsOf: [0, 0, 0, 1]); out.append(s)
+            out.append(contentsOf: [0, 0, 0, 1]); out.append(p)
+        }
+        var offset = 0
+        while offset + 4 <= length {
+            var size: UInt32 = 0
+            memcpy(&size, base + offset, 4)
+            let n = Int(UInt32(bigEndian: size))
+            offset += 4
+            guard n > 0, offset + n <= length else { break }
+            out.append(contentsOf: [0, 0, 0, 1])
+            out.append(Data(bytes: base + offset, count: n))
+            offset += n
+        }
+        return out.isEmpty ? nil : (out, keyframe)
+    }
+    func encode(_ pixels: CVPixelBuffer) {
+        var flags = VTEncodeInfoFlags()
+        VTCompressionSessionEncodeFrame(session, imageBuffer: pixels, presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()), duration: .invalid, frameProperties: nil, infoFlagsOut: &flags) { [weak self] status, _, sample in
+            guard status == noErr, let self, let sample, let (data, key) = self.annexB(sample) else { return }
+            var payload = Data([0x02, key ? 1 : 0])
+            payload.append(data)
+            var size = UInt32(payload.count).bigEndian
+            FileHandle.standardOutput.write(Data(bytes: &size, count: 4))
+            FileHandle.standardOutput.write(payload)
+        }
+    }
+}
+
+// 无屏幕权限也能验证编码器：合成帧走完整 VT → Annex-B 通路。
+if mode == "video-selftest" {
+    let width = 640, height = 360
+    let encoder = VideoEncoder(width: width, height: height, fps: 30, bitrate: 1_500_000)
+    var buffer: CVPixelBuffer?
+    CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, nil, &buffer)
+    guard let pixels = buffer else { fail("Cannot allocate test buffer.") }
+    for frame in 0..<30 {
+        CVPixelBufferLockBaseAddress(pixels, [])
+        if let base = CVPixelBufferGetBaseAddress(pixels) {
+            let stride = CVPixelBufferGetBytesPerRow(pixels)
+            for y in 0..<height {
+                let row = base.advanced(by: y * stride).assumingMemoryBound(to: UInt8.self)
+                for x in 0..<width {
+                    let p = row + x * 4
+                    p[0] = UInt8((x + frame * 4) % 256); p[1] = UInt8(y % 256); p[2] = UInt8((x + y) % 256); p[3] = 255
+                }
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(pixels, [])
+        encoder.encode(pixels)
+        usleep(33_000)
+    }
+    sleep(1)
+    exit(0)
+}
+var maxEdge = preview ? 640.0 : 1920.0
+var jpegQuality = 0.65
+var captureFPS = 30.0
+var requestedDisplay: CGDirectDisplayID = 0
+var activeDisplay: CGDirectDisplayID = CGMainDisplayID()
+func displayIds() -> [CGDirectDisplayID] {
+    var ids = [CGDirectDisplayID](repeating: 0, count: 32), count: UInt32 = 0
+    guard CGGetActiveDisplayList(32, &ids, &count) == .success else { return [CGMainDisplayID()] }
+    return Array(ids.prefix(Int(count)))
+}
 // Only an explicit local permission action may trigger TCC or open Settings.
 // Use the same Swift process identity as capture and input injection.
 func openPrivacy(_ pane: String) {
@@ -60,9 +186,16 @@ let keyMap: [String: CGKeyCode] = [
     "Backquote":50,"Backspace":51,"Escape":53,"MetaRight":54,"MetaLeft":55,"ShiftLeft":56,"CapsLock":57,
     "AltLeft":58,"ControlLeft":59,"ShiftRight":60,"AltRight":61,"ControlRight":62,"F1":122,"F2":120,"F3":99,
     "F4":118,"F5":96,"F6":97,"F7":98,"F8":100,"F9":101,"F10":109,"F11":103,"F12":111,"Insert":114,
-    "Home":115,"PageUp":116,"Delete":117,"End":119,"PageDown":121,"ArrowLeft":123,"ArrowRight":124,"ArrowDown":125,"ArrowUp":126
+    "Home":115,"PageUp":116,"Delete":117,"End":119,"PageDown":121,"ArrowLeft":123,"ArrowRight":124,"ArrowDown":125,"ArrowUp":126,
+    "Numpad0":CGKeyCode(kVK_ANSI_Keypad0),"Numpad1":CGKeyCode(kVK_ANSI_Keypad1),"Numpad2":CGKeyCode(kVK_ANSI_Keypad2),
+    "Numpad3":CGKeyCode(kVK_ANSI_Keypad3),"Numpad4":CGKeyCode(kVK_ANSI_Keypad4),"Numpad5":CGKeyCode(kVK_ANSI_Keypad5),
+    "Numpad6":CGKeyCode(kVK_ANSI_Keypad6),"Numpad7":CGKeyCode(kVK_ANSI_Keypad7),"Numpad8":CGKeyCode(kVK_ANSI_Keypad8),"Numpad9":CGKeyCode(kVK_ANSI_Keypad9),
+    "NumpadDecimal":CGKeyCode(kVK_ANSI_KeypadDecimal),"NumpadMultiply":CGKeyCode(kVK_ANSI_KeypadMultiply),"NumpadAdd":CGKeyCode(kVK_ANSI_KeypadPlus),
+    "NumpadDivide":CGKeyCode(kVK_ANSI_KeypadDivide),"NumpadEnter":CGKeyCode(kVK_ANSI_KeypadEnter),"NumpadSubtract":CGKeyCode(kVK_ANSI_KeypadMinus),
+    "NumpadEqual":CGKeyCode(kVK_ANSI_KeypadEquals),"NumpadComma":CGKeyCode(kVK_JIS_KeypadComma),"NumLock":CGKeyCode(kVK_ANSI_KeypadClear),"NumpadClear":CGKeyCode(kVK_ANSI_KeypadClear)
 ]
 let modifiers: [CGKeyCode: CGEventFlags] = [54:.maskCommand,55:.maskCommand,56:.maskShift,60:.maskShift,58:.maskAlternate,61:.maskAlternate,59:.maskControl,62:.maskControl]
+let keypadCodes = Set(keyMap.filter { $0.key.hasPrefix("Numpad") || $0.key == "NumLock" }.map { $0.value })
 func flags() -> CGEventFlags {
     var f = CGEventFlags()
     for k in keys { if let bit = modifiers[k] { f.formUnion(bit) } }
@@ -71,6 +204,7 @@ func flags() -> CGEventFlags {
 func key(_ code: CGKeyCode, _ down: Bool) {
     let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down)
     event?.flags = flags()
+    if keypadCodes.contains(code) { event?.flags.insert(.maskNumericPad) }
     event?.post(tap: .cghidEventTap)
 }
 func mouse(_ button: Int, _ down: Bool) {
@@ -96,6 +230,16 @@ DispatchQueue.global().async {
         guard let data = line.data(using: .utf8), let e = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let type = e["type"] as? String else { continue }
         if type == "close" { return }
         if type == "ack" { acknowledged.signal(); continue }
+        if type == "display" {
+            if let id = e["id"] as? String, let display = UInt32(id) { lock.lock(); requestedDisplay = display; lock.unlock() }
+            continue
+        }
+        if type == "configure" && !preview {
+            if let edge = e["maxEdge"] as? Int, let quality = e["quality"] as? Int, let fps = e["fps"] as? Int, (640...4096).contains(edge), (35...85).contains(quality), (5...240).contains(fps) {
+                lock.lock(); maxEdge = Double(edge); jpegQuality = Double(quality) / 100; captureFPS = Double(fps); lock.unlock()
+            }
+            continue
+        }
         if readOnly { continue }
         lock.lock()
         if stopped { lock.unlock(); return }
@@ -107,7 +251,7 @@ DispatchQueue.global().async {
             buttons.removeAll()
         case "pointer":
             if let x = e["x"] as? Double, let y = e["y"] as? Double, let action = e["action"] as? String {
-                let bounds = CGDisplayBounds(CGMainDisplayID())
+                let bounds = CGDisplayBounds(activeDisplay)
                 lastPoint = CGPoint(x: bounds.minX + x * max(0, bounds.width - 1), y: bounds.minY + y * max(0, bounds.height - 1))
                 let b = e["button"] as? Int ?? 0
                 if action == "move" {
@@ -142,50 +286,127 @@ DispatchQueue.global().async {
         lock.unlock()
     }
 }
-// ScreenCaptureKit is also used by krd. SCScreenshotManager avoids deprecated
-// CGDisplayCreateImage on current macOS SDKs and never opens a network port.
-@available(macOS 14.0, *)
-func captureImage() -> CGImage {
-    let ready = DispatchSemaphore(value: 0)
-    var result: CGImage?
+// Keep a bounded, continuous ScreenCaptureKit stream instead of starting a screenshot for every frame.
+final class DesktopFrames: NSObject, SCStreamOutput, SCStreamDelegate {
+    let condition = NSCondition()
+    var latest: CVPixelBuffer?
+    var failure: String?
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        condition.lock(); failure = String(describing: error); condition.broadcast(); condition.unlock()
+    }
+    func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen, sample.isValid,
+              let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let status = attachments.first?[.status] as? Int, status == SCFrameStatus.complete.rawValue,
+              let pixels = CMSampleBufferGetImageBuffer(sample) else { return }
+        condition.lock(); latest = pixels; condition.signal(); condition.unlock()
+    }
+    func take() -> CVPixelBuffer? {
+        condition.lock(); defer { condition.unlock() }
+        if latest == nil && failure == nil { _ = condition.wait(until: Date(timeIntervalSinceNow: 1)) }
+        if let message = failure { fail("ScreenCaptureKit stream stopped: " + message) }
+        let pixels = latest; latest = nil; return pixels
+    }
+}
+let frames = DesktopFrames()
+let captureQueue = DispatchQueue(label: "pi.desktop.capture", qos: .userInteractive)
+let imageContext = CIContext(options: [.cacheIntermediates: false])
+var stream: SCStream?
+var currentDisplay: SCDisplay?
+var configuredEdge = 0.0, configuredFPS = 0.0
+func configureStream(edge: Double, fps: Double, displayID: CGDirectDisplayID) {
+    let done = DispatchSemaphore(value: 0)
     var failure: String?
     Task {
         do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) else {
-                failure = "No active main display."; ready.signal(); return
+            if currentDisplay?.displayID != displayID {
+                if let old = stream { try await old.stopCapture(); stream = nil }
+                captureQueue.sync { frames.condition.lock(); frames.latest = nil; frames.condition.unlock() }
+                currentDisplay = nil
             }
-            let filter = SCContentFilter(display: display, excludingWindows: [])
+            if stream == nil {
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
+                    failure = "No active main display."; done.signal(); return
+                }
+                currentDisplay = display
+            }
+            guard let display = currentDisplay else { done.signal(); return }
             let config = SCStreamConfiguration()
-            let scale = min(1.0, 1920.0 / Double(max(display.width, display.height)))
+            let scale = min(1.0, edge / Double(max(display.width, display.height)))
             config.width = max(1, Int(Double(display.width) * scale))
             config.height = max(1, Int(Double(display.height) * scale))
             config.showsCursor = true
-            result = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            config.pixelFormat = kCVPixelFormatType_32BGRA
+            config.queueDepth = 3
+            config.minimumFrameInterval = preview ? CMTime(value: 3, timescale: 1) : CMTime(value: 1, timescale: CMTimeScale(fps))
+            if let active = stream { try await active.updateConfiguration(config) }
+            else {
+                let active = SCStream(filter: SCContentFilter(display: display, excludingWindows: []), configuration: config, delegate: frames)
+                try active.addStreamOutput(frames, type: .screen, sampleHandlerQueue: captureQueue)
+                stream = active
+                try await active.startCapture()
+            }
         } catch { failure = String(describing: error) }
-        ready.signal()
+        done.signal()
     }
-    guard ready.wait(timeout: .now() + 15) == .success, let image = result else {
-        release(); fail("ScreenCaptureKit capture failed: " + (failure ?? "timeout; check Screen Recording permission and active desktop."))
+    guard done.wait(timeout: .now() + 15) == .success, failure == nil else {
+        release(); fail("ScreenCaptureKit stream failed: " + (failure ?? "timeout; check Screen Recording permission."))
     }
-    return image
+    configuredEdge = edge; configuredFPS = fps
+    lock.lock(); activeDisplay = displayID; lock.unlock()
+}
+var reportedAt = 0.0, lastFrameAt = 0.0
+var cachedPixels: CVPixelBuffer?
+var cachedDisplayID: CGDirectDisplayID = 0
+var videoEncoder: VideoEncoder?
+var encoderEdge = 0.0, encoderFPS = 0.0
+func videoBitrate(edge: Double, quality: Double, fps: Double) -> Int {
+    let base: Double = edge >= 3500 ? 28_000_000 : edge >= 2400 ? 14_000_000 : edge >= 1700 ? 9_000_000 : edge >= 1200 ? 5_000_000 : 2_500_000
+    let q = min(1.25, max(0.6, quality / 0.7))
+    return Int(base * q * (fps >= 90 ? 1.4 : 1))
 }
 while true {
+    lock.lock(); let edge = maxEdge, quality = jpegQuality, fps = captureFPS, requested = requestedDisplay; lock.unlock()
+    let ids = displayIds(), chosen = ids.contains(requested) ? requested : CGMainDisplayID()
+    if edge != configuredEdge || fps != configuredFPS || currentDisplay?.displayID != chosen { configureStream(edge: edge, fps: fps, displayID: chosen) }
+    if videoMode {
+        if videoEncoder == nil || encoderEdge != edge || encoderFPS != fps {
+            let scale = min(1.0, edge / Double(max(CGDisplayPixelsWide(chosen), CGDisplayPixelsHigh(chosen))))
+            let w = max(2, Int(Double(CGDisplayPixelsWide(chosen)) * scale) & ~1)
+            let h = max(2, Int(Double(CGDisplayPixelsHigh(chosen)) * scale) & ~1)
+            videoEncoder = VideoEncoder(width: w, height: h, fps: fps, bitrate: videoBitrate(edge: edge, quality: quality, fps: fps))
+            encoderEdge = edge; encoderFPS = fps
+        }
+        if let fresh = frames.take() { videoEncoder?.encode(fresh) }
+        continue
+    }
+    let now = ProcessInfo.processInfo.systemUptime
+    if now - reportedAt >= 2 {
+        let info: [String: Any] = ["type": "displays", "capture": "screencapturekit", "maxEdge": 4096, "selected": String(chosen), "displays": ids.map { id in ["id": String(id), "width": CGDisplayPixelsWide(id), "height": CGDisplayPixelsHigh(id), "primary": id == CGMainDisplayID()] as [String: Any] }]
+        if let data = try? JSONSerialization.data(withJSONObject: info) {
+            var size = UInt32(data.count).bigEndian
+            FileHandle.standardOutput.write(Data(bytes: &size, count: 4)); FileHandle.standardOutput.write(data)
+        }
+        reportedAt = now
+    }
+    if cachedDisplayID != chosen { cachedPixels = nil; cachedDisplayID = chosen }
+    let fresh = frames.take()
+    if let latest = fresh { cachedPixels = latest }
+    if fresh == nil && ProcessInfo.processInfo.systemUptime - lastFrameAt < 3 { continue }
+    guard let pixels = cachedPixels else { continue }
     autoreleasepool {
-        let image = captureImage()
-        let scale = min(1.0, 1920.0 / Double(max(image.width, image.height)))
-        let width = max(1, Int(Double(image.width) * scale)), height = max(1, Int(Double(image.height) * scale))
-        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { release(); fail("Cannot allocate capture buffer.") }
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        let input = CIImage(cvPixelBuffer: pixels)
+        guard let image = imageContext.createCGImage(input, from: input.extent) else { fail("Cannot read captured image.") }
         let data = NSMutableData()
-        guard let scaled = context.makeImage(), let destination = CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil) else { release(); fail("Cannot create JPEG encoder.") }
-        CGImageDestinationAddImage(destination, scaled, [kCGImageDestinationLossyCompressionQuality: 0.65] as CFDictionary)
+        guard let destination = CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil) else { release(); fail("Cannot create JPEG encoder.") }
+        CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
         guard CGImageDestinationFinalize(destination), data.length > 0, data.length <= 4194304 else { release(); fail("JPEG exceeds 4 MB or encoding failed.") }
         var size = UInt32(data.length).bigEndian
         FileHandle.standardOutput.write(Data(bytes: &size, count: 4))
         FileHandle.standardOutput.write(data as Data)
+        lastFrameAt = ProcessInfo.processInfo.systemUptime
     }
     if acknowledged.wait(timeout: .now() + 15) == .timedOut { release(); fail("Frame consumer stopped responding.") }
-    Thread.sleep(forTimeInterval: 0.1)
 }
 `;

@@ -1,3 +1,5 @@
+[English](./architecture-core.en.md) · **简体中文** · [繁體中文](./architecture-core.zh-TW.md)
+
 # 核心架构
 
 > 改代码前必读。本文档覆盖快照驱动、协议单源、安全边界、主题切换、多对话并发等全局架构决策。
@@ -69,6 +71,8 @@ React + Capacitor 手机客户端、Hub 账号隔离推送与设备切换见 [`m
 钉住 / 取消钉住后要按**会话自己的 cwd 推一次 `sessions` 摘要**：历史行上的 📌 来自摘要里的 `pinned`（`isSessionPinned()` 现算），`emitConversations()` 只刷新运行中与活动行、不动摘要——不推的话取消钉住后图标得等点一下项目重新拉列表才消失。`setConversationPinned()` 推 `conv.cwd`；`pinSession()` 在记账用的 `pinCwd` 与当前 `cwd` 不同时改推 `pushSessionsForCwd(pinCwd)`。验证：`tests/unit/pin-badge-refresh.test.ts`。项目的展开/收起状态持久化在 `pi-web-ui:lp-expanded-projects`：刷新时**完全按记录恢复**，只有「首次使用、没有任何记录」才展开当前项目，`currentCwd` 变化的 effect 在首帧不动作（否则收起来的项目一刷新又自动弹开），之后切换项目才自动展开。钉住的历史行在项目收起时仍然显示（`isPinnedRowVisible()`；刷新后一直是收起状态、从没展开过的项目也要挂载子节点，并且不受 `maxVisible` 截断），否则一收起项目它就从左栏消失，钉住等于没钉。历史行的右键菜单按**该行自己的 `pinned`** 判断显示「钉住」还是「取消钉住」：跨项目的历史行不在当前项目的 `sessions` 列表里，只查列表会永远显示「钉住」（点下去还会再钉一次）。验证：`tests/unit/pin-badge-refresh.test.ts` 与 `tests/unit/left-panel-actions.test.ts`（跨项目历史行用例）。
 
 侧栏子代理树从一级开始每层缩进 12px，有无子代理的行使用相同标题基线，层级仅通过缩进表达，不绘制连接线。折叠按钮使用细描边箭头并随深度同步右移；图标为 12×12px，独立点击区域为 18×24px，与标题保持 2px 间隔，提供悬停及键盘焦点反馈。运行中和其他客户端的对话树共用同一布局，按钮通过 `aria-expanded` 表达展开状态。层内样式与 `styles.css` 末尾结构复位规则保持一致，避免主题或选中态覆盖缩进。
+
+跨项目历史读取统一走 `pushSessionsForCwd`。UniversalSession（Claude/Codex）按请求项目读取存档并应用该项目的标题与分页限制，返回 `sessions.cwd` 和每行 `cwd`；读取不会切换当前工作区或覆盖活动对话列表。`use-session-list-requests.ts` 按项目跟踪回执，20 秒未返回时显示可重试状态；其他项目的回执不能结束本项目的加载。断线和引擎切换清理旧请求，重连后重新读取已展开项目，迟到的有效回执可恢复列表。验证见 `universal-session-list.test.ts`、`left-panel-session-loading.test.ts`。
 
 ## 工作树入口
 
@@ -294,6 +298,7 @@ events.jsonl    追加式生命周期流水（有字节上限，截断后只留�
 - **内置服务商多密钥（不复制模型列表 + 纯名字通信）**：一个内置服务商（如 opencode/openai）可同时持有**多把 API key**，存于 `<agentDir>/provider-keys.json`（`{ <providerId>: { activeKeyName, keys:[{name,apiKey}] } }`），**模型目录始终复用该服务商的默认系统目录**，绝不复制进 models.json（`clone_provider` 只保留给程序化/测试路径，UI 已改为多密钥管理）。**安全**：前端**永远只拿到钥匙的**名字**（`ProviderKeyInfo={name,active}`），**原始 key 值 / 掩码片段（masked）一律不出服务端**——key 值只在添加时经 WS 上传一次落盘（同 auth.json）；`activate_provider_key`/`remove_provider_key` 都**按名字**寻址，服务端解析存储值。协议：`list_provider_keys` / `add_provider_key`（`{provider, apiKey, name?}`，名字自动去重）/ `activate_provider_key` / `remove_provider_key`，服务端回 `provider_keys`。**activeKey 与 auth.json + 运行时 override 同步**（`applyActiveKey`），切 key 后 `pushModels` 重推该服务商模型。前端模型下拉对多 key 服务商在左侧「供应商」栏**按 key 拆成多个条目**（供应商名在上、key 名在下，如 opencode 下 key1/key2 各一条，不拼接 `opencode-key2name`），**选中某 key 条目即只显示该服务商模型一次，点模型即切换激活 key** 再选模型——无需静态副本、始终最新；单 key 服务商仍显示普通单一条目。
 - **内置服务商 OAuth（开放授权）登录**：`ProviderStatus` 同时下发 `supportsApiKey`、`supportsOAuth`、`oauthName` 与 `usingOAuth`，模型管理页和首次设置页据此只展示服务商真正支持的认证入口及对应账号名称。登录由服务端 `ProviderOAuthFlowManager` 驱动 SDK（软件开发工具包）的 `ModelRuntime.login`，浏览器只接收选择题、验证地址、设备验证码和进度；SDK 返回的访问令牌与刷新令牌不进入 wire 协议。每个流程使用 `flowId + promptId` 关联回复，可取消；活动流程留在 `ClientSession`，浏览器重连后通过 `provider_oauth_flows` 恢复当前公开状态。登录成功后 OAuth 凭据成为该服务商的活动认证，并清除各项目保存的 API key 选择，防止切换项目时覆盖；登出统一调用 SDK 的 `logout`。
 - **token 反射防护**（issue #45）：`PI_WEB_TOKEN` 鉴权中间件里，`/api/health` 保持开放供探针，但 `Set-Cookie` 只在请求确实携带有效 token（`tokenOk(req)`）时才下发——匿名命中 `/api/health` 绝不反射真实 token cookie。回归：`tests/token-auth-test.mjs` 的「health does NOT leak pi_web_token」检查。
+- **未登录页走原生表单登录**（`server/unauthorized-page.ts` + `server/auth-login.ts`，`POST /__pi/auth`）：口令表单是**真 POST → 303 → GET**，并带 `autocomplete="username"` 的账号域 + `autocomplete="current-password"` 的密码域——只有这样才能让 Chrome/Safari/Firefox 在登录后询问「是否保存密码」（历史实现是 JS `preventDefault()` + `?token=` 跳转，浏览器不认为是登录，永远不弹）。回跳目标统一走 `sanitizeNextPath`：只允许同源绝对路径（禁 `//host`、`\`、控制字符）并剔除 `token`/`__tried_cached_token`/`auth_error` 查询参数；口令错误 303 回 `?auth_error=1`，未登录页据此渲染「口令不正确」。`?token=` / Bearer / X-PI-Token 旧路径全部保留。回归：`tests/unit/auth-login.test.ts`、`tests/unit/unauthorized-page.test.ts`、`tests/token-auth-test.mjs`。
 - **dev 兼容**：vite :5173 代理 /ws 到 :8788 时 Origin(:5173) ≠ Host(:8788)，靠 `PI_WEB_ALLOW_ORIGINS`（dev:server 内置）放行，勿删。
 
 ## 主题切换
@@ -311,12 +316,13 @@ events.jsonl    追加式生命周期流水（有字节上限，截断后只留�
 - **按钮状态契约**：普通按钮统一用 `--button-bg/fg/border`、`--button-hover-bg/fg/border`；实底主按钮统一用 `--button-primary-bg/fg` 与 `--button-primary-hover-bg/fg`；危险按钮用 `--button-danger-bg/fg` 与 `--button-danger-hover-bg/fg`。主题优先覆盖成对变量，避免重复复制组件选择器。主按钮默认保持悬浮文字/底色配对，以外圈提示悬浮，禁止整体 brightness 滤镜同时改字与底。发送/停止的悬浮底色分别配 `--on-send-blue-hover` / `--on-stop-red-hover`，不能假设普通状态前景仍可读。`node tests/theme-buttons-test.mjs` 无需构建或启动服务，在真实 Chrome 中逐主题验证十类按钮普通/悬浮态的最终层叠与透明背景合成，对比度下限 3:1；无 Chrome 明确 SKIP，已加入全量冒烟。
 - **回归**：`theme-test.mjs`（端口 8937，隔离 data-dir）：列表/内置/用户主题、注入 link、浅色生效、刷新持久、用户主题可应用、回默认移除 link。
 
-## CSS 分层（`@layer guard, base, theme;`）
+## CSS 分层（`@layer guard, base, theme, drawer;`）
 
 - **为什么分层**：`web/src/styles.css` 是共享基线、主题是后加载的完整样式表，两者在同一份文档里争权重。分层重构前，能跨文件夺权的唯一手段就是 `!important`（叹号 important）：基线 218 处、主题侧 613 处（`bases/obsidian-base.css` 220、`bases/zhujian-base.css` 143、`bases/zhupi-base.css` 132、`aetheris.css` 118），主题要压住基线只能继续加码，越改越沉——典型的军备竞赛。改成显式分层 + 无层覆盖区后基线只剩 1 处（mermaid 运行时内联 style，见下），胜负由**层序**决定，叹号 important 不再是夺权工具。
-- **三层职责**（顺序声明只有一处：`web/src/styles.css` 顶部的 `@layer guard, base, theme;`，早于所有层块，层序按此固定）：
+- **四层职责**（顺序声明只有一处：`web/src/styles.css` 顶部的 `@layer guard, base, theme, drawer;`，早于所有层块，层序按此固定）：
   - `@layer base`：整份基线样式（`web/src/styles.css` 内容）。默认层，正常写选择器，不加 `!important`。
   - `@layer theme`：主题样式。**服务端统一下发**——`server/themes.ts` 的 `readThemeCss()` 内联展开 `@import` 后把整份文本包进 `@layer theme { … }`（只包最外层一次；递归内联的子文件原样返回，否则会变成嵌套层）。`themes/**/*.css` 源文件因此**不需要**自己写 `@layer`，也不需要 `!important`：只要写在主题里就天然压过 base。
+  - `@layer drawer`：底部面板与源码管理面板（`web/src/drawer.css`，经 `@import … layer(drawer)` 引入）。它排在最后，因此能压过 base 里的同名规则，**不必靠复合类提权**；新增组件层只能追加到这个位置之后。
   - `@layer guard`：唯一活口是 mermaid——它用 d3 `.style()` 把字号写成 SVG 内联 `style`，任何普通声明都压不住，只能留这一处叹号 important（`styles.css` 末尾，写明原因）。guard 先声明，层序反转后它的 important 恒胜。别把普通样式挪进来偷懒。
 - **无层覆盖区**（`styles.css` 末尾、所有层块之后）：需要盖过主题或未分层三方库（highlight.js `github-dark.css`，bundle 里后加载）的结构性复位放这里——代码行清零（同为无层后靠更高权重盖过 `pre code.hljs`）、折叠态 `.goalbar.goalbar-collapsed` 抹皮（无层一句盖住 theme 层面板皮）。**未分层的普通声明永远胜过任何层内的普通声明**，所以这里不需要叹号 important。分包引入的 CSS（如 `web/src/model-management.css` 经 `@import … layer(base)`）与插件样式同样必须进层，不能裸奔成无层。
 - **层序规则（两个方向相反，最容易踩）**：普通声明按**层声明顺序**后者胜（`theme` > `base` > `guard`）；带叹号 important 的声明**反向**——先声明的层胜（`guard` > `base` > `theme`）。所以 guard 层的价值恰在于它**先**声明：mermaid 那一处例外放进去就能盖住运行时内联；而 base/theme 里写叹号 important 只会把自己钉死，越写越糟。另注：**未分层的样式永远胜过任何层内的普通声明**——这正是「无层覆盖区」能零提权盖住主题与 highlight.js 的原因。
@@ -412,7 +418,9 @@ events.jsonl    追加式生命周期流水（有字节上限，截断后只留�
 
 1. **全局关**：设置 →「工具」页的「工具执行审批」总开关（`ClientSettings.toolApprovalEnabled`，默认开，纯运行开关不进预设）。关掉后一切审批都不弹——内置高危检测直接放行、插件 pre guard 的 `ask` 也按放行处理（`withToolGuard` 的 `ask` 分支只改 `needApproval`，最终都经 `askApproval` 定夺）；开关被关掉的那一刻，挂着的待审批项由 `autoApprovePendingApprovals` 全部按批准放行（不让人对着弹窗干等）。
 2. **本对话全部允许**（弹窗按钮，`tool_approval_response.scope = "all"`）：该对话后续任何高危操作都不再询问。
-3. **本对话允许同类**（弹窗按钮，`scope = "category"`，仅在本次命中规则档位时出现）：只放行同一档位。档位 = `UiApprovalCategory{ id, label, labelEn }`，id 稳定不许改名：`bash.rm-rf` / `bash.win-del` / `bash.disk` / `bash.git-destructive` / `bash.chmod` / `bash.system-redirect` / `file.sensitive.env` / `file.sensitive.ssh` / `file.sensitive.shell` / `file.outside-workspace` / `plugin:<pluginId>`（插件 pre guard 的 `ask` 按插件分档）。无档位的拦截（自定义 reason）只受前两档影响。
+3. **本对话允许同类**（弹窗按钮，`scope = "category"`，仅在本次命中规则档位时出现）：只放行同一档位。档位 = `UiApprovalCategory{ id, label, labelEn }`，id 稳定不许改名：`bash.rm-rf` / `bash.win-del` / `bash.disk` / `bash.git-destructive` / `bash.chmod` / `bash.system-redirect` / `file.sensitive.env` / `file.sensitive.ssh` / `file.sensitive.shell` / `file.outside-workspace` / `phone.gesture` / `phone.input` / `phone.key` / `phone.launch` / `plugin:<pluginId>`（插件 pre guard 的 `ask` 按插件分档）。无档位的拦截（自定义 reason）只受前两档影响。
+
+**手机操控档（#902）**：`phone` 工具的 `op` 分读屏档（`status`/`dump`/`screenshot`）与操控档（`tap`/`long_press`/`swipe`/`input`/`key`/`launch`，单源 `server/phone-tool.ts` 的 `PHONE_READ_OPS` / `PHONE_CONTROL_OPS`）。**读屏档不建规则**（默认不拦截）；操控档由 `PHONE_APPROVAL_GROUPS` 派生出 4 条内置 `ask` 规则（`builtin.phone.*`，`field: "params"` 匹配 `op`，容空白/大小写），因此每档既能单独停用（等价于「只允许读屏」「launch 才问」这类粒度），也能按档「记住本类」。工具描述与设置文案必须写明「开启即授权整机操控，但每个操控 op 先问」，不要退回到「无逐操作审批」的旧口径。回归：`tests/unit/phone-tool-ops.test.ts`。
 
 **策略挂在哪**：`Conversation.approvalPolicy = { allowAll, categories: Map<id, UiApprovalCategory> }`，**仅内存**（不落 client-state），且挂在对话对象上而不是 ClientSession——手动过户搬的就是对话本体，策略跟着走；重启服务 / 新对话即恢复询问。记住后同对话内**已被新策略覆盖的其它待审批项一并放行**（`approveCoveredPending`），并给一句回执 notice。
 
