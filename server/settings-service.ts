@@ -4,6 +4,7 @@ import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { mergeQuickAskSettings, normalizeQuickAskSettings, type QuickAskSettings } from "./quick-ask-settings.js";
+import { mergeBotDraftSettings, normalizeBotDraftSettings, type BotDraftSettings } from "./bot-draft-settings.js";
 import type {
 	ClientMessage,
 	QueueMode,
@@ -45,6 +46,7 @@ import { findVisionModels, SYSTEM_PROMPT } from "./vision-bridge.js";
 import { COMMITMSG_SYSTEM_PROMPT } from "./scm-commitmsg.js";
 import { PLAN_MODE_SYSTEM_PROMPT } from "./plan-mode.js";
 import { DEFAULT_TEMPLATES, localizeTemplate, type SubagentTemplatesStore } from "./subagent-templates.js";
+import { resolveSecurityMode } from "./subagent-security-gate.js";
 import { discoverDiskSkills, isSkillStillOnDisk, type DiscoveredSkill } from "./skill-discovery.js";
 import type { ApprovalRulesStore } from "./approval-rules.js";
 import {
@@ -560,6 +562,7 @@ export class SettingsService {
 				scmCommitMsgPromptMode: this.settings.scmCommitMsgPromptMode,
 				scmCommitMsgPrompt: this.settings.scmCommitMsgPrompt,
 				...normalizeQuickAskSettings(this.settings),
+				...normalizeBotDraftSettings(this.settings),
 				planModePromptMode: this.settings.planModePromptMode,
 				planModePrompt: this.settings.planModePrompt,
 				reviewPrompt: this.settings.reviewPrompt,
@@ -591,7 +594,12 @@ export class SettingsService {
 							disabledMarkers: [] as string[],
 							markers: [] as import("./protocol.js").UiMarkerInfo[],
 						}),
-				subagentTemplates: this.templates.list().map((t) => localizeTemplate(t, this.host.getLocale?.())),
+				subagentTemplates: this.templates.list().map((t) => ({
+					...localizeTemplate(t, this.host.getLocale?.()),
+					// 下发生效值：模板从未声明权限时也要让设置页看见启发式的真实结果，
+					// 否则用户以为「常规」、实际按名字被当成 readonly。
+					securityMode: resolveSecurityMode(t.name, t),
+				})),
 				subagentDefaultTemplates: DEFAULT_TEMPLATES.map((t) => t.name),
 				subagentDefaultModel: this.settings.subagentDefaultModel ?? null,
 				subagentMaxDepth: this.settings.subagentMaxDepth ?? 0,
@@ -709,8 +717,11 @@ export class SettingsService {
 		quickAskEnabled?: QuickAskSettings["quickAskEnabled"];
 		quickAskModel?: QuickAskSettings["quickAskModel"];
 		quickAskThinking?: QuickAskSettings["quickAskThinking"];
+		botDraftModel?: BotDraftSettings["botDraftModel"];
+		botDraftThinking?: BotDraftSettings["botDraftThinking"];
 		quickAskSystemPrompt?: QuickAskSettings["quickAskSystemPrompt"];
 		quickAskExplainPrompt?: QuickAskSettings["quickAskExplainPrompt"];
+		quickAskTranslateModel?: QuickAskSettings["quickAskTranslateModel"];
 		quickAskTranslateEnabled?: QuickAskSettings["quickAskTranslateEnabled"];
 		quickAskTranslateTarget?: QuickAskSettings["quickAskTranslateTarget"];
 		quickAskTranslateStyle?: QuickAskSettings["quickAskTranslateStyle"];
@@ -936,6 +947,7 @@ export class SettingsService {
 			next.scmCommitMsgPrompt = partial.scmCommitMsgPrompt;
 		}
 		Object.assign(next, mergeQuickAskSettings(this.settings, partial));
+		Object.assign(next, mergeBotDraftSettings(this.settings, partial));
 		if (partial.planModePromptMode !== undefined) {
 			next.planModePromptMode = partial.planModePromptMode;
 		}

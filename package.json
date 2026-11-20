@@ -1,6 +1,6 @@
 {
 	"name": "pi-web-ui",
-	"version": "0.121.0",
+	"version": "0.121.3",
 	"description": "Just open your browser to get all your work done — browser cockpit for AI coding agents (chat, code, files, terminal, Git in one tab)",
 	"license": "MIT",
 	"author": {
@@ -70,9 +70,11 @@
 	},
 	"scripts": {
 		"postinstall": "node bin/postinstall.mjs",
-		"prepublishOnly": "npm run build:device-p2p && npm run build:ffmpeg -- --platform=win32-x64 && npm run verify:desktop-codec && npm run build",
+		"prepublishOnly": "npm run build:release",
+		"build:release": "npm run build:device-p2p && npm run build:ffmpeg -- --platform=win32-x64 && npm run verify:desktop-codec && npm run build",
 		"verify:device-p2p": "node scripts/verify-device-p2p.mjs",
-		"pack:p2p": "npm run build:device-p2p && npm run build:ffmpeg -- --platform=win32-x64 && npm run verify:desktop-codec && npm run build && npm run verify:device-p2p && npm pack",
+		"pack:npm": "node scripts/pack-npm.mjs",
+		"pack:p2p": "npm run build:release && npm run verify:device-p2p && node scripts/pack-npm.mjs",
 		"build:device-p2p": "node scripts/build-device-p2p.mjs",
 		"build:ffmpeg": "node scripts/fetch-ffmpeg.mjs",
 		"build:desktop-codec": "node scripts/build-ffmpeg-compat.mjs && node scripts/build-native-desktop-codec.mjs",
@@ -84,7 +86,7 @@
 		"app:update": "node scripts/update-local-app.mjs",
 		"build": "npm run build:web && npm run build:server && npm run build:dsh-runtime && npm run build:mermaid-vendor && npm run build:runtrace-vendor",
 		"build:web": "vite build --config web/vite.config.ts",
-		"build:server": "node scripts/build-server.mjs && node scripts/gen-bin-atomic-file.mjs && node scripts/build-desktop-service-source.mjs",
+		"build:server": "node scripts/build-server.mjs && node scripts/gen-bin-atomic-file.mjs && node scripts/gen-bin-mirrors.mjs && node scripts/build-desktop-service-source.mjs",
 		"build:dsh-runtime": "node scripts/copy-dsh-runtime.mjs",
 		"build:mermaid-vendor": "node scripts/build-mermaid-vendor.mjs",
 		"build:extension": "node plugins/page-picker/extension/build.mjs",
@@ -96,7 +98,8 @@
 		"release:local": "node scripts/release-local.mjs",
 		"release:npm": "node scripts/publish-npm.mjs",
 		"release:check": "node scripts/check-release-assets.mjs",
-		"typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p web/tsconfig.json --noEmit && tsc -p tsconfig.tests.json --noEmit && tsc -p desktop/tsconfig.json --noEmit && tsc -p plugins/page-picker/extension/tsconfig.json --noEmit",
+		"release:check:npm": "node scripts/check-npm-version.mjs",
+		"typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p web/tsconfig.json --noEmit && tsc -p tsconfig.tests.json --noEmit && tsc -p desktop/tsconfig.json --noEmit && tsc -p tsconfig.extensions.json --noEmit && tsc -p plugins/page-picker/extension/tsconfig.json --noEmit",
 		"test": "vitest run",
 		"test:unit": "vitest run",
 		"test:integration": "vitest run --config vitest.integration.config.ts",
@@ -120,17 +123,21 @@
 		"plugins:unlink": "node scripts/link-plugins.mjs --unlink",
 		"start": "node --import ./dist/server/resolve-global-sdk.js dist/server/index.js",
 		"build:desktop": "tsc -p desktop/tsconfig.json && node scripts/build-browser.mjs",
+		"build:desktop-runtime": "node scripts/build-desktop-runtime.mjs",
+		"verify:desktop-runtime": "node scripts/verify-desktop-runtime.mjs",
 		"desktop:dev": "npm run build:desktop && electron dist/desktop/main.js",
-		"desktop:dist": "npm run build && npm run build:desktop && node scripts/run-electron-builder.mjs -c desktop/electron-builder.yml",
-		"desktop:portable": "npm run build && npm run build:desktop && node scripts/make-portable.mjs",
+		"desktop:dist": "node scripts/ensure-latest-engine.mjs && npm run build && npm run build:desktop && node scripts/run-electron-builder.mjs -c desktop/electron-builder.yml",
+		"desktop:msi": "node scripts/ensure-latest-engine.mjs && npm run build && npm run build:desktop && node scripts/run-electron-builder.mjs -c desktop/electron-builder.yml --win msi --publish never",
+		"desktop:portable": "node scripts/ensure-latest-engine.mjs && npm run build && npm run build:desktop && node scripts/make-portable.mjs",
 		"desktop:portable:full": "npm run build && npm run build:desktop && node scripts/make-portable.mjs --with-git",
-		"format": "prettier --write server/ web/src/ extensions/ scripts/ bin/ desktop/ tests/*.mjs tests/unit/ *.mjs",
-		"format:check": "prettier --check server/ web/src/ extensions/ scripts/ bin/ desktop/ tests/*.mjs tests/unit/ *.mjs",
+		"format": "prettier --write server/ web/src/ extensions/ scripts/ bin/ desktop/ tests/*.mjs tests/unit/",
+		"format:check": "prettier --check server/ web/src/ extensions/ scripts/ bin/ desktop/ tests/*.mjs tests/unit/",
 		"lint": "oxlint server/ web/src/ extensions/ scripts/ bin/ desktop/",
 		"lint:fix": "oxlint --fix server/ web/src/ extensions/ scripts/ bin/ desktop/",
 		"audit:themes": "node scripts/theme-audit.mjs --out .theme-audit/current",
 		"audit:diff": "node scripts/theme-diff.mjs .theme-audit/baseline .theme-audit/current",
-		"gen:atomic": "node scripts/gen-bin-atomic-file.mjs"
+		"gen:atomic": "node scripts/gen-bin-atomic-file.mjs",
+		"gen:bin-mirrors": "node scripts/gen-bin-mirrors.mjs"
 	},
 	"dependencies": {
 		"@deepseek-ai/dsh-sdk-jsonrpc-server": "^0.2.1-rc.2",
@@ -151,17 +158,22 @@
 	"optionalDependencies": {
 		"@crosscopy/clipboard": "0.3.6",
 		"@earendil-works/pi-coding-agent": ">=1.1.0",
-		"typebox": "^1.3.34"
+		"typebox": "^1.3.34",
+		"@earendil-works/pi-tui": "1.5.2"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",
-		"typebox": "*"
+		"typebox": "*",
+		"@earendil-works/pi-tui": "*"
 	},
 	"peerDependenciesMeta": {
 		"@earendil-works/pi-coding-agent": {
 			"optional": true
 		},
 		"typebox": {
+			"optional": true
+		},
+		"@earendil-works/pi-tui": {
 			"optional": true
 		}
 	},
@@ -208,7 +220,12 @@
 		"typescript": "^7.0.2",
 		"vis-timeline": "^8.5.4",
 		"vite": "^8.3.0",
-		"vitest": "^5.0.1"
+		"vitest": "^5.0.1",
+		"mdast-util-from-markdown": "^2.0.3",
+		"mdast-util-math": "^3.0.0",
+		"micromark-util-types": "^2.0.2",
+		"remark-parse": "^11.0.0",
+		"unified": "^11.0.5"
 	},
 	"allowScripts": {
 		"node-pty@1.1.0": true

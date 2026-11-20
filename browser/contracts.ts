@@ -86,6 +86,11 @@ export interface BrowserHostBridge {
 
 export type BrowserShellAction =
 	| "state"
+	/**
+	 * 要键盘焦点：内部页（新标签页的搜索框）加载完请宿主把焦点交给自己的视图。
+	 * 宿主只接受「发送方就是当前活动标签」的请求，Agent 模式 / 地址浮层开着时不抢。
+	 */
+	| "focus"
 	| "overlay"
 	/** 面板浮层：`{ open, panel }` 开/收起，`{ size }` 由面板页回煲自己要多大的矩形 */
 	| "panel"
@@ -111,11 +116,15 @@ export type BrowserShellAction =
 	| "back"
 	| "forward"
 	| "reload"
+	/** 开发工具开关：网站出问题（验证码不通过、脚本报错）时用户能自己看控制台 */
+	| "devtools.toggle"
 	| "mode"
 	| "splitRatio"
 	| "agent.connect"
 	| "bookmarks.list"
 	| "bookmarks.save"
+	/** 从别的浏览器导出的书签文件导入：宿主自己开原生选文件对话框、读盘、解析再合并，回执只有条数 */
+	| "bookmarks.import"
 	| "history.list"
 	| "settings.get"
 	| "settings.save"
@@ -131,6 +140,11 @@ export type BrowserShellAction =
 	| "passwords.reveal"
 	| "passwords.upsert"
 	| "passwords.remove"
+	/** 从 CSV 导出文件导入：宿主自己开原生选文件对话框，明文不进渲染层 */
+	| "passwords.import"
+	/** Passkey 保管库：私钥永不下发渲染层，面板只看得到投影（`PublicPasskey`） */
+	| "passkeys.list"
+	| "passkeys.remove"
 	/** TOTP 保管库：secret 永不出主进程，渲染层只要 6 位码（`totp.code`） */
 	| "totp.available"
 	| "totp.list"
@@ -147,4 +161,6 @@ export type BrowserShellAction =
 	| "scripts.list"
 	| "scripts.toggle"
 	| "scripts.remove"
-	| "download.open";
+	| "download.open"
+	/** 在系统文件管理器里定位已完成下载（只传 id，路径由主进程解析，不执行文件） */
+	| "download.reveal";

@@ -23,6 +23,8 @@ pi 引擎在 `stats.contextUsage.categories` 中提供分类估算：系统提�
 ```bash
 npm run dev          # 并行：node --watch --import tsx 后端(:8788，dev:server 脚本，cross-env 固定 PI_WEB_PORT=8788，
 #                     避开全局 pi-web-ui 的默认 :8787) + vite 前端(:5173，代理 /ws 到 :8788)。
+#                     写接口（设备中心 POST）在 dev 下靠同源例外放行：dev:server 已设
+#                     PI_WEB_ALLOW_ORIGINS=http://localhost:5173,http://127.0.0.1:5173（Vite 代理会改写 Host）。
 #                     注意：不要用 `tsx watch` 起后端——它在 Windows 下、stdio 为管道（concurrently 的 spawn 方式）
 #                     时会静默挂死（tsx 上游 bug），改用 Node 原生 --watch。
 npm run dev:totp     # 本地 TOTP 测试站（http://127.0.0.1:8791，测内置浏览器「TOTP 验证器」的扫码/自动匹配/填码，见下文「TOTP 测试站」）
@@ -43,6 +45,13 @@ npm run test:freeze  # 冻结/重连回归测试（Playwright，需要本机 chr
 ```
 
 Electron 相关依赖（`electron` / `electron-builder` 的二进制）走 npmmirror：打包命令（`desktop:dist`、`desktop:portable*`）已由 `scripts/run-electron-builder.mjs` 自动注入 `ELECTRON_MIRROR` / `ELECTRON_BUILDER_BINARIES_MIRROR`（默认值见 `scripts/lib/electron-mirror.mjs`）。这些镜像**禁止**写进 `.npmrc`——npm 11 会对自定义键告警，npm 12 起不再透传。首次 `npm install` 要下载 Electron 二进制，国内网络请先自带 `ELECTRON_MIRROR` 环境变量。
+
+### Pi 引擎版本（打包跟随 + 桌面在线更新）
+
+根因：线上 `@earendil-works/pi-coding-agent` 经常比 package-lock 里钉的版本新，`npm ci` 永远装回旧版，打包带出去的自带副本一直是旧引擎；桌面安装包的 node_modules 不可写、也没有更新入口。出路是现成的：`resolve-global-sdk` 会优先采用机器上**更新**的全局副本（见 `server/resolve-global-sdk.ts` 头部注释）。
+
+- 构建侧：`desktop:dist` / `desktop:msi` / `desktop:portable` 在正式 build 前先跑 `node scripts/ensure-latest-engine.mjs`。该脚本对比自带副本与 registry 最新版，落后则 `npm update @earendil-works/pi-coding-agent`（`>=1.1.0` range 自动升到满足版并更新 lock），只动 package.json / package-lock.json / node_modules；默认永远 exit 0（离线/失败只警告不断构建），CI 卡点用 `--check-only`，跳过用 `--allow-outdated`。
+- 运行侧：`server/engine-update.ts` 提供 `GET /api/engine/status`（`{bundled, inUse, latest}`，失败项为 null）与 `POST /api/engine/update`（`npm i -g …@latest`，复用 `run-process.ts`，300s 超时），错误按超时/权限/网络/缺 npm 给人话；更新后不自动重启。桌面设置「Pi 引擎」section（仅桌面壳）展示三个版本号，成功后提示重启服务生效，重启走既有路径。
 
 ## 更新本地桌面 app（macOS）
 
@@ -71,6 +80,8 @@ node scripts/update-local-app.mjs            # 退出 app → 备份 → 替换 
 | 源码仓库 / CI / 人工终端跑一次性命令 | `scripts/safe-exec.mjs`                                | 调用方不常驻，靠 `--detach` 守护进程 + jobfile 三件套（`.pid`/`.state.json`/`.cursor`）托管                                      |
 
 `background: true` 的 timeout 语义与前台**故意不同**（`server/bash-timeout.ts` 分两条归一）：前台缺省 120s、上限 3600s；后台缺省 / 传 0 = **不限**，显式正数才计时（上限 7 天，仅防手滑）。所以起 FastAPI 这类服务不会被“默认 120s”杀掉。日志落 `<dataDir>/jobs/<id>-<slug>.log`，任务结束（正常退出 / 超时 / 空闲 / 被停 / 起不来）会发一条通知，有对话归属时还会补一条系统消息。
+
+**后台任务秒退（退出码 127）先查 PATH，不要先怀疑 job runner**：Node 装在版本管理器（fnm / nvm-windows / Volta / Scoop）下时，`node` / `npm` 目录只由**交互式** shell 的 profile 注入（`eval "$(fnm env --use-on-cd)"`），系统 PATH 里根本没有；`bash -c "npm run build"`（后台任务、bash 工具）不读 profile → `npm: command not found` = 127，而集成终端（`bash -i` 会读 `.bashrc`）一切正常。启动时两层补齐（`server/node-path.ts` + `server/shell-env.ts`）：先按候选目录探测前插**真有 node/npm** 的目录，仍然找不到就起一次交互式登录 shell 把用户真实 PATH 合进来（`PI_WEB_PATH_CAPTURE=off` 可关）。启动日志：`[path] prepended node dirs: …` / `[path] interactive-shell capture: +N entries (Nms)`；细节与业界同款实现见 [`architecture-terminal.md#node--npm-的-path-补齐后台任务-127-的真正原因`](architecture-terminal.md#node--npm-的-path-补齐后台任务-127-的真正原因)；**这份快照是冻结的**（运行期换 fnm/nvm 版本不生效，要重启 server），见同文档 [PATH 冻结语义](architecture-terminal.md#path-冻结语义补一次就固定到下次启动)。
 
 `scripts/safe-exec.mjs` 是跨平台（Windows / macOS / Linux）的命令执行器，给 AI、CI 和人工终端共用。它治的是五类挂死：子进程 **stdin 接到空设备**（交互确认、pager、REPL 一律读到 EOF）、**硬超时 + 空闲超时**（连续 N 秒无任何输出判静默卡死）、**杀整棵进程树**（`server/process-utils.ts` 的 `killPidTree` 为单源：Win `taskkill /T /F`，Posix `kill(-pgid)`）、**原始输出先落盘只回显尾部**、**跨平台轮询**（`--wait` 在 Node 里计时，不拼 `sleep` / `&&` / `$?`）。
 

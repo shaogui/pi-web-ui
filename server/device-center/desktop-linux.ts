@@ -1,12 +1,19 @@
+import type { DesktopCursor, DesktopCursorMode } from "./desktop-cursor.js";
 import { parseDesktopProfile, type DesktopProfile } from "./desktop-quality.js";
 import { accessSync, constants, statSync } from "node:fs";
 import { delimiter, join } from "node:path";
-import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { runProcess } from "../run-process.js";
 import type { NativeDesktopInput } from "./desktop-native.js";
 
 const MAX_FRAME = 4 * 1024 * 1024;
 const MAX_QUEUE = 128;
-const PROBE_OPTIONS = { encoding: "utf8", timeout: 2000, maxBuffer: 256 * 1024, shell: false } as const;
+const PROBE_TIMEOUT_MS = 2000;
+const PROBE_MAX_BYTES = 256 * 1024;
+
+/** 探测类命令统一走单源（2s 超时、256KB 输出上限，不 shell）。 */
+const probe = (cmd: string, args: string[]) =>
+	runProcess({ cmd, args, timeoutMs: PROBE_TIMEOUT_MS, maxBytes: PROBE_MAX_BYTES });
 
 function executable(name: string): string | undefined {
 	for (const directory of (process.env.PATH ?? "").split(delimiter)) {
@@ -34,12 +41,12 @@ export function linuxDesktopStatus(): { supported: boolean; backend: string; rea
 	};
 }
 
-function screenSize(): [number, number] {
+async function screenSize(): Promise<[number, number]> {
 	const display = process.env.DISPLAY!;
 	const info = executable("xdpyinfo");
 	if (info) {
 		try {
-			const output = execFileSync(info, ["-display", display], PROBE_OPTIONS);
+			const output = (await probe(info, ["-display", display])).stdout;
 			const defaultScreen = output.match(/default screen number:\s*(\d+)/)?.[1];
 			const section = defaultScreen
 				? output.split(new RegExp(`screen #${defaultScreen}:`))[1]?.split(/screen #\d+:/)[0]
@@ -51,7 +58,7 @@ function screenSize(): [number, number] {
 	const randr = executable("xrandr");
 	if (randr) {
 		try {
-			const output = execFileSync(randr, ["--display", display, "--current"], PROBE_OPTIONS);
+			const output = (await probe(randr, ["--display", display, "--current"])).stdout;
 			const match = output.match(/current\s+(\d+)\s+x\s+(\d+)/);
 			if (match && +match[1] > 0 && +match[2] > 0) return [+match[1], +match[2]];
 		} catch {}
@@ -116,14 +123,21 @@ function keySymbol(code: string): string | undefined {
 }
 
 export function startLinuxDesktop(options: {
+	onCursor?: (cursor: DesktopCursor) => void;
 	onFrame: (jpeg: Buffer) => void;
 	onError: (message: string) => void;
 	onClose: () => void;
 	readOnly?: boolean;
 	preview?: boolean;
-}): { input(event: NativeDesktopInput): void; configure?: (profile: DesktopProfile) => void; close(): void } {
+}): {
+	setCursorMode?(mode: DesktopCursorMode): void;
+	input(event: NativeDesktopInput): void;
+	configure?: (profile: DesktopProfile) => void;
+	close(): void;
+} {
 	let closed = false;
 	let capture: ChildProcess | undefined;
+	let cursorMode: DesktopCursorMode | undefined;
 	let profile: DesktopProfile = { maxEdge: 1600, quality: 65, fps: 15 };
 	let reconfigure: ReturnType<typeof setTimeout> | undefined;
 	let command: ChildProcess | undefined;
@@ -277,7 +291,7 @@ export function startLinuxDesktop(options: {
 		queue.push(args);
 		drain();
 	};
-	const startCapture = () => {
+	const startCapture = async () => {
 		if (closed) return;
 		const previous = capture;
 		capture = undefined;
@@ -290,6 +304,8 @@ export function startLinuxDesktop(options: {
 		pending = Buffer.alloc(0);
 		stderr = "";
 		try {
+			if (!width || !height) [width, height] = await screenSize();
+			if (closed) return;
 			capture = spawn(
 				executable("ffmpeg")!,
 				[
@@ -299,6 +315,8 @@ export function startLinuxDesktop(options: {
 					"error",
 					"-f",
 					"x11grab",
+					"-draw_mouse",
+					cursorMode === "local" ? "0" : "1",
 					"-framerate",
 					options.preview ? "1/3" : String(profile.fps),
 					"-video_size",
@@ -321,6 +339,7 @@ export function startLinuxDesktop(options: {
 				{ shell: false, stdio: ["ignore", "pipe", "pipe"], env: process.env },
 			);
 			const current = capture;
+			let announceCursor = cursorMode;
 			const active = () => !closed && capture === current;
 			capture.stdout!.on("data", (chunk: Buffer) => {
 				if (!active()) return;
@@ -345,6 +364,10 @@ export function startLinuxDesktop(options: {
 						const frame = Buffer.from(pending.subarray(0, end + 2));
 						pending = pending.subarray(end + 2);
 						try {
+							if (announceCursor) {
+								options.onCursor?.({ type: "cursor", kind: announceCursor === "remote" ? "embedded" : "local" });
+								announceCursor = undefined;
+							}
 							options.onFrame(frame);
 						} catch (error) {
 							fail(`Desktop frame callback failed: ${String(error)}`);
@@ -370,12 +393,19 @@ export function startLinuxDesktop(options: {
 			queueMicrotask(() => fail(String(error)));
 		}
 	};
+	const scheduleCapture = (delay: number) => {
+		// The first capture reads the latest preferences after its asynchronous size probe.
+		if (!capture) return;
+		clearTimeout(reconfigure);
+		reconfigure = setTimeout(() => void startCapture(), delay);
+		reconfigure.unref();
+	};
 	try {
 		const status = linuxDesktopStatus();
 		if (!status.supported) throw new Error(status.reason);
 		control = executable("xdotool");
-		[width, height] = screenSize();
-		startCapture();
+		// 屏幕尺寸探测走异步（同步子进程会卡住整个事件循环）；首帧前 await 出尺寸再起 ffmpeg。
+		void startCapture();
 	} catch (error) {
 		queueMicrotask(() => fail(String(error)));
 	}
@@ -384,14 +414,17 @@ export function startLinuxDesktop(options: {
 		close,
 		...(!options.preview
 			? {
+					setCursorMode(mode: DesktopCursorMode) {
+						if (closed || mode === cursorMode) return;
+						cursorMode = mode;
+						scheduleCapture(50);
+					},
 					configure(next: DesktopProfile) {
 						const parsed = parseDesktopProfile(next);
 						if (!parsed || closed) return;
 						if (JSON.stringify(parsed) === JSON.stringify(profile)) return;
 						profile = parsed;
-						clearTimeout(reconfigure);
-						reconfigure = setTimeout(startCapture, 250);
-						reconfigure.unref();
+						scheduleCapture(250);
 					},
 				}
 			: {}),

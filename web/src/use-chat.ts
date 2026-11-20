@@ -73,6 +73,7 @@ import type {
 import { applyMessageDelta, type MessageDeltaMsg } from "./message-delta";
 import {
 	createOptimisticQueueTracker,
+	markOptimisticPromptEchoQueued,
 	reconcileOptimisticPromptEchoes,
 	reconcileOptimisticQueue,
 	recordOptimisticPromptEcho,
@@ -770,6 +771,7 @@ type Action =
 	| { type: "sandbox_diff"; diff: SandboxDiffView | null }
 	| { type: "optimistic_queue_add"; text: string; attachments?: PromptAttachment[]; queue?: boolean }
 	| { type: "optimistic_prompt_echo"; text: string; attachments?: PromptAttachment[] }
+	| { type: "prompt_queued"; conversationId: string; text: string }
 	| { type: "optimistic_queue_remove"; kind: "steer" | "followUp"; text: string; index?: number };
 
 const MAX_LIVE_OUTPUT = 200_000;
@@ -1024,6 +1026,12 @@ export function reducer(state: ChatState, action: Action): ChatState {
 				optimisticQueue: res.tracker,
 				state: res.state,
 			};
+		}
+		case "prompt_queued": {
+			// 服务端确认这条消息已进队列（压缩期间）：回显气泡不再按 TTL 回收。
+			const tracker = markOptimisticPromptEchoQueued(state.optimisticQueue, action.conversationId, action.text);
+			if (tracker === state.optimisticQueue) return state;
+			return { ...state, optimisticQueue: tracker };
 		}
 		case "tool_approval":
 			return {
@@ -2022,14 +2030,18 @@ export function useChat() {
 				before: msg.before ?? curState.historyStart,
 			};
 		}
+		// 会换掉「当前这条对话」的命令一律算导航：群组视图（activeGroupId）必须跟着退出，
+		// 否则点左栏某个智能体只是服务端切了会话，用户还停在群里，看起来「点不开」私聊。
 		if (
 			msg.type === "new_chat" ||
 			msg.type === "new_cli_chat" ||
+			(msg.type === "open_bot_chat" && msg.botId) ||
 			(msg.type === "switch_session" && (msg.path || msg.sessionId)) ||
 			((msg.type === "switch_conversation" ||
 				msg.type === "open_shared_conversation" ||
 				msg.type === "take_over_conversation") &&
-				msg.id)
+				msg.id) ||
+			msg.type === "open_scheduled_conversation"
 		) {
 			notifySessionSwitch();
 		}
@@ -2202,7 +2214,6 @@ export function useChat() {
 		ws.onopen = () => {
 			if (wsRef.current !== ws) return;
 			dispatch({ type: "status", status: "open" });
-			retryRef.current = 0;
 			lastBeatRef.current = Date.now();
 			helloSentAt = performance.now();
 			ws.send(
@@ -2246,14 +2257,19 @@ export function useChat() {
 			}
 			switch (msg.type) {
 				case "ready": {
+					retryRef.current = 0;
 					const mine = typeof __BUILD_ID__ !== "undefined" ? __BUILD_ID__ : "";
 					const autoReload = chatApi.current.chat.settings?.autoReload ?? true;
 					if (!isMobileRuntime() && autoReload && msg.buildId && mine && msg.buildId !== mine) {
 						const key = `pi-web-ui-reloaded-${msg.buildId}`;
-						if (!sessionStorage.getItem(key)) {
-							sessionStorage.setItem(key, "1");
-							location.reload();
-							return;
+						try {
+							if (!sessionStorage.getItem(key)) {
+								sessionStorage.setItem(key, "1");
+								location.reload();
+								return;
+							}
+						} catch {
+							// Sandboxed device portals can deny storage. Finish the current handshake.
 						}
 					}
 					const prevEngine = chatApi.current.chat.engine;
@@ -2371,6 +2387,10 @@ export function useChat() {
 						type: "notice",
 						notice: { id, level: msg.level, text: msg.text, textEn: msg.textEn },
 					});
+					break;
+				}
+				case "prompt_queued": {
+					dispatch({ type: "prompt_queued", conversationId: msg.conversationId, text: msg.text });
 					break;
 				}
 				case "transition_progress":

@@ -1,5 +1,6 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawnChildPiped, type SpawnedChild } from "../spawn-child.js";
 import { resolveFfmpeg } from "./ffmpeg-path.js";
+import { runProcess } from "../run-process.js";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createH264Splitter, h264Codec, videoBitrate, type VideoFrame } from "./desktop-video.js";
@@ -19,7 +20,9 @@ export function encoderArguments(encoder: DesktopVideoEncoder): string[] {
 		case "h264_qsv":
 			return ["-preset", "veryfast", "-async_depth", "1", "-look_ahead", "0"];
 		case "h264_amf":
-			return ["-usage", "ultralowlatency", "-quality", "speed", "-rc", "cbr"];
+			// Some AMF drivers emit nonconforming filler NALs. The H.264 metadata filter
+			// drops the whole access unit when it cannot parse one of those fillers.
+			return ["-usage", "ultralowlatency", "-quality", "speed", "-rc", "cbr", "-filler_data", "0"];
 		case "h264_mf":
 			return ["-hw_encoding", "1", "-scenario", "display_remoting"];
 		case "libx264":
@@ -47,45 +50,32 @@ export function selectDesktopVideoRuntime(
 		for (const candidate of candidates) {
 			if (rejected.has(candidate.path + ":" + candidate.encoder)) continue;
 			const { encoder } = candidate;
-			const ok = await new Promise<boolean>((resolve) => {
-				const child = spawn(
-					candidate.path,
-					[
-						"-hide_banner",
-						"-loglevel",
-						"error",
-						"-nostdin",
-						"-f",
-						"lavfi",
-						"-i",
-						"color=size=1280x720:rate=10:duration=0.2",
-						"-an",
-						"-c:v",
-						encoder,
-						...encoderArguments(encoder),
-						"-bf",
-						"0",
-						"-f",
-						"null",
-						"-",
-					],
-					{ windowsHide: true, stdio: "ignore" },
-				);
-				const timer = setTimeout(() => {
-					child.kill();
-					resolve(false);
-				}, 3000);
-				timer.unref();
-				child.once("error", () => {
-					clearTimeout(timer);
-					resolve(false);
-				});
-				child.once("exit", (code) => {
-					clearTimeout(timer);
-					resolve(code === 0);
-				});
+			const probeResult = await runProcess({
+				cmd: candidate.path,
+				args: [
+					"-hide_banner",
+					"-loglevel",
+					"error",
+					"-nostdin",
+					"-f",
+					"lavfi",
+					"-i",
+					"color=size=1280x720:rate=10:duration=0.2",
+					"-an",
+					"-c:v",
+					encoder,
+					...encoderArguments(encoder),
+					"-bf",
+					"0",
+					"-f",
+					"null",
+					"-",
+				],
+				timeoutMs: 3000,
+				maxBytes: 4096,
+				keepColor: true,
 			});
-			if (ok) return candidate;
+			if (probeResult.code === 0) return candidate;
 		}
 	};
 	if (rejected.size) return probe();
@@ -110,7 +100,7 @@ export function rawVideoArguments(
 		!parseDesktopProfile(profile)
 	)
 		throw new Error("Invalid encoder profile");
-	const bitrate = videoBitrate(profile);
+	const bitrate = videoBitrate({ ...profile, maxEdge: Math.max(width, height) });
 	return [
 		"-hide_banner",
 		"-loglevel",
@@ -128,12 +118,14 @@ export function rawVideoArguments(
 		"pipe:0",
 		"-an",
 		"-vf",
-		"scale=trunc(iw/2)*2:trunc(ih/2)*2",
+		"scale=trunc(iw/2)*2:trunc(ih/2)*2:in_range=pc:out_range=tv:out_color_matrix=bt709",
 		"-c:v",
 		encoder,
 		...encoderArguments(encoder),
 		"-pix_fmt",
 		encoder === "libx264" ? "yuv420p" : "nv12",
+		"-bsf:v",
+		"h264_metadata=matrix_coefficients=1:video_full_range_flag=0:colour_primaries=1:transfer_characteristics=13",
 		"-b:v",
 		String(bitrate),
 		"-maxrate",
@@ -156,22 +148,27 @@ export function startEncodedServiceDesktop(
 	options: NativeDesktopOptions & { profile: DesktopProfile; onVideo(frame: VideoFrame): void },
 ): NativeDesktopHandle {
 	let closed = false,
+		paused = false,
 		generation = 0,
 		profile = options.profile,
 		applied = "",
 		codec: string | undefined;
 	let source: NativeDesktopHandle | undefined;
-	let encoder: ChildProcessWithoutNullStreams | undefined;
+	let encoder: ReturnType<typeof spawnChildPiped>["child"] | undefined;
+	let stopEncoderChild: SpawnedChild["stop"] | undefined;
 	let drainTimer: ReturnType<typeof setTimeout> | undefined;
 	function stopEncoder() {
 		generation++;
 		clearTimeout(drainTimer);
 		const previous = encoder;
+		const stopPrevious = stopEncoderChild;
 		encoder = undefined;
+		stopEncoderChild = undefined;
 		applied = "";
 		if (previous) {
 			previous.stdin.destroy();
-			previous.kill();
+			// 先 SIGTERM，宽限后由 stop() 收整棵树（原路径只 kill 主进程，孙进程会漏）。
+			void stopPrevious?.({ graceMs: 1500 });
 		}
 	}
 	function close() {
@@ -237,7 +234,7 @@ export function startEncodedServiceDesktop(
 			onError: fail,
 			onRawFrame(frame, ack) {
 				if (closed) return;
-				if (recovering || !selected) {
+				if (paused || recovering || !selected) {
 					ack();
 					return;
 				}
@@ -248,11 +245,13 @@ export function startEncodedServiceDesktop(
 					applied = key;
 					codec = undefined;
 					const id = generation;
-					encoder = spawn(selected.path, rawVideoArguments(selected.encoder, frame.width, frame.height, profile), {
-						windowsHide: true,
-						stdio: ["pipe", "pipe", "pipe"],
+					const spawned = spawnChildPiped({
+						cmd: selected.path,
+						args: rawVideoArguments(selected.encoder, frame.width, frame.height, profile),
 					});
-					const current = encoder;
+					encoder = spawned.child;
+					stopEncoderChild = spawned.stop;
+					const current = spawned.child;
 					let reset = true;
 					const split = createH264Splitter((value) => {
 						if (closed || id !== generation) return;
@@ -299,6 +298,12 @@ export function startEncodedServiceDesktop(
 		source.configure?.(profile);
 	})().catch(() => fail("Could not initialize the built-in desktop video encoder."));
 	return {
+		get setCursorMode() {
+			return source?.setCursorMode;
+		},
+		videoFeedback(value) {
+			paused = value;
+		},
 		input: (event) => {
 			if (!closed) source?.input(event);
 		},

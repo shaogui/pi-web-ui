@@ -677,7 +677,7 @@ export function handleSessionLifecycleMessage(
 				const pending =
 					msg.type === "new_cli_chat"
 						? cs.newCliChat?.(msg.config, msg.cwd, acknowledge)
-						: cs.newChat(msg.preset, msg.ephemeral, acknowledge, msg.independent);
+						: cs.newChat(msg.preset, msg.ephemeral, acknowledge, msg.independent, msg.botId);
 				await Promise.resolve(pending);
 			}).then(
 				() => acknowledge(),
@@ -685,6 +685,10 @@ export function handleSessionLifecycleMessage(
 			);
 			return true;
 		}
+		// 私聊入口：可能切会话/工作区，同样入队列（顺序与 new_chat 一致）。
+		case "open_bot_chat":
+			void runWorkspaceCommand(cs, () => cs.openBotChat?.(msg.botId, { fresh: msg.fresh }));
+			return true;
 		case "delete_message":
 			if (cs.deleteMessage) void cs.deleteMessage(msg.messageId, msg.conversationId);
 			else
@@ -964,8 +968,11 @@ export function handleSettingsMessage(
 				quickAskEnabled: msg.quickAskEnabled,
 				quickAskModel: msg.quickAskModel,
 				quickAskThinking: msg.quickAskThinking,
+				botDraftModel: msg.botDraftModel,
+				botDraftThinking: msg.botDraftThinking,
 				quickAskSystemPrompt: msg.quickAskSystemPrompt,
 				quickAskExplainPrompt: msg.quickAskExplainPrompt,
+				quickAskTranslateModel: msg.quickAskTranslateModel,
 				quickAskTranslateEnabled: msg.quickAskTranslateEnabled,
 				quickAskTranslateTarget: msg.quickAskTranslateTarget,
 				quickAskTranslateStyle: msg.quickAskTranslateStyle,

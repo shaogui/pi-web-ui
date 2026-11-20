@@ -8,13 +8,16 @@ import {
 	type PluginViewModule,
 } from "../plugin-loader";
 import { withPluginScopeAsync } from "../plugin-host";
-import { useT, type Translate } from "../i18n";
+import { useI18n, useT, type Translate } from "../i18n";
 import type { UiPluginInfo } from "../types";
+import { pluginDisplayName } from "../plugin-name";
 
 interface PluginPageProps {
 	plugin: UiPluginInfo;
 	epoch: number;
 	send: (msg: { type: "plugin_message"; pluginId: string; payload: unknown }) => void;
+	/** 要渲染的插件页 id（`ui.settings[].id`）；不给就是通用「插件页」（ctx.page === undefined） */
+	pageId?: string;
 	className?: string;
 }
 
@@ -39,9 +42,10 @@ function failureText(failure: PageFailure, name: string, t: Translate): string {
 	}
 }
 
-export function PluginPage({ plugin, epoch, send, className }: PluginPageProps): JSX.Element {
+export function PluginPage({ plugin, epoch, send, pageId, className }: PluginPageProps): JSX.Element {
 	const ref = useRef<HTMLDivElement>(null);
 
+	const { locale } = useI18n();
 	const t = useT();
 	const [failure, setFailure] = useState<PageFailure | null>(null);
 
@@ -82,7 +86,7 @@ export function PluginPage({ plugin, epoch, send, className }: PluginPageProps):
 				const { container } = preparePluginMountContainer(el, { isolated: isIsolated });
 				cleanup = m.mount(
 					container,
-					makePluginContext(plugin.id, (msg) => sendRef.current(msg)),
+					makePluginContext(plugin.id, (msg) => sendRef.current(msg), pageId ? { page: pageId } : undefined),
 				);
 			} catch (err) {
 				if (disposed) return;
@@ -102,7 +106,7 @@ export function PluginPage({ plugin, epoch, send, className }: PluginPageProps):
 			}
 			el.replaceChildren();
 		};
-	}, [plugin.id, plugin.hasClient, epoch]);
+	}, [plugin.id, plugin.hasClient, epoch, pageId]);
 
 	const cls = className ? `plugin-page ${className}` : "plugin-page";
 	return (
@@ -110,7 +114,7 @@ export function PluginPage({ plugin, epoch, send, className }: PluginPageProps):
 			<div className="plugin-page-host" ref={ref} />
 			{failure && (
 				<div className="plugin-page-error" role="alert">
-					{failureText(failure, plugin.name, t)}
+					{failureText(failure, pluginDisplayName(plugin, locale), t)}
 				</div>
 			)}
 		</div>

@@ -84,12 +84,17 @@ const messages = {
 		engineHelp: "地址栏与新标签页使用同一个搜索引擎。",
 		keyboard: "快捷键",
 		language: "语言跟随系统",
-		bookmarkHelp: "在文件夹中整理常用网页。",
+		bookmarkHelp: "在文件夹中整理常用网页，也可以从其他浏览器导入书签文件。",
 		bookmarkSaved: "书签已添加",
+		bookmarkImport: "导入书签",
+		bookmarkImportFolder: "导入的书签",
+		bookmarkImportDone: "已导入 {imported} 条书签，跳过重复 {duplicate} 条、无法识别 {skipped} 条",
+		bookmarkImportEmpty: "没有新的书签可以导入（已全部收藏，或者这个文件不是书签导出文件）",
 		noHistory: "访问网页后会显示在这里。",
 		noDownloads: "暂无下载记录",
 		downloadHelp: "下载记录由浏览器维护，完成后可在系统中打开。",
 		open: "打开",
+		openFolder: "打开文件夹",
 		fileName: "文件名",
 		newDocument: "新建文档",
 		newSheet: "新建 CSV",
@@ -119,12 +124,20 @@ const messages = {
 		hidePassword: "隐藏密码",
 		vaultTabPasswords: "密码",
 		vaultTabTotp: "TOTP",
+		vaultTabPasskeys: "Passkey",
+		passkeyHelp:
+			"Passkey 由网站注册时创建，存在本机加密存储里：登录时网站会直接认，不用输密码。只在本浏览器内有效，不与系统/手机的 passkey 同步。",
+		passkeyEmpty: "还没有 passkey。在某网站的账户安全设置里「添加 passkey」即可（本浏览器已向网站报告支持）。",
+		passkeyRemoveConfirm: "删除这把 passkey？删后该网站无法再用它登录（可用密码或其他方式）。",
 		vaultHintKeys: "键盘：↑↓ 选行 · Enter 填入当前网页 · Shift+Enter 复制验证码 / 显示密码",
 		vaultMovedHint: "密码与 TOTP 已经合并到同一个面板：用顶部图标增删改，点条目选中后再操作。",
 		openVault: "打开凭据保险库",
 		passwordKeep: "留空则不修改",
 		passwordRevealed: "密码已显示，10 秒后自动隐藏。",
 		credentialRemoveConfirm: "确定删除这条凭据？删除后无法恢复。",
+		credentialImport: "从 CSV 导入密码",
+		credentialImportDone: "导入完成：新增 {imported} 条，更新 {updated} 条，已存在 {duplicate} 条，跳过 {skipped} 条",
+		credentialImportEmpty: "这个文件里没有可导入的密码（需要名称 / 网址 / 密码列，按 UTF-8 CSV 保存）。",
 		totpHelp:
 			"扫页面上的二维码（otpauth://），或粘贴链接、导入二维码图片。密钥与密码同一条加密口径，且只在主进程里使用。",
 		totpUnavailable: "系统安全存储不可用，TOTP 保管库已锁定。",
@@ -162,6 +175,8 @@ const messages = {
 		openWorkspace: "打开工作区文件",
 		downloadCancelled: "已取消",
 		bookmarkFolderEmpty: "这个文件夹还没有书签。",
+		navItems: "{count} 项",
+		navItemOne: "{count} 项",
 		exitSearch: "取消搜索",
 		moveTo: "移动到",
 		confirmDelete: "确定删除此项目及其内容？",
@@ -225,7 +240,7 @@ const messages = {
 		extensionHelp:
 			"选已解压的目录，或选 .crx 文件（自动解包）。扩展由 Electron 原生加载，重启后自动恢复；停用只是卸载，目录和扩展存储都保留。",
 		addCredential: "添加凭据",
-		credentialRequired: "请填写名称、有效网址、用户名和密码",
+		credentialRequired: "请填写名称、有效网址和密码",
 		removeCredential: "删除凭据",
 		noCredentials: "尚未保存凭据",
 		previewOnly: "只读预览",
@@ -318,12 +333,18 @@ const messages = {
 		engineHelp: "The address bar and new tab share this search engine.",
 		keyboard: "Keyboard shortcuts",
 		language: "Language follows your system",
-		bookmarkHelp: "Organize your favorite pages into folders.",
+		bookmarkHelp: "Organize your favorite pages into folders, or import a bookmarks file from another browser.",
 		bookmarkSaved: "Bookmark added",
+		bookmarkImport: "Import bookmarks",
+		bookmarkImportFolder: "Imported bookmarks",
+		bookmarkImportDone:
+			"Imported {imported} bookmarks, skipped {duplicate} duplicates and {skipped} unrecognized entries",
+		bookmarkImportEmpty: "Nothing new to import (already bookmarked, or this is not a bookmarks export)",
 		noHistory: "Pages you visit will appear here.",
 		noDownloads: "No downloads yet",
 		downloadHelp: "Downloads are managed by the browser. Open completed files in your system.",
 		open: "Open",
+		openFolder: "Show in folder",
 		fileName: "File name",
 		newDocument: "New document",
 		newSheet: "New CSV",
@@ -354,12 +375,24 @@ const messages = {
 		hidePassword: "Hide password",
 		vaultTabPasswords: "Passwords",
 		vaultTabTotp: "TOTP",
+		vaultTabPasskeys: "Passkeys",
+		passkeyHelp:
+			"Passkeys are created by websites and stored in this app's encrypted store, so a site can sign you in without a password. They only work in this browser — they are not synced with your system or phone.",
+		passkeyEmpty:
+			"No passkeys yet. Add one from a site's account security settings — this browser reports itself as a platform authenticator.",
+		passkeyRemoveConfirm:
+			"Delete this passkey? The site will no longer be able to use it to sign you in (use your password or another method instead).",
 		vaultHintKeys: "Keyboard: ↑↓ select · Enter fill the page · Shift+Enter copy the code / reveal the password",
 		vaultMovedHint: "Passwords and TOTP now live in one panel: use the toolbar icons, select a row first.",
 		openVault: "Open credentials vault",
 		passwordKeep: "Leave empty to keep the current password",
 		passwordRevealed: "Password shown for 10 seconds.",
 		credentialRemoveConfirm: "Delete this credential? This cannot be undone.",
+		credentialImport: "Import passwords from CSV",
+		credentialImportDone:
+			"Import finished: {imported} added, {updated} updated, {duplicate} already saved, {skipped} skipped",
+		credentialImportEmpty:
+			"No importable passwords in that file (it needs name / URL / password columns, saved as UTF-8 CSV).",
 		totpHelp:
 			"Scan the QR code on a page (otpauth://), paste a link, or import a QR image. Secrets use the same encryption as passwords and never leave the main process.",
 		totpUnavailable: "System secure storage is unavailable, so the TOTP vault is locked.",
@@ -398,6 +431,8 @@ const messages = {
 		openWorkspace: "Open workspace file",
 		downloadCancelled: "Cancelled",
 		bookmarkFolderEmpty: "This folder has no bookmarks yet.",
+		navItems: "{count} items",
+		navItemOne: "{count} item",
 		exitSearch: "Clear search",
 		moveTo: "Move to",
 		confirmDelete: "Delete this item and everything inside it?",
@@ -462,7 +497,7 @@ const messages = {
 		extensionHelp:
 			"Pick an unpacked folder or a .crx file (unpacked automatically). Electron loads extensions natively and restores them after restart; disabling only unloads one, keeping its folder and storage.",
 		addCredential: "Add credential",
-		credentialRequired: "Enter a name, valid URL, username and password",
+		credentialRequired: "Enter a name, a valid URL and a password",
 		removeCredential: "Delete credential",
 		noCredentials: "No saved credentials",
 		previewOnly: "Read-only preview",
@@ -475,4 +510,9 @@ const messages = {
 export type MessageKey = keyof typeof messages.en;
 export const language = navigator.language.toLowerCase().startsWith("zh") ? "zh" : "en";
 export const t = (key: MessageKey): string => messages[language][key];
+/** 带占位符的文案：`{name}` 被 `values` 里的同名字段替换（没给的占位符原样留着）。 */
+export const tf = (key: MessageKey, values: Record<string, string | number>): string =>
+	t(key).replace(/\{(\w+)\}/g, (match, name: string) =>
+		Object.prototype.hasOwnProperty.call(values, name) ? String(values[name]) : match,
+	);
 document.documentElement.lang = language === "zh" ? "zh-CN" : "en";

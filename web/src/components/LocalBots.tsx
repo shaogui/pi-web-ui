@@ -3,7 +3,8 @@ import { createPortal } from "react-dom";
 import { appUrl } from "../base-url";
 import { withToken } from "../auth-token";
 import { useT } from "../i18n";
-import { openDirectRoom } from "../open-direct-room";
+import { openBotChat } from "../bot-chat";
+import { importBotBundle } from "../bot-import";
 import { useEscapeKey } from "../shortcut-stack";
 import type { ModelInfo } from "../types";
 import { resolveBotCwd } from "../local-bot-path";
@@ -12,7 +13,7 @@ import { UniversalModelPicker } from "./UniversalModelPicker";
 import { LocalBotCatalogPicker, type BotCatalogEntry } from "./LocalBotCatalogPicker";
 import "./agent-bots.css";
 
-type Bot = {
+export type Bot = {
 	id: string;
 	revision: number;
 	name: string;
@@ -38,11 +39,11 @@ type Options = {
 };
 const modelId = (model: ModelInfo) =>
 	model.id.startsWith(`${model.provider}/`) ? model.id.slice(model.provider.length + 1) : model.id;
-const blank = (): Omit<Bot, "id" | "revision"> => ({
+const blank = (cwd = ""): Omit<Bot, "id" | "revision"> => ({
 	name: "",
 	description: "",
 	systemPrompt: "",
-	cwd: "",
+	cwd,
 	tools: [],
 	skills: [],
 	mcpServers: [],
@@ -63,19 +64,28 @@ async function request(path: string, signal: AbortSignal, body?: object) {
 export function LocalBots({
 	pathCompletions = [],
 	createOnly = false,
+	initialCwd,
+	editBot,
 	onCreated,
+	onFinished,
 	onCancel,
 }: {
 	pathCompletions?: { name: string; path: string; type: "dir" | "file" }[];
 	createOnly?: boolean;
+	/** 新建时预填的工作目录（当前项目）：不填会退回服务端默认工作区。 */
+	initialCwd?: string;
+	/** 编辑模式：直接打开这个 Bot 的编辑器（左栏右键「编辑 Bot」就地弹窗）。 */
+	editBot?: Bot;
 	onCreated?: (bot: Bot, synced: boolean) => void;
+	/** 保存 / 删除完成后的收尾：编辑弹窗据此关掉自己。 */
+	onFinished?: () => void;
 	onCancel?: () => void;
 }) {
 	const t = useT();
 	const [bots, setBots] = useState<Bot[]>([]);
 	const [chatPending, setChatPending] = useState<string | null>(null);
 	const [draft, setDraft] = useState<(ReturnType<typeof blank> & Partial<Pick<Bot, "id" | "revision">>) | null>(() =>
-		createOnly ? blank() : null,
+		editBot ? structuredClone(editBot) : createOnly ? blank(initialCwd ?? "") : null,
 	);
 	const closeDraft = () => {
 		setDraft(null);
@@ -89,9 +99,13 @@ export function LocalBots({
 	const [loading, setLoading] = useState(false);
 	const [reload, setReload] = useState(0);
 	const [modelOpen, setModelOpen] = useState(false);
+	const [importing, setImporting] = useState(false);
+	const importInput = useRef<HTMLInputElement | null>(null);
 	const [catalogTab, setCatalogTab] = useState<"tools" | "skills" | "mcpServers">("tools");
 	const [tab, setTab] = useState<"identity" | "runtime" | "permissions">("identity");
 	const controller = useRef<AbortController | null>(null);
+	// 就地弹窗形态（`BotCreateDialog` / `BotEditDialog` 复用本编辑器）：只渲染编辑器，不渲染列表。
+	const solo = createOnly;
 	const baseCwd = useRef("");
 	const drawer = useRef<HTMLDialogElement>(null);
 	const drawerOpen = draft !== null;
@@ -111,7 +125,9 @@ export function LocalBots({
 			previousFocus?.focus();
 		};
 	}, [drawerOpen]);
+	// 卡片的列表只在常驻模式拉：弹窗里不需要，也不应因为列表接口失败拖住编辑器。
 	useEffect(() => {
+		if (solo) return;
 		const current = new AbortController();
 		void request("local-bots", current.signal)
 			.then((data) => {
@@ -122,11 +138,35 @@ export function LocalBots({
 			.catch((cause) => {
 				if (!current.signal.aborted) setError(String(cause));
 			});
-		return () => {
-			current.abort();
-			controller.current?.abort();
-		};
-	}, []);
+		return () => current.abort();
+	}, [solo]);
+	// 卸载时中止还没回来的保存请求（列表请求由上面的 effect 自己管）。
+	useEffect(() => () => controller.current?.abort(), []);
+	const importBundle = async (file: File) => {
+		setImporting(true);
+		setError("");
+		try {
+			const result = await importBotBundle(file);
+			// 回执带上服务端真实写入/跳过的条数：同一迁移包重复导入时能看出“其实没新增”。
+			setNotice(
+				t("agentBotsImportReceipt", {
+					name: result.name,
+					imported: result.imported,
+					skipped: result.skipped,
+				}),
+			);
+			setReload((value) => value + 1);
+			void request("local-bots", new AbortController().signal)
+				.then((data) => {
+					if (Array.isArray(data.bots)) setBots(data.bots);
+				})
+				.catch(() => {});
+		} catch (cause) {
+			setError(cause instanceof Error ? cause.message : t("localBotImportFailed"));
+		} finally {
+			setImporting(false);
+		}
+	};
 	const cwd = draft?.cwd;
 	useEffect(() => {
 		if (cwd === undefined) return;
@@ -187,6 +227,8 @@ export function LocalBots({
 			setModelOpen(false);
 			setNotice(data.synced === false ? t("localBotSyncFailed") : t("localBotSaved"));
 			if (!remove) onCreated?.(data.bot, data.synced !== false);
+			// 编辑弹窗（`editBot`）保存/删除后就地关掉，不留一个已提交的空对话框。
+			onFinished?.();
 			// 左栏「智能体」区据此重新拉取：Bot 增删改后无需刷新页面就能直接对话。
 			window.dispatchEvent(new CustomEvent("pi-web-ui:device-bots-changed"));
 		} catch (cause) {
@@ -200,7 +242,7 @@ export function LocalBots({
 		setChatPending(botId);
 		setError("");
 		try {
-			await openDirectRoom(botId);
+			openBotChat(botId);
 		} catch (cause) {
 			setError(cause instanceof Error ? cause.message : String(cause));
 		} finally {
@@ -211,21 +253,43 @@ export function LocalBots({
 		(model) => model.provider === draft?.model?.provider && modelId(model) === draft?.model?.modelId,
 	);
 	return (
-		<section className={`dc-card dc-bots${createOnly ? " is-create-only" : ""}`} aria-label={t("localBotTitle")}>
+		<section className={`dc-card dc-bots${solo ? " is-solo" : ""}`} aria-label={t("localBotTitle")}>
 			<div className="dg-heading">
 				<h2>{t("localBotTitle")}</h2>
-				<button
-					className="dc-button"
-					type="button"
-					disabled={busy}
-					onClick={() => {
-						setDraft(blank());
-						setError("");
-						setModelOpen(false);
-					}}
-				>
-					{t("localBotCreate")}
-				</button>
+				<div className="dc-bots-actions">
+					<button
+						className="dc-button"
+						type="button"
+						disabled={busy}
+						onClick={() => {
+							setDraft(blank());
+							setError("");
+							setModelOpen(false);
+						}}
+					>
+						{t("localBotCreate")}
+					</button>
+					<button
+						className="dc-button"
+						type="button"
+						disabled={busy || importing}
+						title={t("localBotImportTip")}
+						onClick={() => importInput.current?.click()}
+					>
+						{importing ? t("localBotImporting") : t("localBotImport")}
+					</button>
+					<input
+						ref={importInput}
+						type="file"
+						accept="application/json,.json"
+						hidden
+						onChange={(event) => {
+							const file = event.target.files?.[0];
+							event.target.value = "";
+							if (file) void importBundle(file);
+						}}
+					/>
+				</div>
 			</div>
 			<p>{t("localBotHint")}</p>
 			{error && !draft && <p role="alert">{error}</p>}
@@ -252,6 +316,13 @@ export function LocalBots({
 									<small className={bot.enabled ? "is-enabled" : ""}>
 										{bot.enabled ? t("localBotEnabled") : t("localBotDisabled")} · r{bot.revision}
 									</small>
+									{bot.cwd.startsWith("ssh://") && (
+										<small title={bot.cwd}>
+											{t("nativeCliRemoteLocation", {
+												host: bot.cwd.replace(/^ssh:\/\/([^@]+)@([^:/]+).*$/, "$1@$2"),
+											})}
+										</small>
+									)}
 								</span>
 							</button>
 							<button
@@ -417,7 +488,6 @@ export function LocalBots({
 											<label htmlFor="local-bot-cwd">{t("localBotCwd")}</label>
 											<UniversalPathPicker
 												inputId="local-bot-cwd"
-												localOnly
 												commitOnBlur
 												pathCompletions={pathCompletions}
 												cwd={draft.cwd}

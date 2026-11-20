@@ -5,7 +5,8 @@ import { EventEmitter } from "node:events";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BrowserWindow, WebContents } from "electron";
-import { isInternalUrl, normalizeBrowserUrl, pickTabFavicon } from "../../browser/runtime/urls.js";
+import { isInternalUrl, normalizeBrowserUrl, pickTabFavicon, webOrigin } from "../../browser/runtime/urls.js";
+import { themeBackground } from "../../browser/runtime/palette.js";
 
 const mock = vi.hoisted(() => ({ views: [] as any[], sessions: [] as any[], downloadsDir: "" }));
 vi.mock("electron", async () => {
@@ -38,6 +39,12 @@ vi.mock("electron", async () => {
 		isLoading() {
 			return this.loading;
 		}
+		isDevToolsOpened = vi.fn(() => false);
+		openDevTools = vi.fn();
+		closeDevTools = vi.fn();
+		// 注入与推送（dock / 下载圆钮 / 页面脚本）都走这一条：假体照真实 API 回一个 Promise
+		executeJavaScript = vi.fn(async (_code: string) => "");
+		insertCSS = vi.fn(async (_css: string) => "");
 		setWindowOpenHandler(handler: any) {
 			this.windowOpen = handler;
 		}
@@ -50,6 +57,8 @@ vi.mock("electron", async () => {
 	class View {
 		webContents = new Contents();
 		setBounds = vi.fn();
+		// 首帧底色：页面画出来之前视图露的就是这块颜色（`setBackgroundColor` 是真实 API）
+		setBackgroundColor = vi.fn();
 		constructor(readonly options: any) {
 			mock.views.push(this);
 		}
@@ -84,6 +93,7 @@ function directory(): string {
 function setup(dataDir = directory()) {
 	const window = Object.assign(new EventEmitter(), {
 		isDestroyed: () => false,
+		setBackgroundColor: vi.fn(),
 		contentView: { addChildView: vi.fn(), removeChildView: vi.fn() },
 	});
 	const onChange = vi.fn();
@@ -107,6 +117,18 @@ beforeEach(() => {
 afterEach(() => {
 	for (const manager of managers.splice(0)) manager.dispose();
 	for (const dir of directories.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+describe("credential origin matching", () => {
+	it("treats one site as one credential scope regardless of path", () => {
+		expect(webOrigin("https://www.pathofexile.com/login/email")).toBe("https://www.pathofexile.com");
+		expect(webOrigin("https://www.pathofexile.com/my-account/change-email")).toBe("https://www.pathofexile.com");
+		expect(webOrigin("http://example.com/")).not.toBe(webOrigin("https://example.com/"));
+	});
+	it.each(["", "javascript:alert(1)", "file:///tmp/a.html", "https://user:pw@example.com/"])(
+		"returns nothing for %s",
+		(value) => expect(webOrigin(value)).toBe(""),
+	);
 });
 
 describe("browser URL policy", () => {
@@ -151,6 +173,19 @@ describe("browser URL policy", () => {
 });
 
 describe("BrowserManager", () => {
+	it("opens the devtools of the active tab from F12 without letting the page see the key", () => {
+		const { manager } = setup();
+		const wc = manager.getWebContents(manager.getActiveTabId()!) as any;
+		const event = { preventDefault: vi.fn() };
+		wc.emit("before-input-event", event, { type: "keyDown", key: "F12", control: false, shift: false, meta: false });
+		expect(event.preventDefault).toHaveBeenCalled();
+		expect(wc.openDevTools).toHaveBeenCalledWith({ mode: "detach" });
+		// 其他按键不能让页面丢了键盘
+		event.preventDefault.mockClear();
+		wc.emit("before-input-event", event, { type: "keyDown", key: "a", control: false, shift: false, meta: false });
+		expect(event.preventDefault).not.toHaveBeenCalled();
+		expect(manager.toggleDevTools("missing-tab")).toBe(false);
+	});
 	it("creates sandboxed pages in a persistent session and denies permissions by default", () => {
 		const { manager, dataDir } = setup();
 		expect(manager.getTabs()).toHaveLength(1);
@@ -189,6 +224,22 @@ describe("BrowserManager", () => {
 		manager.closeTab(firstId);
 		expect(manager.getTabs()).toHaveLength(1);
 		expect(manager.getActiveTabId()).not.toBe(firstId);
+	});
+
+	it("首帧底色跟主题走：新建标签页那块空白不是白的", () => {
+		const { manager, window } = setup();
+		// 建窗口就把底色钺上（外壳页 body 透明，没盖住的地方露的就是它）
+		expect(window.setBackgroundColor).toHaveBeenCalledWith(themeBackground("dark"));
+		expect(mock.views.length).toBeGreaterThan(0);
+		for (const view of mock.views) expect(view.setBackgroundColor).toHaveBeenCalledWith(themeBackground("dark"));
+		// 新建的标签页同样先铺色：页面画出第一帧之前露的就是它
+		const id = manager.createTab("https://example.com");
+		expect(mock.views[mock.views.length - 1].setBackgroundColor).toHaveBeenCalledWith(themeBackground("dark"));
+		// 换主题连这块一起换，否则浅色主题下新建标签页还会先闪一帧深色
+		manager.saveSettings({ ...manager.getSettings(), theme: "light" });
+		expect(window.setBackgroundColor).toHaveBeenLastCalledWith(themeBackground("light"));
+		for (const view of mock.views) expect(view.setBackgroundColor).toHaveBeenLastCalledWith(themeBackground("light"));
+		manager.closeTab(id);
 	});
 
 	it("routes popups to tabs and blocks remote renderer attempts to access internal files", async () => {
@@ -301,5 +352,35 @@ describe("BrowserManager", () => {
 		manager.dispose();
 		expect(item.cancel).not.toHaveBeenCalled();
 		expect(mock.sessions[0].listenerCount("will-download")).toBe(0);
+	});
+
+	it("pushes download state to the active page only, as a single display-only update()", () => {
+		const { manager } = setup();
+		const backgroundId = manager.getActiveTabId()!;
+		const background = manager.getWebContents(backgroundId) as unknown as { executeJavaScript: any };
+		const activeId = manager.createTab("https://example.com/page2");
+		const active = manager.getWebContents(activeId) as unknown as { executeJavaScript: any };
+		// 建标签本身会推一次（新页面要知道自己该不该显示圆钮），这里只关心下载事件带来的推送
+		background.executeJavaScript.mockClear();
+		active.executeJavaScript.mockClear();
+
+		const item = Object.assign(new EventEmitter(), {
+			getFilename: () => "track.zip",
+			getURL: () => "https://example.com/track.zip",
+			getTotalBytes: () => 900,
+			getReceivedBytes: () => 300,
+			setSavePath: vi.fn(),
+			cancel: vi.fn(),
+		});
+		mock.sessions[0].emit("will-download", { preventDefault: vi.fn() }, item, manager.getWebContents(activeId));
+
+		const code = active.executeJavaScript.mock.calls.at(-1)?.[0] as string;
+		expect(code).toContain("window.__PI_DOWNLOADS__ && window.__PI_DOWNLOADS__.update(");
+		expect(code).toContain("track.zip");
+		// 页面拿到的只能是显示用的字段，方向是单向的（脚本里没有任何反向能力）
+		expect(code).toContain('"state":"progressing"');
+		// 后台标签不推：同一时刻只有活动标签那一块是可见的
+		expect(background.executeJavaScript).not.toHaveBeenCalled();
+		manager.dispose();
 	});
 });

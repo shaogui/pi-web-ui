@@ -945,6 +945,8 @@ export interface UiState {
 	model: UiModelInfo | null;
 	thinkingLevel: string;
 	agentPreset?: { id: string; name: string; locked: boolean } | null;
+	/** 当前会话绑定的 Bot（私聊）：UI 据此显示身份并去掉房间语义。 */
+	bot?: { id: string; name: string } | null;
 	permission?: string | null;
 	availableThinkingLevels: string[];
 	queue: {
@@ -1076,8 +1078,13 @@ export interface TextQuote {
 
 export interface PromptAttachment {
 	path: string;
-	mode?: "inline" | "reference" | "lines" | "page" | "conversation" | "quote" | "canvas";
+	mode?: "inline" | "reference" | "lines" | "page" | "conversation" | "quote" | "canvas" | "terminal";
 	quote?: TextQuote;
+	/**
+	 * `mode: "terminal"`：被引用的终端标签 id（`path` 留空，不是文件路径）。
+	 * 服务端按 id 现场解析出标题 / cwd / 命令 / 输出，不把终端当成一条静态文本。
+	 */
+	terminalId?: string;
 	conversationId?: string;
 	sessionPath?: string;
 	lines?: { start: number; end: number };
@@ -1261,6 +1268,13 @@ export interface CanvasGraphSummary {
 	updatedAt: number;
 }
 
+export interface SamplingOverrides {
+	profile?: "default" | "gemma4";
+	thinkingEnabled?: boolean;
+	thinkingEffort?: "low" | "medium" | "high";
+	preserveThinking?: boolean;
+}
+
 export type ClientMessage =
 	| { type: "hello"; clientId: string; protocolVersion?: number; locale?: string }
 	| { type: "canvas_list" }
@@ -1283,6 +1297,7 @@ export type ClientMessage =
 	| {
 			type: "prompt";
 			text: string;
+			samplingOverrides?: SamplingOverrides;
 			targetConversationId?: string;
 			queue?: boolean;
 			steer?: boolean;
@@ -1409,9 +1424,36 @@ export type ClientMessage =
 			independent?: boolean;
 			/** 目标工作目录：服务端先切到该目录并核验，再建会话；切不过去就不建（`ok:false`）。 */
 			cwd?: string;
+			/** 私聊：把会话绑定到本机这个 Bot（普通对话 + Bot 身份；群聊仍走房间与 @ 路由）。 */
+			botId?: string;
 	  }
-	| { type: "new_cli_chat"; config: NativeCliConfig; cwd?: string; requestId?: string }
+	| {
+			type: "new_cli_chat";
+			config: NativeCliConfig;
+			cwd?: string;
+			requestId?: string;
+	  }
+	| {
+			/**
+			 * 私聊入口（左栏「智能体」点一行）：默认回到这个 Bot 的**同一个**对话。
+			 * 默认依次找到内存里开着的私聊 → 磁盘上它最近一次的转录 → 都没有才新建；
+			 * `fresh: true` = 开一条新的（用户按住想要「清空对话」），旧转录保留。
+			 */
+			type: "open_bot_chat";
+			botId: string;
+			fresh?: boolean;
+	  }
 	| { type: "open_shared_conversation"; owner: string; id: string; readOnly?: boolean }
+	/**
+	 * 打开某次定时任务运行的对话：先按「活会话」只读共享打开（持有方还在、能看实时状态），
+	 * 否则按 sessionFile 打开历史会话（服务重启后仍然可看）。
+	 */
+	| {
+			type: "open_scheduled_conversation";
+			taskId: string;
+			conversationId?: string;
+			sessionFile?: string;
+	  }
 	| { type: "delete_message"; messageId: string; conversationId?: string }
 	| {
 			type: "edit_message";
@@ -1598,7 +1640,10 @@ export type ClientMessage =
 			scmCommitMsgPrompt?: string;
 			quickAskEnabled?: boolean;
 			quickAskModel?: string | null;
+			quickAskTranslateModel?: string | null;
 			quickAskThinking?: ThinkingLevel;
+			botDraftModel?: string | null;
+			botDraftThinking?: ThinkingLevel;
 			quickAskSystemPrompt?: string;
 			quickAskExplainPrompt?: string;
 			quickAskTranslateEnabled?: boolean;
@@ -2098,6 +2143,8 @@ export interface UiQueuedQuestion extends UiPendingQuestion {
 	rootConversationId?: string;
 	createdAt: number;
 	audience?: "user" | "parent";
+	/** Project directory of the source conversation; cross-project rows are labelled with it. */
+	cwd?: string;
 }
 
 export interface UiActionSuggestion {
@@ -2206,6 +2253,8 @@ export interface SchedulerRunInfo {
 	ok: boolean;
 	durationMs: number;
 	conversationId?: string;
+	/** 本次运行落盘的会话文件：持有方没了（服务重启/对话被回收）也能按文件打开历史 */
+	sessionFile?: string;
 	error?: string;
 	manual?: boolean;
 }
@@ -2421,12 +2470,14 @@ export interface UiPluginSettingField {
 	key: string;
 	type: "text" | "password" | "number" | "boolean" | "select" | "secret";
 	label: string;
+	labelEn?: string;
 	default?: string | number | boolean;
 	min?: number;
 	max?: number;
 	options?: (string | UiSelectOption)[];
 	optionsFrom?: "models" | "thinkingLevels";
 	hint?: string;
+	hintEn?: string;
 }
 
 export interface PluginRequires {
@@ -2460,9 +2511,14 @@ export interface PluginPanelGroup {
 
 export interface UiPluginInfo {
 	id: string;
+	/** Display name from the manifest (source language: usually Chinese). */
 	name: string;
+	/** English display name (`manifest.nameEn`); the client picks by UI locale. */
+	nameEn?: string;
 	version?: string;
 	description?: string;
+	/** English description (`manifest.descriptionEn`); the client picks by UI locale. */
+	descriptionEn?: string;
 	homepage?: string;
 	hasClient: boolean;
 	icon?: string;
@@ -2516,6 +2572,7 @@ export type UiSlotId =
 	| "contextmenu.file"
 	| "contextmenu.search"
 	| "contextmenu.toolcall"
+	| "contextmenu.bot"
 	| "tool.card.footer"
 	| "settings.pages"
 	| "leftpanel.projects.actions"
@@ -2727,6 +2784,9 @@ export interface ConversationSummary {
 	isSubagent: boolean;
 	agentPreset?: string;
 	presetLocked?: boolean;
+	/** 私聊会话绑定的 Bot（普通对话 + Bot 身份）；普通对话/群任务无此字段。 */
+	botId?: string;
+	botName?: string;
 	error?: string;
 	canceled?: boolean;
 	/**
@@ -2779,6 +2839,10 @@ export interface ElsewhereRunning {
 	questionTitle?: string;
 	pseudo?: boolean;
 	ownerOffline?: boolean;
+	/** 子代理行：挂到同一持有方的父对话行下面（只读查看） */
+	isSubagent?: boolean;
+	/** 父对话在持有方内部的 id；客户端拼成 `elsewhere:<owner>:<parentId>` 认父行 */
+	parentId?: string;
 }
 
 export interface UiAgentPreset {
@@ -2898,6 +2962,12 @@ export interface UiPresetImportPreview {
 	promptDisabled: string[];
 }
 
+/**
+ * 子代理权限模式（协议单源，服务端闸门与设置页共用）：
+ * `normal` 不加限制；`readonly` 只放行只读工具与只读 bash 命令；`verify` 在只读之上再放行测试套件。
+ */
+export type SubagentSecurityMode = "normal" | "readonly" | "verify";
+
 export interface UiSubagentTemplate {
 	name: string;
 	description: string;
@@ -2910,6 +2980,11 @@ export interface UiSubagentTemplate {
 	model: string;
 	thinkingLevel: string;
 	enabled: boolean;
+	/**
+	 * 权限模式。设置快照下发的**永远是生效值**（服务端已按模板名算过启发式），
+	 * 页面保存时原样回传 → 从此该模板显式固定，不再受名称关键字推断影响。
+	 */
+	securityMode?: SubagentSecurityMode;
 }
 
 export interface UiVisionBridgeModel {
@@ -2919,6 +2994,13 @@ export interface UiVisionBridgeModel {
 }
 
 export type McpScope = "global" | "project";
+
+/**
+ * MCP 工具暴露方式，与 pi 的 `McpExposure` 同口径：
+ * `direct` 内联声明进上下文，`codemode` / `deferred` 不内联（分别走 codemode / tool_search），`hidden` 不可达。
+ * 定义在这里保持 `server/protocol.ts` 不依赖 node 类型（前端也直接消费它）。
+ */
+export type McpExposure = "codemode" | "deferred" | "direct" | "hidden";
 
 export interface UiMcpToolInfo {
 	name: string;
@@ -2939,6 +3021,13 @@ export interface UiMcpServer {
 	protocolVersion?: string;
 	enabled?: boolean;
 	description?: string;
+	/**
+	 * 服务器默认的工具暴露方式。`undefined` = 请求里没带（保存时保留文件里的原值），
+	 * `null` = 明确回到缺省（保存时删掉该字段，即 pi 的 `codemode`）。
+	 */
+	exposure?: McpExposure | null;
+	/** 单个工具的暴露方式；`null` 同上表示删掉该字段。 */
+	toolExposure?: Record<string, McpExposure> | null;
 	status?: "running" | "stopped" | "error";
 	overriddenBy?: McpScope;
 	usingPreviousConfig?: boolean;
@@ -3083,8 +3172,11 @@ export interface UiSettingsState {
 	quickAskEnabled: boolean;
 	quickAskModel: string | null;
 	quickAskThinking: ThinkingLevel;
+	botDraftModel: string | null;
+	botDraftThinking: ThinkingLevel;
 	quickAskSystemPrompt: string;
 	quickAskExplainPrompt: string;
+	quickAskTranslateModel: string | null;
 	quickAskTranslateEnabled: boolean;
 	quickAskTranslateTarget: QuickAskTranslateTarget;
 	quickAskTranslateStyle: QuickAskTranslateStyle;
@@ -3362,6 +3454,9 @@ export type ServerMessage =
 	| { type: "commands"; commands: CommandDef[]; path: string }
 	| { type: "slash_commands"; commands: SlashCommandInfo[] }
 	| { type: "notice"; level: "info" | "warning" | "error"; text: string; textEn?: string }
+	/** 压缩期间用户发的文本已进投递队列（issues/929）：客户端据此让乐观回显气泡不再
+	 *  按 TTL 过期，而是等真正的 user 消息进快照时才对账收掉。 */
+	| { type: "prompt_queued"; conversationId: string; text: string }
 	| { type: "scm_changed" }
 	| { type: "extension_inventory_changed" }
 	| { type: "heartbeat"; hostMetrics?: UiHostMetrics; latencyMs?: number }

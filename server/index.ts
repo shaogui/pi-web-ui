@@ -16,18 +16,26 @@
  *   all share one conversation list per project.
  *   PI_CODING_AGENT_DIR  pi config dir (auth/models/skills) — passed to the SDK
  */
+// 必须排在所有 import 之前：先装上「Windows 不弹控制台」进程级开关，后面求值的模块
+// （含 module 作用域里的 `promisify(execFile)` 捕获、插件里的 spawn）才都吃到它。
+import "./hide-console-windows.js";
+import { sleep } from "./async-utils.js";
 import { botExecutionMessageAllowed } from "./device-center/bot-execution.js";
 import { createBotDraftStore, normalizeBotDraft } from "./device-center/bot-drafts.js";
+import { createBotDraftRunner } from "./bot-draft-runner.js";
 import { setAgentBotHost } from "./device-center/bot-creation-tool.js";
+import { setBotChatHost } from "./device-center/bot-chat.js";
 import { startBotMemoryMaintenance } from "./device-center/bot-memory-scheduler.js";
 import { ALL_AGENT_TOOL_ENTRIES, effectiveDisabledAgentTools, isToolSupportedOnPlatform } from "./tool-manager.js";
 import "./patch-remote-catalog.js";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { registerPromptTemplateRoutes } from "./prompt-templates.js";
 import { createQuickAskRuntime, registerQuickAskRoutes } from "./quick-ask.js";
+import { registerTranslateRoutes } from "./browser-translate.js";
 import { QuickAskError, readQuickAskHistoryConversation } from "./quick-ask-context.js";
 import { SandboxManager } from "./sandbox-service.js";
 import { registerSystemScreenshotRoutes } from "./system-screenshot.js";
+import { registerEngineUpdateRoutes } from "./engine-update.js";
 import { readFile, stat } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
 import { proxyHttp, type ProxyHit } from "./http-proxy.js";
@@ -57,6 +65,7 @@ import { isOfficeFile, OFFICE_MAX_FILE_BYTES, unzipFiles } from "./office-parse.
 import { startControlServer } from "./control-socket.js";
 import { scheduleUploadCleanup } from "./uploads.js";
 import { ensureWindowsBash, windowsBashDir } from "./ensure-bash.js";
+import { augmentNodePath, augmentNodePathFromShell } from "./node-path.js";
 import { listThemes, readThemeCss, resolveThemeFile } from "./themes.js";
 import { isManaged, managedRefusal } from "./managed.js";
 import { launchOrigin, toServiceInfo } from "./launch-origin.js";
@@ -115,7 +124,7 @@ import { buildPiWebTokenCookie, decodeCookieToken, isTlsRequest } from "./auth-c
 import { AUTH_ERROR_PARAM, AUTH_LOGIN_PATH, loginFailureLocation, sanitizeNextPath } from "./auth-login.js";
 import { isLoopbackAddress, loadServerFileConfig, saveServerFileConfig, tokenWarning } from "./server-config.js";
 import { renderSetupHtml } from "./setup-page.js";
-import { renderUnauthorizedHtml } from "./unauthorized-page.js";
+import { buildLangCookie, readLangCookie, renderUnauthorizedHtml, resolvePageLang } from "./unauthorized-page.js";
 import { formatStartupBannerLines } from "./startup-banner.js";
 import { getAppVersion, getPkgRoot } from "./pkg-info.js";
 import {
@@ -267,6 +276,23 @@ const proxyInfo = initHttpProxy(getAgentDir());
 if (proxyInfo.active) {
 	console.log(`[proxy] Outbound HTTP proxy enabled: ${proxyInfo.proxyUrl}`);
 }
+
+// node / npm 装在版本管理器（fnm / nvm-windows / Volta / Scoop）下时，目录只由交互式 shell 的
+// profile 注入 PATH；本进程继承的 PATH 里没有它，`bash -c "npm run …"` 就是 127 —— 后台任务面板
+// 的一键启动因此「全部闪退」，而 `bash -i` 终端正常。启动时补一次，所有子进程都跟着有。
+const nodePathDirs = augmentNodePath();
+if (nodePathDirs.length > 0) console.log(`[path] prepended node dirs: ${nodePathDirs.join(delimiter)}`);
+// 还找不到 npm/node 时走机制层：抓一次交互式登录 shell 的真实环境（VS Code resolveShellEnv 同款）。
+// 硬超时可用 PI_WEB_PATH_CAPTURE_TIMEOUT_MS（默认 1500ms，夹 200ms～10s）单独放宽。
+const shellPath = await augmentNodePathFromShell();
+if (shellPath.reason === "merged")
+	console.log(
+		`[path] interactive-shell capture: +${shellPath.added} entries (${shellPath.ms}ms, timeout ${shellPath.timeoutMs}ms)`,
+	);
+else if (shellPath.reason === "failed")
+	console.log(
+		`[path] interactive-shell capture failed after ${shellPath.ms}ms (timeout ${shellPath.timeoutMs}ms, PATH left as-is)`,
+	);
 
 if (process.platform === "win32") {
 	process.env.PATH = `${windowsBashDir()}${delimiter}${process.env.PATH ?? ""}`;
@@ -543,13 +569,38 @@ app.use((req, res, next) => {
 		res.status(401);
 		res.setHeader("Content-Type", "text/html; charset=utf-8");
 		res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+		// 登录页的语言：?lang= > cookie > Accept-Language > zh（cookie 是登录前唯一能读到的偏好，见 issue #955）
+		const installedLangs = listPacks(DATA_DIR)
+			.filter((pack) => pack.installed)
+			.map((pack) => ({ code: pack.code, nativeName: pack.nativeName }));
+		const availableLangs = [
+			{ code: "zh", nativeName: "简体中文" },
+			{ code: "en", nativeName: "English" },
+			...installedLangs,
+		];
+		const resolvedLang = resolvePageLang({
+			query: req.query?.lang,
+			cookie: readLangCookie(req.headers.cookie),
+			acceptLanguage: req.headers["accept-language"],
+			available: availableLangs.map((l) => l.code),
+		});
+		if (resolvedLang.explicit) {
+			const prior = res.getHeader("Set-Cookie");
+			const cookies = Array.isArray(prior) ? [...prior] : prior ? [String(prior)] : [];
+			cookies.push(buildLangCookie(resolvedLang.lang));
+			res.setHeader("Set-Cookie", cookies);
+		}
+		const nextTarget = new URL(req.originalUrl ?? "/", "http://localhost");
+		nextTarget.searchParams.delete("lang");
 		res.send(
 			renderUnauthorizedHtml({
 				isLoopback,
 				isStaleCookie: Boolean(cookie),
 				port: PORT,
 				authFailed: req.query?.[AUTH_ERROR_PARAM] !== undefined,
-				nextPath: sanitizeNextPath(req.originalUrl ?? "/"),
+				nextPath: sanitizeNextPath(nextTarget.pathname + nextTarget.search),
+				lang: resolvedLang.lang,
+				langs: availableLangs,
 			}),
 		);
 		return;
@@ -569,7 +620,12 @@ registerTtsRoutes(app);
 const sharedStateStore = new ClientStateStore(join(DATA_DIR, "client-state.json"));
 registerPromptTemplateRoutes(app, DATA_DIR);
 registerSystemScreenshotRoutes(app);
+registerEngineUpdateRoutes(app);
 const quickAskSandboxes = new SandboxManager(DATA_DIR);
+registerTranslateRoutes(app, {
+	getSettings: () => sharedStateStore.getSettingsSnapshot(""),
+	agentDir: getAgentDir(),
+});
 registerQuickAskRoutes(app, {
 	getSettings: () => sharedStateStore.getSettingsSnapshot(""),
 	getRuntime: (signal) => createQuickAskRuntime(getAgentDir(), signal),
@@ -1008,7 +1064,24 @@ const deviceCenter = await installLocalDeviceCenter({
 	dataDir: DATA_DIR,
 	bots: deviceBots,
 	botDrafts: deviceBotDrafts,
+	// 一句话建 Bot：一次模型调用产出草案，创建仍由人在面板上确认。
+	// 模型/思考强度**每次现取**：设置 →「智能体」里可以单独指定，不指定则跟随本机默认模型。
+	draftBotFromRequest: createBotDraftRunner({
+		agentDir: getAgentDir(),
+		cwd: process.env.PI_WEB_CWD ? process.env.PI_WEB_CWD : process.cwd(),
+		model: () => {
+			const settings = sharedStateStore.getSettingsSnapshot("");
+			return settings.botDraftModel ?? sharedStateStore.getDefaultModel("pi");
+		},
+		thinking: () => sharedStateStore.getSettingsSnapshot("").botDraftThinking,
+		allowedTools: new Set(
+			ALL_AGENT_TOOL_ENTRIES.map((tool) => tool.name).filter((name) => isToolSupportedOnPlatform(name)),
+		),
+		create: (input, createdBy) => deviceBotDrafts.create(input, createdBy),
+	}),
 	allowHosts: ALLOW_HOSTS,
+	// dev 的 Vite 代理（页面 origin ≠ 后端 Host）由这里显式放行；生产反向代理通常同源。
+	allowOrigins: ALLOW_ORIGINS,
 	lanAccess: deviceLanAccess,
 	botCatalog: {
 		defaultCwd: CWD,
@@ -1103,6 +1176,17 @@ const botMemoryMaintenance = startBotMemoryMaintenance({
 void botMemoryMaintenance;
 
 // 一句话创建：模型只能写草案，落库由人在界面确认（见 bot-drafts.ts 的批准语义）。
+setBotChatHost({
+	// 私聊 = 普通对话 + Bot 身份：会话创建/恢复时按 id 回到本机 Bot 注册表取当前配置。
+	// 走 `list()` 而不是 `get()`：注册表是懒加载的（首次 list 才读盘），
+	// `get()` 在加载前会给出 undefined，那会把"还没加载"误判成"Bot 不存在"。
+	resolve: async (botId) => (await deviceBots.list()).find((bot) => bot.id === botId),
+	dataDir: DATA_DIR,
+	isBusy: (botId) => deviceBots.busy(botId),
+	// 私聊回合与群任务共用同一把租约：同一 Bot 不并发（任务侧遇 BOT_BUSY 会有界等待）。
+	acquireLease: (botId) => deviceBots.acquire(botId),
+});
+
 setAgentBotHost({
 	draft: async (input) => {
 		const allowed = new Set(ALL_AGENT_TOOL_ENTRIES.map((tool) => tool.name));
@@ -1398,7 +1482,10 @@ export interface DispatchSession {
 		ephemeral?: boolean,
 		onReady?: (id: string) => void,
 		independent?: boolean,
+		botId?: string,
 	): Promise<boolean | void>;
+	/** 打开某个 Bot 的私聊：默认回到同一个对话，`fresh` 才新开一条（见 device-center/bot-chat.ts）。 */
+	openBotChat?(botId: string, opts?: { fresh?: boolean }): Promise<boolean>;
 	newCliChat?(config: NativeCliConfig, cwd?: string, onReady?: (id: string) => void): Promise<boolean>;
 	controlNativeCli?(conversationId: string, terminalId: string, action: "detach" | "reconnect" | "stop"): Promise<void>;
 	getNativeCliConversation?(conversationId?: string): import("./protocol.js").NativeCliConversation | undefined;
@@ -1581,8 +1668,11 @@ export interface DispatchSession {
 		quickAskEnabled?: boolean;
 		quickAskModel?: string | null;
 		quickAskThinking?: ThinkingLevel;
+		botDraftModel?: string | null;
+		botDraftThinking?: ThinkingLevel;
 		quickAskSystemPrompt?: string;
 		quickAskExplainPrompt?: string;
+		quickAskTranslateModel?: import("./quick-ask-settings.js").QuickAskSettings["quickAskTranslateModel"];
 		quickAskTranslateEnabled?: import("./quick-ask-settings.js").QuickAskSettings["quickAskTranslateEnabled"];
 		quickAskTranslateTarget?: import("./quick-ask-settings.js").QuickAskSettings["quickAskTranslateTarget"];
 		quickAskTranslateStyle?: import("./quick-ask-settings.js").QuickAskSettings["quickAskTranslateStyle"];
@@ -1719,6 +1809,8 @@ export interface EngineService {
 		options?: { readOnly?: boolean },
 	): boolean;
 	closeSharedConversation?(viewerId: string): void;
+	/** 定时任务持有方那份对话的转录文件（活会话在内存里时可解析）。 */
+	scheduledConversationFile?(ownerId: string, convId: string): string | undefined;
 	sharedConversationTarget?(
 		viewerId: string,
 	): { conversationId: string; owner: DispatchSession; ownerClientId: string } | undefined;
@@ -1984,6 +2076,12 @@ const service: EngineService = {
 	closeSharedConversation(viewerId) {
 		ensureEngine(resolveClientEngine(viewerId)).closeSharedConversation?.(viewerId);
 	},
+	scheduledConversationFile(ownerId, convId) {
+		// 定时任务持有方固定在 pi 引擎（无头执行只有 pi 支持）。
+		return (
+			ensureEngine("pi") as unknown as { scheduledConversationFile?: (o: string, c: string) => string | undefined }
+		).scheduledConversationFile?.(ownerId, convId);
+	},
 	sharedConversationTarget(viewerId) {
 		return ensureEngine(resolveClientEngine(viewerId)).sharedConversationTarget?.(viewerId);
 	},
@@ -2230,7 +2328,7 @@ const scheduler = new SchedulerStore(DATA_DIR, {
 		if (task.target === "canvas") {
 			return executeScheduledCanvas(DATA_DIR, canvasOrchestrator, task);
 		}
-		let result: { ok: boolean; conversationId?: string; error?: string };
+		let result: { ok: boolean; conversationId?: string; sessionFile?: string; error?: string };
 		try {
 			const svc = ensureEngine("pi") as unknown as {
 				chatFromScheduler?: (t: {
@@ -2240,7 +2338,7 @@ const scheduler = new SchedulerStore(DATA_DIR, {
 					prompt: string;
 					model?: string;
 					thinkingLevel?: string;
-				}) => Promise<{ ok: boolean; conversationId?: string; error?: string }>;
+				}) => Promise<{ ok: boolean; conversationId?: string; sessionFile?: string; error?: string }>;
 				wakeConversation?: (
 					id: string,
 					text: string,
@@ -2268,7 +2366,12 @@ const scheduler = new SchedulerStore(DATA_DIR, {
 			if (typeof svc.chatFromScheduler !== "function" && typeof svc.wakeConversation !== "function") {
 				result = { ok: false, error: "当前引擎不支持定时任务（仅标准 pi 引擎）" };
 			} else {
-				const runHeadless = (): Promise<{ ok: boolean; conversationId?: string; error?: string }> =>
+				const runHeadless = (): Promise<{
+					ok: boolean;
+					conversationId?: string;
+					sessionFile?: string;
+					error?: string;
+				}> =>
 					svc.chatFromScheduler!({
 						id: task.id,
 						name: task.name,
@@ -2304,7 +2407,11 @@ const scheduler = new SchedulerStore(DATA_DIR, {
 									scheduler.rebind(task.id, { sessionFile: w.sessionFile });
 							} catch {}
 						}
-						result = { ok: true, conversationId: w.conversationId };
+						result = {
+							ok: true,
+							conversationId: w.conversationId,
+							...(w.sessionFile ? { sessionFile: w.sessionFile } : {}),
+						};
 					} else if (typeof svc.wakeViewportInCwd === "function") {
 						const fallbackText = `[定时任务 ${task.name}｜原对话不在，已转到本窗口继续] ${task.prompt}`;
 						let f: {
@@ -2333,7 +2440,11 @@ const scheduler = new SchedulerStore(DATA_DIR, {
 								`定时任务「${task.name}」原对话不在，已转到同项目的活跃对话继续（原绑定 ${target || "（未知）"}）。报告直接落在当前对话。`,
 								`Scheduled task "${task.name}" moved to the project's active conversation (was ${target || "unknown"}). The report lands in the current chat.`,
 							);
-							result = { ok: true, conversationId: f.conversationId };
+							result = {
+								ok: true,
+								conversationId: f.conversationId,
+								...(f.sessionFile ? { sessionFile: f.sessionFile } : {}),
+							};
 						} else {
 							pushNoticeToAll(
 								"warning",
@@ -3267,7 +3378,16 @@ wss.on("connection", (ws) => {
 						});
 						break;
 					}
-					void cs.prompt(msg.text, msg.attachments, msg.queue);
+					void cs.prompt(msg.text, msg.attachments, msg.queue).catch((err: unknown) => {
+						// `prompt()` 的前置门禁是直接抛的：不接住就只剩一条 Unhandled Rejection，
+						// 用户那边看起来就是「点了发送什么都没发生」。
+						send({
+							type: "notice",
+							level: "error",
+							text: `发送失败：${(err as Error)?.message ?? err}`,
+							textEn: `Failed to send: ${(err as Error)?.message ?? err}`,
+						});
+					});
 					break;
 				}
 				case "queue_remove":
@@ -3319,6 +3439,41 @@ wss.on("connection", (ws) => {
 						});
 					}
 					return;
+				case "open_scheduled_conversation": {
+					// 定时任务的对话就是一条普通对话：直接打开（走 switch_session，不再另做
+					// 「另一处 / 只读共享」）。打开前服务端会让后台持有方放手，避免两个 writer；
+					// 正在跑那一轮则拒绝，等它结束再开。
+					const taskId = String(msg.taskId ?? "").trim();
+					const owner = `scheduler:${taskId.replace(/[^A-Za-z0-9_-]/g, "") || "task"}`;
+					const task = taskId ? scheduler.list().find((t) => t.id === taskId) : undefined;
+					const recorded = new Set<string>();
+					if (task) {
+						for (const h of [task.lastRun, ...task.history]) {
+							if (h?.sessionFile) recorded.add(resolve(h.sessionFile));
+						}
+						if (task.sessionFile) recorded.add(resolve(task.sessionFile));
+					}
+					// sessionFile 只认该任务运行记录里真的记过的那个（不让这条消息变成任意会话打开器）；
+					// 老记录没有 sessionFile 时，才拿活会话反查文件。
+					let sessionFile = String(msg.sessionFile ?? "").trim();
+					if (sessionFile && !recorded.has(resolve(sessionFile))) sessionFile = "";
+					if (!sessionFile) {
+						const convId = String(msg.conversationId ?? "").trim();
+						const live = convId ? service.scheduledConversationFile?.(owner, convId) : undefined;
+						if (live && recorded.has(resolve(live))) sessionFile = live;
+					}
+					if (sessionFile) {
+						handleSessionLifecycleMessage({ type: "switch_session", path: sessionFile }, cs, send, service, clientId);
+						return;
+					}
+					send({
+						type: "notice",
+						level: "warning",
+						text: "这次运行还没有可打开的对话（既没有存活会话，也没记录会话文件）",
+						textEn: "This run has no conversation to open: the live session is gone and no session file was recorded.",
+					});
+					return;
+				}
 				case "take_over_conversation":
 					if (typeof service.takeOverConversation === "function") {
 						void service.takeOverConversation(clientId, msg.owner, msg.id);
@@ -3616,7 +3771,7 @@ if (process.env[RESTART_CHILD_ENV] === "1") {
 		});
 	while (Date.now() < deadline) {
 		if (await portFree()) break;
-		await new Promise((r) => setTimeout(r, 300));
+		await sleep(300);
 	}
 }
 
@@ -3733,15 +3888,15 @@ async function shutdown(signal: "SIGINT" | "SIGTERM" = "SIGINT"): Promise<void> 
 	let disarmKiller: (() => void) | null = null;
 	if (process.platform === "win32") {
 		try {
-			const { spawn } = await import("node:child_process");
-			const killer = spawn(
-				"cmd.exe",
-				[
+			const { spawnChild } = await import("./spawn-child.js");
+			const killer = spawnChild({
+				cmd: "cmd.exe",
+				args: [
 					"/c",
 					`timeout /t ${Math.ceil((SHUTDOWN_FORCE_EXIT_MS + 5000) / 1000)} /nobreak >nul && taskkill /F /T /PID ${process.pid}`,
 				],
-				{ stdio: "ignore", windowsHide: true },
-			);
+				stdio: "ignore",
+			}).child;
 			killer.unref();
 			disarmKiller = () => {
 				try {

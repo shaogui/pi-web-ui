@@ -35,6 +35,30 @@ SDK 沒有自動壓縮指令及許可權前別名解析的公開介面，分別�
 
 驗證：`tests/unit/request-context.test.ts`、`context-evidence.test.ts`、`compaction-instructions.test.ts`、`evidence-tool-hooks.test.ts`、`context-integration.test.ts`。
 
+### 模型自主壓縮：正文由模型給，宿主不另發摘要請求
+
+`compact_context` 的 `summary` 是必填項，模型必須在本輪回覆裡自己寫出壓縮後的上下文正文（≥300 字元、≥2 個 `## ` 分節，不合格直接回傳錯誤要求重寫）。turn 結束後 `executePendingCompaction` 把正文交給 `installCompactionInstructions` 的 patch，`_runDefaultCompaction` 直接回傳 `{summary, firstKeptEntryId, tokensBefore, details}` 而**不呼叫任何模型**：邊界與大小來自 SDK 自己的 `prepareCompaction`（`preparation.firstKeptEntryId` / `tokensBefore` / `fileOps`），後續 `appendCompaction`、事件與投影重新整理仍是 SDK 原流程。因此這條路徑不產生額外請求、不消耗摘要輸入 token，也不受壓縮請求 `cacheRetention: "none"` 影響。
+
+正文只讀取一次（`AgentService.providedCompactionSummaries` 是會話物件的 WeakMap，`finally` 清空）：模型沒給正文時仍回落 SDK 摘要請求。`details` 與 `<read-files>` / `<modified-files>` 尾註由 `compactionFileDetails` / `formatFileDetails` 複刻（SDK 未匯出 `computeFileLists` / `formatFileOperations`），SDK 升級時需與 `core/compaction/utils.ts` 對齊。與獨立摘要相比質量風險集中在模型當前上下文壓力，故保留長度與分節門檻。
+
+驗證：`tests/unit/request-context.test.ts`、`context-evidence.test.ts`、`compaction-instructions.test.ts`（含 provided checkpoint 短路組）、`compact-context-tool.test.ts`、`evidence-tool-hooks.test.ts`、`context-integration.test.ts`。
+
+### 壓縮後可定址：`<context-recovery>` 控制代碼（`server/context-recovery.ts`）
+
+證據外置解決的是「大工具輸出還能讀回來」，解決不了另一半：**被折疊的對話本身沒有地址**。壓縮後模型看到的是摘要 + 保留尾巴，此前 `read-files` / `modified-files` 只記檔名，使用者原話與模型自己的推理不在任何控制代碼裡。
+
+`installCompactionInstructions` 在兩條壓縮路徑（SDK 摘要 / 模型自寫 checkpoint）產出的 summary 後面**確定性追加**一個 `<context-recovery>` 塊，內容全部從會話轉錄推導，不新增工具、不複製轉錄副本（JSONL 仍是唯一事實源）：
+
+1. **轉錄路徑**：`sessionManager.getSessionFile()` 的絕對路徑，並說明用法——`grep({pattern:"\\"id\\":\\"<entryId>\\"", path})` 拿行號，再 `read({path, offset:<line>, limit:1})`。單行超過 50KB 時 `read` 會整行拒絕，那類輸出恰好走 `context-evidence` 控制代碼。
+2. **折疊段使用者輪次逐字**：最多 3 條、每條壓到 300 字元（`MAX_VERBATIM_USER_TURNS` / `MAX_VERBATIM_CHARS`），帶 entry id 與行號——最貴的資訊不依賴任何查找。
+3. **更早的使用者輪次**：最多 12 條，只列 id + 行號（`MAX_INDEXED_USER_TURNS`）。
+
+約束與不變量：折疊範圍由 `firstKeptEntryId` 沿 `parentId` 鏈回溯（boundary 本身是保留項，不計入）；boundary 尚未落到會話裡（retain-none 壓縮寫入的是壓縮自身的 id）時回落到全部 entry，寧可多給地址也不藏歷史。行號由流式掃描轉錄得到，只快取每行頭 256 字元，單行幾 MB 也不會把記憶體打爆（實測一條 4.3MB 的 tool result 仍能正確給出 L 行號）；檔案超過 64MB 或不可讀時**降級為只給 id**，絕不拋錯——索引失敗不能讓壓縮失敗。摘要裡若有舊塊，追加前先 `stripRecoveryBlocks` 剝掉，保證**任何時刻只有一個** `<context-recovery>`；保留指令與 `compact_context` 指引都要求模型不要抄這兩個宿主生成的塊。證據索引仍然失敗即拒絕（`getEvidenceIndex` 的拒絕語義不變），因為靜默丟證據比壓縮失敗更糟。
+
+代價與取捨：每次壓縮約 1k–2k 字元（≈300–700 tokens），常態路徑零開銷；塊裡只記**使用者輪次**的逐字文字（模型自己的結論由摘要承載），並把會話轉錄的絕對路徑交給模型——這與 evidence 目錄同一信任邊界（同一會話目錄、同一讀許可權），換來的是壓縮後仍能定點回讀原文。
+
+驗證：`tests/unit/context-recovery.test.ts`（控制代碼構造、行號對映、降級、單塊不變量、與 `installCompactionInstructions` 的整合）。
+
 ## 1. 一塊開銷有多大
 
 以 30 個目錄/核心工具為例（設定頁「檢視工具 schema」能看到即時數字）：
@@ -63,7 +87,7 @@ SDK 沒有自動壓縮指令及許可權前別名解析的公開介面，分別�
 `_toolRegistry` 上（核心內建 / 本專案工具 / 外掛 / MCP 一網打盡）。見
 `server/tool-prompt-overrides.ts`。
 
-### 2.3 延遲載入（本機制，**預設關**，可開；名單制）
+### 2.3 延遲載入（本機制，**出廠預設開**，可關；名單制）
 
 開：`load_tools` 常駐；只有**按需名單**（`ClientSettings.toolOnDemandTools`，見 §2.6）裡的工具才走延遲——
 它們在系統提示詞的 `{{tools}}` 段裡只有**名字 + 一行摘要**（目錄），引數 schema 不進上下文。模型
@@ -71,10 +95,13 @@ SDK 沒有自動壓縮指令及許可權前別名解析的公開介面，分別�
 名單外的工具（含核心工具 `bash` / `read` / `edit` / `write`）按開關/預設常駐可用；名單為空時等於都不延遲
 （此時 `load_tools` 也不掛載、`{{tools}}` 段整段不輸出，見 §3）。
 
-- 開關：設定 → 工具區「工具按需載入」（`ClientSettings.toolLazyLoading`，**出廠預設關**，即 `load_tools` 總閘）。
-  預設關的理由：模型忘載入會先吃一次 `Tool <name> not found`（SDK 只認已宣告集），開箱
-  即用優先；需要省上下文的例項自己開啟，部署級預設可用環境變數 `PI_WEB_TOOL_LAZY_LOADING=1`
-  / `true` / `on` / `yes`（只作預設值，使用者已存檔的設定優先）。
+- 開關：設定 → 工具區「工具按需載入」（`ClientSettings.toolLazyLoading`，**出廠預設開**，即 `load_tools` 總閘）。
+  出廠預設開的理由：預設工具面收窄——常駐只留核心四件套與輕量工具，7 個重工具（`terminal` /
+  `browser_page` / `browser_script` / `browser_design` / `agent_bot` / `schedule` / `compact_context`）走按需，
+  模型先調 `load_tools` 再拿 schema（同一份名單見 §2.6 與 `DEFAULT_CLIENT_SETTINGS.toolOnDemandTools`）。
+  代價：模型忘載入會先吃一次 `Tool <name> not found`（SDK 只認已宣告集）。想回到「全部常駐」的例項
+  自己關掉；部署級預設可用環境變數 `PI_WEB_TOOL_LAZY_LOADING=0` / `false` / `off` / `no` 覆蓋
+  （只作預設值，使用者已存檔的設定優先）。
   關著 = 按開關/預設直接全部活躍（與 pi 命令列一致，名單無效果）。**隻影響新會話與之後的門控重放**——
   不會把正在跑的對話裡的工具反向清空。
 - 門控實現：延遲載入**不引入第二條門控路徑**。未載入的名單工具 = 臨時加進停用名單
@@ -181,10 +208,13 @@ SDK 沒有自動壓縮指令及許可權前別名解析的公開介面，分別�
   合併只省約 1.2k 字元（~330 tokens），代價是兩套 service/審批/設定行/許可權閘門併成一套 15 項 action 的
   混合列舉，且違反「一個能力一個工具名」。
 - **不改預設開關去「延遲載入」它們**（當時結論）。延遲載入已經由 §2.3 的全域性開關提供；把 `canvas` /
-  `sandbox` / `schedule` 這類主打功能預設改成待載入，是產品決定，不是預算最佳化的順帶結論。後來的
-  產品決定是**直接預設關閉** `ls` / `patch` / `delegate_task` / `sandbox` / `worktree` / `canvas`
-  （目錄 `defaultOn: false` + 出廠設定 `disabledAgentTools` 同名單），理由不再是預算，而是預設工具面
-  收窄；`plan_update` / `compact_context` / `schedule` 仍預設開。
+  `sandbox` 這類主打功能預設改成待載入，是產品決定，不是預算最佳化的順帶結論。後來的
+  產品決定是**直接預設關閉** `powershell` / `ls` / `delegate_task` / `phone` / `patch` / `lsp` / `eval` /
+  `tool_search` / `mcp_manage` / `sandbox` / `worktree` / `canvas` 12 個（目錄 `defaultOn: false` +
+  出廠設定 `disabledAgentTools` 同名單），理由不再是預算，而是預設工具面收窄；`plan_update` 仍預設開。
+  最新一次則把三個重工具從「關閉」改成「按需」：`terminal`（原本硬關）、`schedule` / `compact_context`
+  （原本預設開）——出廠 `toolOnDemandTools` = 7 個：`terminal` / `browser_page` / `browser_script` /
+  `browser_design` / `agent_bot` / `schedule` / `compact_context`。按需 ≠ 關閉：模型調 `load_tools` 就能拿到。
 
 守衛：`tests/unit/tool-schema-slim.test.ts` 現在把上面 21 個工具全部納進來（含 `patternProperties`），
 任何一條裝飾約束、任何一個白名單外的欄位說明都會紅。
@@ -243,7 +273,7 @@ redefinition）、關掉某個工具（`toolsRemoved` → 該對話之後只能�
 
 ## 4. 換來的收益與代價
 
-（都是**開啟**這個開關之後的口徑；出廠預設關，所以下面是「想省上下文時才付的代價」）
+（都是**開啟**這個開關之後的口徑；出廠預設開，所以下面是這套預設一直付的代價和一直拿到的收益）
 
 - 收益：常駐 schema 取決於名單大小——名單把重量級工具都收進來時 33k → **~7k**（核心工具 + load_tools + 名單外常駐）。名單裡的工具體用不到就永遠不進上下文；
   系統提示詞本身也從 ~8.6k 降到 ~6.7k（guidelines 只剩常駐）。名單為空時開關等同關閉（既不延遲、也不掛 `load_tools`、不出按需段），記得先勾名單再開開關。

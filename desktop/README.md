@@ -20,6 +20,14 @@ Office 支持文本/CSV 编辑，以及 DOCX/XLSX/PPTX 的只读内容预览；�
 
 模块边界、权限和构建说明见 [内置浏览器架构](../docs/architecture-browser.md)。
 
+## 系统集成（默认浏览器 / 文件关联）
+
+Windows 桌面版可在「设置 → 桌面应用 → 系统集成」把 pi 注册成可选的默认浏览器与文件打开方式（`.pdf`，以及 office 插件接管的 `.docx/.xlsx/.pptx/.csv/.tsv`）。注册写 HKCU，不需要管理员权限；开发模式（未打包）不写注册表。
+
+Windows 不允许程序自己改默认程序：注册只是让 pi 出现在「默认应用 / 打开方式」列表里，仍需用户在系统设置里选一次并确认，设置页的按钮会直接打开「默认应用」。双击关联文件后，PDF 用内置浏览器（Chromium 阅读器）打开，其余交给 Agent 页：有插件接管的由插件渲染，没有的走内置预览；文件在工作区外时，插件会弹一次目录授权。
+
+便携版换目录后启动会自动把注册项刷新到当前 exe。细节见 [系统集成架构](../docs/architecture-system-integration.md)。
+
 ## 设备中心集成浏览器
 
 桌面端点击“打开中心”，会打开独立的设备中心窗口，用于登录、创建账号及确认配对。主窗口继续轮询配对结果，确认后自动完成绑定；无需依赖系统浏览器的新标签。相同中心重复打开会复用窗口，窗口菜单提供前进、后退、刷新和返回中心首页。
@@ -72,9 +80,20 @@ open -a /Applications/pi-web-ui-desktop.app
 
 ## 升级与备份
 
-安装版可在应用更新面板检查、下载并安装更新。主进程通过 `electron-updater` 读取 GitHub Release 的 `latest*.yml`：启动时仅检查元数据，不自动下载；用户下载完成后可“安装并重启”，退出时也允许安装。能否更新取决于对应平台的产物、feed、网络和系统签名要求，不能保证每一种解包目录都支持原地更新。
+安装版可在应用更新面板检查、下载并安装更新。主进程通过 `electron-updater` 读取 GitHub Release 的 `latest*.yml`：启动后检查一次元数据、之后每 6 小时自检（失败按指数退避，最长 24 小时一次），不自动下载；面板里能看到「更新内容」（从当前版本到目标版本之间每个 release 的说明）、下载进度与取消、以及「忽略此版本」。用户下载完成后可“安装并重启”，退出时也允许安装。
 
-`npm i -g pi-web-ui@latest` 更新的是全局 npm 包，不会替换桌面应用内部的 `dist/server`。更新失败时，从 Release 下载对应平台的新包安装；先退出应用并备份 WebUI 数据目录及 Agent 目录。便携 ZIP 应按[便携版手动升级步骤](../launcher/README.md#升级与迁移)操作，避免更新后改变便携布局。
+更新面板会先判断**这份拷贝能不能替换自己**，判断结果直接写在面板上：
+
+| 情形                                                                           | 表现                                                  |
+| ------------------------------------------------------------------------------ | ----------------------------------------------------- |
+| 从安装包装出来的（NSIS / dmg+zip / AppImage，`resources/app-update.yml` 存在） | 走应用内更新                                          |
+| 便携 ZIP、`win-unpacked` 之类解压即用的目录（没有 `app-update.yml`）           | 只给「去下载页手动安装」和原因，不尝试原地覆盖        |
+| `npm run desktop:dev` 等未打包运行                                             | 同上，提示用安装包                                    |
+| 设置了 `PI_DESKTOP_UPDATE_MODE=manual`                                         | 强制关闭应用内更新（排查问题时用；`auto` 可强行打开） |
+
+失败会分门别类，而不是一条英文错误：网络不可达 / feed 还没就绪（发布未完成）/ 没有写权限 / 磁盘满 / 系统拒绝签名。前两类可以直接重试，后三类引导去下载页换包（macOS 未签名产物首启需要右键打开）。细节见 [桌面应用内更新](../docs/architecture-desktop-update.md)。
+
+`npm i -g pi-web-ui@latest` 更新的是全局 npm 包，不会替换桌面应用内部的 `dist/server`，两者在更新面板里是分开的两段。更新失败时，从 Release 下载对应平台的新包安装；先退出应用并备份 WebUI 数据目录及 Agent 目录。便携 ZIP 应按[便携版手动升级步骤](../launcher/README.md#升级与迁移)操作，避免更新后改变便携布局。
 
 ## 从源码运行与构建
 
@@ -106,6 +125,7 @@ Remove-Item Env:PI_WEB_DESKTOP_URL
 | ------------------------------- | --------------------------------------------------------------------------------------------- |
 | `npm run build:desktop`         | 仅用 `desktop/tsconfig.json` 编译桌面壳到 `dist/desktop/`                                     |
 | `npm run desktop:dist`          | 先构建应用与桌面壳，再按 electron-builder 配置生成当前平台产物，输出到 `release/`             |
+| `npm run desktop:msi`           | 先构建应用与桌面壳，再出 Windows MSI 安装包 `release/pi-web-ui-desktop-<版本>-win-x64.msi`    |
 | `npm run desktop:portable`      | 构建应用与桌面壳，再组装 Windows `release/PiWebUI-Portable/`；默认不下载 Git/Node，不生成 ZIP |
 | `npm run desktop:portable:full` | 同上，但增加 `--with-git`；名称中的 full 不表示包含独立 Node.js                               |
 

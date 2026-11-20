@@ -4,7 +4,8 @@ import { FiChevronDown, FiChevronRight, FiRefreshCw, FiSearch, FiPlus, FiTrash2,
 import type { UiExtensionInfo, UiExtensionInventoryEntry, UiPluginInfo, UiPluginUpdateInfo } from "../types";
 import type { PluginSelectModel } from "../plugin-setting-options";
 import { appSend } from "../app-globals";
-import { useT } from "../i18n";
+import { useI18n } from "../i18n";
+import { pluginDisplayDescription, pluginDisplayName } from "../plugin-name";
 import { PluginIcon } from "../plugin-icon";
 import {
 	getPluginLogs,
@@ -16,8 +17,10 @@ import {
 } from "../plugin-logs";
 import { PluginSettingsForm } from "./PluginSettingsForm";
 import { PluginPage } from "./PluginPage";
+import type { UiSlotEntry } from "../ui-slots";
 
-type DetailTab = "overview" | "config" | "page" | "logs" | "caps" | "load";
+/** `page:<entryId>` = manifest `ui.settings` 里声明的一页；`page` = 没声明页时的通用插件页 */
+type DetailTab = "overview" | "config" | "page" | `page:${string}` | "logs" | "caps" | "load";
 type KindFilter = "all" | "ui" | "pi";
 type Health = "online" | "error" | "warn" | "stopped";
 
@@ -52,6 +55,8 @@ export interface InstalledPluginsPanelProps {
 	pluginJobs?: Record<string, { pluginId?: string; phase?: string; startedAt?: number }>;
 	/** #885 服务端统一清单；用于 Pi 扩展的健康、错误原文与工具数。 */
 	inventoryEntries?: UiExtensionInventoryEntry[];
+	/** `settings.pages` 槽位的工作集（已按界面布局过滤/排序）：插件声明的页在这里变成详情里的标签 */
+	pageEntries?: UiSlotEntry[];
 	models?: PluginSelectModel[];
 	epoch: number;
 	onTogglePlugin: (plugin: UiPluginInfo) => void;
@@ -83,6 +88,7 @@ export function InstalledPluginsPanel({
 	pluginUpdates,
 	pluginJobs,
 	inventoryEntries = [],
+	pageEntries = [],
 	models = [],
 	epoch,
 	onTogglePlugin,
@@ -92,7 +98,7 @@ export function InstalledPluginsPanel({
 	onInstallExtension,
 	onUninstallExtension,
 }: InstalledPluginsPanelProps): JSX.Element {
-	const t = useT();
+	const { t, locale } = useI18n();
 	const disabledPluginSet = useMemo(() => new Set(disabledPlugins), [disabledPlugins]);
 	const disabledExtensionSet = useMemo(() => new Set(disabledExtensions), [disabledExtensions]);
 
@@ -110,10 +116,10 @@ export function InstalledPluginsPanel({
 			out.push({
 				uid: `ui:${p.id}`,
 				kind: "ui",
-				name: p.name || p.id,
+				name: pluginDisplayName(p, locale),
 				icon: p.icon,
 				iconSvg: p.iconSvg,
-				desc: p.description || p.source || t("uiPluginNoSource"),
+				desc: pluginDisplayDescription(p, locale) || p.source || t("uiPluginNoSource"),
 				scope: "dataDir",
 				version: p.version,
 				enabled,
@@ -166,7 +172,17 @@ export function InstalledPluginsPanel({
 		const order = { ui: 0, pi: 1 } as const;
 		out.sort((a, b) => order[a.kind] - order[b.kind] || a.name.localeCompare(b.name));
 		return out;
-	}, [plugins, extensions, inventoryEntries, disabledPluginSet, disabledExtensionSet, pluginUpdates, pluginJobs, t]);
+	}, [
+		plugins,
+		extensions,
+		inventoryEntries,
+		disabledPluginSet,
+		disabledExtensionSet,
+		pluginUpdates,
+		pluginJobs,
+		t,
+		locale,
+	]);
 
 	const [expandedUid, setExpandedUid] = useState<string | null>(() => rows[0]?.uid ?? null);
 	const [detailTab, setDetailTab] = useState<DetailTab>("overview");
@@ -204,12 +220,21 @@ export function InstalledPluginsPanel({
 		setConfirmUninstallUid(null);
 	};
 
+	// 插件声明的 `ui.settings` 页（已按布局隐藏/排序）→ 详情里的标签；
+	// 一页都没声明的插件仍给一个通用「插件页」标签（client/entry.mjs 的 mount 直接渲染）。
+	const pageTabsFor = (r: Row): Array<[DetailTab, string]> => {
+		if (!r.plugin) return [];
+		const declared = pageEntries.filter((e) => e.source === `plugin:${r.plugin!.id}` && !e.hidden);
+		if (declared.length > 0) return declared.map((e) => [`page:${e.id}` as DetailTab, e.label] as [DetailTab, string]);
+		return r.plugin.hasClient ? [["page", t("pluginsTabPage")]] : [];
+	};
+
 	const tabsFor = (r: Row): Array<[DetailTab, string]> =>
 		r.kind === "ui"
 			? [
 					["overview", t("pluginsTabOverview")],
 					["config", t("pluginsTabConfig")],
-					["page", t("pluginsTabPage")],
+					...pageTabsFor(r),
 					["logs", t("pluginLogTitle")],
 				]
 			: [
@@ -343,11 +368,13 @@ export function InstalledPluginsPanel({
 				</div>
 			);
 		}
-		if (activeTab === "page") {
+		if (activeTab === "page" || activeTab.startsWith("page:")) {
 			if (!r.plugin?.hasClient) return <p className="ip-empty">{t("pluginsNoClient")}</p>;
+			// entry.id 是 `<pluginId>:<itemId>`，插件要的是自己声明里的那个 itemId
+			const pageId = activeTab === "page" ? undefined : activeTab.slice("page:".length).split(":").slice(1).join(":");
 			return (
 				<div className="ip-page-host">
-					<PluginPage plugin={r.plugin} epoch={epoch} send={appSend} />
+					<PluginPage plugin={r.plugin} epoch={epoch} send={appSend} pageId={pageId} />
 				</div>
 			);
 		}

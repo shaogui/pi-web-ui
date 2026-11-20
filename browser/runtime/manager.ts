@@ -10,13 +10,26 @@ import {
 } from "electron";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import type { BrowserTab, BrowserDesignDocument, BrowserDesignKind, BrowserDesignStatus } from "../contracts.js";
 import { BrowserStorage } from "../storage/index.js";
-import { isWebUrl, internalPageName, internalPageUrl, normalizeBrowserUrl, pickTabFavicon } from "./urls.js";
+import { isWebUrl, internalPageName, internalPageUrl, normalizeBrowserUrl, pickTabFavicon, webOrigin } from "./urls.js";
 import { BrowserCustomization } from "./customize.js";
+import { themeBackground } from "./palette.js";
 import { DOCK_SCRIPT, SCROLLBAR_CSS } from "./dock.js";
+import { TRANSLATE_SCRIPT } from "./translate.js";
+import { DOWNLOADS_SCRIPT, scriptLiteral } from "./downloads.js";
+import { AUTOFILL_SCRIPT } from "./autofill.js";
+import { PASSKEY_GATE_SCRIPT } from "./passkey-gate.js";
+import {
+	passkeyFromCredential,
+	passkeysForHost,
+	toCdpCredential,
+	upsertPasskey,
+	type CdpCredential,
+	type StoredPasskey,
+} from "./passkeys.js";
 import {
 	buildCleanupCode,
 	buildInjectionCode,
@@ -71,7 +84,43 @@ interface TabScriptRun {
 	debuggerAttached: boolean;
 }
 const ISOLATED_SCRIPT_WORLD = 999;
+/**
+ * Passkey 的平台认证器配置（CDP `WebAuthn.addVirtualAuthenticator`）。
+ *
+ * - `transport: "internal"`：网站看到的是“本机平台认证器”（就是它让 `isUVPAA()` 变成 true）。
+ * - `hasResidentKey`：可发现凭据（不先输账号也能登，passkey 的标准形态）。
+ * - `hasUserVerification/isUserVerified`：用户验证由本地确认（见 `docs/architecture-browser.md`）。
+ */
+const PASSKEY_AUTHENTICATOR = {
+	protocol: "ctap2",
+	transport: "internal",
+	hasResidentKey: true,
+	hasUserVerification: true,
+	isUserVerified: true,
+	automaticPresenceSimulation: true,
+} as const;
+interface PasskeySession {
+	enabled: boolean;
+	/** 本地确认闸门是否已挂到「新文档」上（每个标签一次）。 */
+	gateInjected: boolean;
+	authenticatorId: string | null;
+}
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+/**
+ * 下载圆钮只展示「进行中」与「刚刚结束」的：留着旧任务会让每打开一个页面
+ * 都把「上次那个已下完」再亮一遍，那就不叫提示了。
+ */
+const DOWNLOAD_NOTICE_MS = 30_000;
+/** 圆钮一次最多列 8 条：再多也看不完，真正的全量列表在浏览器的「下载」面板里。 */
+const DOWNLOAD_NOTICE_LIMIT = 8;
+/** file:// URL → 本地路径；不是合法 file URL 就返回空串（恢复标签时遇到就丢掉）。 */
+function safeFilePath(url: string): string {
+	try {
+		return fileURLToPath(url);
+	} catch {
+		return "";
+	}
+}
 type Bounds = { x: number; y: number; width: number; height: number };
 
 export class BrowserManager {
@@ -82,10 +131,14 @@ export class BrowserManager {
 	private readonly tabs = new Map<string, TabRecord>();
 	/** 每个标签当前注入的主题覆盖 CSS 的 key：换样式时先撤旧的，不叠层 */
 	private readonly themeKeys = new Map<string, string>();
-	private readonly downloads = new Map<string, { state: BrowserDownload; item?: DownloadItem }>();
+	private readonly downloads = new Map<string, { state: BrowserDownload; item?: DownloadItem; finishedAt?: number }>();
 	private activeTabId: string | null = null;
 	private readonly sessionScripts = new Map<string, PageScript>();
 	private readonly scriptRuns = new Map<string, TabScriptRun>();
+	/** 每个标签的 passkey 会话（CDP 虚拟认证器）；换文档不需要重建。 */
+	private readonly passkeySessions = new Map<string, PasskeySession>();
+	/** 这些 WebContents 的调试器是 passkey 挂上的：document-start 逻辑不能把它拆了。 */
+	private readonly passkeyDebuggable = new WeakSet<WebContents>();
 	private visible = true;
 	private bounds: Bounds = { x: 0, y: 0, width: 0, height: 0 };
 	private disposed = false;
@@ -96,6 +149,9 @@ export class BrowserManager {
 	constructor(private readonly options: BrowserManagerOptions) {
 		this.storage = new BrowserStorage(options.dataDir, safeStorage);
 		this.customization = new BrowserCustomization(options.dataDir);
+		// 窗口自己也得有底色：外壳页 body 是透明的，视图没盖住的那些地方（启动首帧、分栏缝隙、
+		// 标签页切换的空档）露出来的就是它——不给值就是系统默认的白色。
+		this.paintChrome();
 		this.session = session.fromPath(path.resolve(options.dataDir, "session"));
 		this.session.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
 		this.session.setPermissionCheckHandler(() => false);
@@ -108,7 +164,9 @@ export class BrowserManager {
 		let selected: string | undefined;
 		for (const [index, url] of (saved?.urls ?? []).entries()) {
 			try {
-				const id = this.createTab(url);
+				// 双击打开的本地文件标签是 file://，恢复时不能走 normalizeBrowserUrl（只放行 http(s)）
+				const localFile = /^file:\/\//i.test(url) ? safeFilePath(url) : "";
+				const id = localFile ? this.createTab("", { localFile }) : this.createTab(url);
 				if (index === saved?.activeIndex) selected = id;
 			} catch {}
 		}
@@ -119,9 +177,11 @@ export class BrowserManager {
 		this.persist();
 	}
 
-	createTab(url = ""): string {
+	createTab(url = "", options: { localFile?: string } = {}): string {
 		this.ensureAlive();
-		const target = this.targetUrl(url);
+		// 本地文件（系统里双击的 PDF）直接 file:// 加载：normalizeBrowserUrl 只放行 http(s)，
+		// 这条路径由宿主主动调用，不接受网页传入的任意 file://。
+		const target = options.localFile ? pathToFileURL(path.resolve(options.localFile)).href : this.targetUrl(url);
 		const id = randomUUID();
 		const view = new WebContentsView({
 			webPreferences: {
@@ -133,8 +193,12 @@ export class BrowserManager {
 				webSecurity: true,
 				allowRunningInsecureContent: false,
 				webviewTag: false,
+				// Chromium 内置 PDF 阅读器靠 plugins；不开启时打开 PDF 会变成空白页
+				plugins: true,
 			},
 		});
+		// 页面画出第一帧之前，视图露的是自己的背景色（默认白）：先铺成主题底色，新标签页才不会白闪一下
+		view.setBackgroundColor(this.chromeBackground());
 		const state: BrowserTab = {
 			id,
 			url: target,
@@ -156,6 +220,7 @@ export class BrowserManager {
 			debuggerAttached: false,
 		});
 		const wc = view.webContents;
+		this.installPasskeys(id, wc);
 		const update = () => {
 			if (this.disposed || this.tabs.get(id) !== record || wc.isDestroyed()) return;
 			state.url = wc.getURL() || state.url;
@@ -220,6 +285,14 @@ export class BrowserManager {
 		wc.on("context-menu", (_event, params) => {
 			this.options.onContextMenu?.(wc, params);
 		});
+		// F12 / Ctrl+Shift+I：页面拿着键盘焦点时外壳页收不到，所以在这里拦（见 toggleDevTools）
+		wc.on("before-input-event", (event, input) => {
+			if (input.type !== "keyDown") return;
+			const inspect = (input.control || input.meta) && input.shift && input.key.toLowerCase() === "i";
+			if (input.key !== "F12" && !inspect) return;
+			event.preventDefault();
+			this.toggleDevTools(id);
+		});
 		wc.on("did-start-loading", update);
 		wc.on("did-stop-loading", update);
 		wc.on("did-navigate", update);
@@ -231,17 +304,34 @@ export class BrowserManager {
 			const current = wc.getURL() || "";
 			// 自定义主题也盖内部页：外壳 / 面板在宿主那边注入，标签页归这里
 			if (this.isInternalPage(current)) void this.applyTheme(id, wc).catch(() => {});
-			if (!current.includes("shell.html") && !current.includes("newtab.html")) {
+			// 本地文件（PDF 阅读器是 Chromium 内部文档）不注入 dock / 滚动条 CSS / 下载圆钮：
+			// 这些脚本会挂到它的滚动容器上，实测让 PDF 滚动明显卡顿。
+			const isLocalFile = current.startsWith("file:");
+			const isWebsite = isWebUrl(current);
+			if (!isLocalFile && !this.isInternalPage(current)) {
 				try {
 					if (this.storage.getSettings().customScrollbar !== false) {
 						void wc.insertCSS(SCROLLBAR_CSS).catch(() => {});
 					}
-					if (this.storage.getSettings().smartDock !== false) {
-						void wc.executeJavaScript(DOCK_SCRIPT).catch(() => {});
+					// DOCK_SCRIPT 读不到时是空串（见 runtime/dock.ts 的单源说明），别白跑一次注入
+					if (DOCK_SCRIPT && this.storage.getSettings().smartDock !== false) {
+						void wc
+							.executeJavaScript(DOCK_SCRIPT)
+							.catch((error: unknown) => this.reportInjection(wc, "悬浮圆钮", error));
+					}
+					// 翻译脚本只对 http(s) 网站注入；preload 的 __piTranslate 窄桥也只在这些页面可用
+					if (isWebsite && TRANSLATE_SCRIPT) {
+						void wc
+							.executeJavaScript(TRANSLATE_SCRIPT)
+							.catch((error: unknown) => this.reportInjection(wc, "网页翻译", error));
 					}
 				} catch {}
+				// 下载圆钮不受 smartDock 管：它是「文件下来了」的提示，不是导航玩具
+				this.injectDownloads(wc);
 			}
-			void this.applyPageScripts(id).catch(() => {});
+			if (!isLocalFile) void this.applyPageScripts(id).catch(() => {});
+			// passkey：先确保本标签有平台认证器，再把属于这个站点的凭据装回去
+			if (isWebUrl(current)) void this.syncPasskeyCredentials(id, wc).catch(() => {});
 		});
 		wc.on("did-finish-load", () => {
 			update();
@@ -252,12 +342,25 @@ export class BrowserManager {
 						this.storage.addHistory(current, wc.getTitle());
 					} catch {}
 				}
-				if (!current.includes("shell.html") && !current.includes("newtab.html")) {
+				const isLocalFile = current.startsWith("file:");
+				if (!isLocalFile && !this.isInternalPage(current)) {
 					try {
-						if (this.storage.getSettings().smartDock !== false) {
-							void wc.executeJavaScript(DOCK_SCRIPT).catch(() => {});
+						if (DOCK_SCRIPT && this.storage.getSettings().smartDock !== false) {
+							void wc
+								.executeJavaScript(DOCK_SCRIPT)
+								.catch((error: unknown) => this.reportInjection(wc, "悬浮圆钮", error));
+						}
+						// 密码自动填充下拉：只对真网站注入（内部页没有登录表单，也不该拿到那条桥）
+						if (isWebUrl(current) && AUTOFILL_SCRIPT) {
+							void wc.executeJavaScript(AUTOFILL_SCRIPT).catch(() => {});
+						}
+						if (isWebUrl(current) && TRANSLATE_SCRIPT) {
+							void wc
+								.executeJavaScript(TRANSLATE_SCRIPT)
+								.catch((error: unknown) => this.reportInjection(wc, "网页翻译", error));
 						}
 					} catch {}
+					this.injectDownloads(wc);
 				}
 			}
 		});
@@ -283,6 +386,8 @@ export class BrowserManager {
 		if (contents) this.options.extensionHooks?.selectTab?.(contents);
 		this.mount();
 		this.changed();
+		// 这个页面可能早就加载完了（那时推的是彼时的下载状态），切回来时补推一次
+		if (contents) this.pushDownloads(contents);
 	}
 	closeTab(id: string): void {
 		const record = this.tabs.get(id);
@@ -330,6 +435,23 @@ export class BrowserManager {
 	reload(): void {
 		this.activeContents()?.reload();
 	}
+	/**
+	 * 开关某个标签页的开发者工具（默认当前标签，独立窗口打开不影响分栏布局）。
+	 *
+	 * 内置浏览器没有“另开一个真 Chrome”这条退路：网站自己出问题（验证码一直转圈、脚本报错）时，
+	 * 用户的控制台就在这——所以 F12 / Ctrl+Shift+I 由主进程直接接管（页面有焦点时也收得到），
+	 * 不依赖外壳页先拿到键盘事件。只给用户用，不挂到 agent 的浏览器工具上。
+	 */
+	toggleDevTools(tabId?: string): boolean {
+		const wc = tabId ? this.getWebContents(tabId) : this.activeContents();
+		if (!wc || wc.isDestroyed()) return false;
+		if (wc.isDevToolsOpened()) {
+			wc.closeDevTools();
+			return false;
+		}
+		wc.openDevTools({ mode: "detach" });
+		return true;
+	}
 	getTabs(): BrowserTab[] {
 		return [...this.tabs.values()].map(({ state }) => ({ ...state }));
 	}
@@ -364,6 +486,47 @@ export class BrowserManager {
 	getDownloads(): BrowserDownload[] {
 		return [...this.downloads.values()].map(({ state }) => ({ ...state }));
 	}
+	/**
+	 * 注入失败不再静默：站点把桥挡住 / 脚本在页面里抛错时，主进程日志里至少留一条。
+	 * 以前全是 `.catch(() => {})`，用户报「某个站整颗钮看不见」时一点线索都没有。
+	 */
+	private reportInjection(contents: WebContents, what: string, error: unknown): void {
+		if (this.disposed) return;
+		const target = contents.isDestroyed() ? "（页面已关闭）" : contents.getURL();
+		console.warn(`[browser] ${what}注入失败 ${target}：${messageOf(error)}`);
+	}
+	/**
+	 * 注入下载圆钮（页面右下角悬浮球里那一颗），并把当前状态补推给它：新文档里它是空的，
+	 * 不喂一次就不知道自己该不该出现（刚下来的文件在新页面上也该看得见）。
+	 */
+	private injectDownloads(contents: WebContents): void {
+		if (!DOWNLOADS_SCRIPT || contents.isDestroyed()) return;
+		void contents
+			.executeJavaScript(DOWNLOADS_SCRIPT)
+			.then(() => this.pushDownloads(contents))
+			.catch((error: unknown) => this.reportInjection(contents, "下载圆钮", error));
+	}
+	/**
+	 * 把下载状态推给页面里的圆钮（`browser/renderer/downloads.js`）。
+	 *
+	 * 只推一块视图：同一时刻只有活动标签的页面是可见的，后台标签等它被激活/重新加载时再补。
+	 * 方向是单向的（主进程 → 页面）：显示面不接受任何反向请求，唯一的后向能力是按 id 走
+	 * `__piDownloads.reveal` 请宿主在文件管理器里定位（见 `desktop/browser-host.ts`）。
+	 */
+	private pushDownloads(contents = this.activeContents()): void {
+		if (this.disposed || !DOWNLOADS_SCRIPT || !contents || contents.isDestroyed()) return;
+		const now = Date.now();
+		const list = this.getDownloads()
+			.filter((item) => {
+				if (item.state === "progressing") return true;
+				return now - (this.downloads.get(item.id)?.finishedAt ?? 0) < DOWNLOAD_NOTICE_MS;
+			})
+			.slice(-DOWNLOAD_NOTICE_LIMIT)
+			.reverse();
+		void contents
+			.executeJavaScript(`window.__PI_DOWNLOADS__ && window.__PI_DOWNLOADS__.update(${scriptLiteral(list)})`)
+			.catch(() => {});
+	}
 	listBookmarks(): ReturnType<BrowserStorage["listBookmarks"]> {
 		return this.storage.listBookmarks();
 	}
@@ -379,7 +542,10 @@ export class BrowserManager {
 		return this.storage.getSettings();
 	}
 	saveSettings(value: unknown): boolean {
+		const before = this.storage.getSettings().theme;
 		const result = this.storage.saveSettings(value);
+		// 换主题要连「还没画出来的那块」一起换：只改 CSS 的话，浅色主题下新建标签页仍会先闪一帧深色
+		if (this.storage.getSettings().theme !== before) this.paintChrome();
 		this.changed();
 		return result;
 	}
@@ -735,6 +901,11 @@ export class BrowserManager {
 			await this.removeCdpScript(dbg, identifier);
 		}
 		if (!wanted.length) {
+			// passkey 还要用同一个调试器（虚拟认证器绑在 CDP 会话上），不能因为它没脚本就拆掉
+			if (this.passkeyDebuggable.has(wc)) {
+				state.debuggerAttached = false;
+				return;
+			}
 			if (state.debuggerAttached && dbg.isAttached()) {
 				try {
 					dbg.detach();
@@ -799,6 +970,108 @@ export class BrowserManager {
 		}
 	}
 
+	/**
+	 * 给标签挂一个“平台认证器”（CDP 虚拟认证器）：网站看到的 `isUVPAA()` / `passkeyPlatformAuthenticator`
+	 * 就是它。Electron 自己不提供 Windows Hello 那层实现（见 docs/architecture-browser.md），
+	 * 所以 passkey 的生成/断言全在 Chromium 内部完成，私钥由我们加密保管。
+	 */
+	private installPasskeys(tabId: string, wc: WebContents): void {
+		const dbg = (wc as unknown as { debugger?: Electron.Debugger }).debugger;
+		if (!dbg || typeof dbg.sendCommand !== "function") return;
+		this.passkeySessions.set(tabId, { enabled: false, gateInjected: false, authenticatorId: null });
+		if (typeof dbg.on === "function")
+			dbg.on("message", (_event: Electron.Event, method: string, params: Record<string, unknown>) => {
+				this.handlePasskeyEvent(tabId, wc, method, params);
+			});
+	}
+
+	/** 确保本标签的虚拟认证器已就位（可能要在先 attach 调试器），返回它的 id。 */
+	private async ensurePasskeyAuthenticator(tabId: string, wc: WebContents): Promise<string | null> {
+		const session = this.passkeySessions.get(tabId);
+		const dbg = (wc as unknown as { debugger?: Electron.Debugger }).debugger;
+		if (!session || !dbg || typeof dbg.sendCommand !== "function" || wc.isDestroyed()) return null;
+		try {
+			if (!dbg.isAttached()) {
+				dbg.attach("1.3");
+				this.passkeyDebuggable.add(wc);
+			}
+			if (!session.enabled) {
+				await dbg.sendCommand("WebAuthn.enable", { enableUI: false });
+				session.enabled = true;
+			}
+			if (!session.gateInjected && PASSKEY_GATE_SCRIPT) {
+				// 闸门要赶在页面脚本之前装：document-start 注入 + 当前这份文档补一次
+				session.gateInjected = true;
+				try {
+					await dbg.sendCommand("Page.enable");
+					await dbg.sendCommand("Page.addScriptToEvaluateOnNewDocument", { source: PASSKEY_GATE_SCRIPT });
+				} catch {}
+				try {
+					await wc.executeJavaScript(PASSKEY_GATE_SCRIPT);
+				} catch {}
+			}
+			if (!session.authenticatorId) {
+				const added = (await dbg.sendCommand("WebAuthn.addVirtualAuthenticator", {
+					options: PASSKEY_AUTHENTICATOR,
+				})) as { authenticatorId?: string };
+				if (!added?.authenticatorId) return null;
+				session.authenticatorId = added.authenticatorId;
+			}
+			return session.authenticatorId;
+		} catch {
+			return null;
+		}
+	}
+
+	/** 进新页面时把属于这个 host 的凭据装进虚拟认证器（换站就换成那家的）。 */
+	private async syncPasskeyCredentials(tabId: string, wc: WebContents): Promise<void> {
+		const url = wc.getURL();
+		const origin = webOrigin(url);
+		if (!origin) return;
+		const authenticatorId = await this.ensurePasskeyAuthenticator(tabId, wc);
+		if (!authenticatorId) return;
+		const dbg = (wc as unknown as { debugger?: Electron.Debugger }).debugger;
+		if (!dbg || typeof dbg.sendCommand !== "function") return;
+		let entries: StoredPasskey[] = [];
+		try {
+			entries = passkeysForHost(this.storage.listPasskeys(), new URL(url).hostname);
+		} catch {
+			// safeStorage 不可用：没有可装的凭据，但藏读器仍可让网站自己注册（注册后也存不进）
+			entries = [];
+		}
+		// 先清空再装：导航可能换了站点，旧站点的凭据不该留在新页面的认证器里
+		try {
+			await dbg.sendCommand("WebAuthn.clearCredentials", { authenticatorId });
+		} catch {}
+		for (const entry of entries) {
+			try {
+				await dbg.sendCommand("WebAuthn.addCredential", { authenticatorId, credential: toCdpCredential(entry) });
+			} catch {}
+		}
+	}
+
+	/** CDP 事件：网站刚注册了一把新 passkey，或刚用已有的登录（signCount 会涨）。 */
+	private handlePasskeyEvent(tabId: string, wc: WebContents, method: string, params: Record<string, unknown>): void {
+		const session = this.passkeySessions.get(tabId);
+		if (!session?.authenticatorId || params?.authenticatorId !== session.authenticatorId) return;
+		if (method !== "WebAuthn.credentialAdded" && method !== "WebAuthn.credentialAsserted") return;
+		const credential = params?.credential as CdpCredential | undefined;
+		if (!credential?.credentialId || !wc || wc.isDestroyed()) return;
+		try {
+			const current = this.storage.listPasskeys();
+			if (method === "WebAuthn.credentialAdded") {
+				const entry = passkeyFromCredential(credential, webOrigin(wc.getURL()));
+				if (!entry) return;
+				this.storage.savePasskeys(upsertPasskey(current, entry));
+				return;
+			}
+			const index = current.findIndex((item) => item.credentialId === credential.credentialId);
+			if (index < 0) return;
+			current[index] = { ...current[index], signCount: credential.signCount };
+			this.storage.savePasskeys(current);
+		} catch {}
+	}
+
 	dispose(): void {
 		if (this.disposed) return;
 		for (const [tabId, state] of this.scriptRuns) {
@@ -811,6 +1084,7 @@ export class BrowserManager {
 			}
 		}
 		this.scriptRuns.clear();
+		this.passkeySessions.clear();
 		this.sessionScripts.clear();
 		this.persist();
 		this.disposed = true;
@@ -826,6 +1100,19 @@ export class BrowserManager {
 	}
 	private ensureAlive(): void {
 		if (this.disposed) throw new Error("Browser manager is disposed");
+	}
+	/** 视图 / 窗口的基线底色：页面还没画出任何像素时露出来的就是这一块（单源见 `palette.ts`）。 */
+	private chromeBackground(): string {
+		return themeBackground(this.storage.getSettings().theme);
+	}
+	/** 把当前主题底色铺到窗口与所有标签视图上（建窗口时一次，换主题时再来一次）。 */
+	private paintChrome(): void {
+		if (this.disposed) return;
+		const background = this.chromeBackground();
+		if (!this.options.window.isDestroyed()) this.options.window.setBackgroundColor(background);
+		for (const record of this.tabs.values()) {
+			if (!record.view.webContents.isDestroyed()) record.view.setBackgroundColor(background);
+		}
 	}
 	private mount(): void {
 		if (this.disposed || this.options.window.isDestroyed()) return;
@@ -902,13 +1189,15 @@ export class BrowserManager {
 			receivedBytes: 0,
 			totalBytes: item.getTotalBytes(),
 		};
-		const record = { state, item: item as DownloadItem | undefined };
+		const record = { state, item: item as DownloadItem | undefined, finishedAt: 0 };
 		this.downloads.set(state.id, record);
 		const onUpdate = (_event: Electron.Event, status: "progressing" | "interrupted") => {
 			state.state = status;
 			state.receivedBytes = item.getReceivedBytes();
 			state.totalBytes = item.getTotalBytes();
+			if (status !== "progressing") record.finishedAt = Date.now();
 			this.changed();
+			this.pushDownloads();
 		};
 		item.on("updated", onUpdate);
 		item.once("done", (_event, status) => {
@@ -917,8 +1206,11 @@ export class BrowserManager {
 			state.state = status;
 			state.receivedBytes = item.getReceivedBytes();
 			state.totalBytes = item.getTotalBytes();
+			record.finishedAt = Date.now();
 			this.changed();
+			this.pushDownloads();
 		});
 		this.changed();
+		this.pushDownloads();
 	};
 }

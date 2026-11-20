@@ -1,8 +1,10 @@
 import { startTurnTiming, finishTurnTiming } from "../turn-timing.js";
+import { sleep } from "../async-utils.js";
 import { DEFAULT_DSH_CAPABILITIES } from "../engine-capabilities.js";
 import { conversationRowKind } from "../conversation-rows.js";
 import type { AgentEngineCapabilities } from "../protocol.js";
 import { mergeQuickAskSettings, normalizeQuickAskSettings, type QuickAskSettings } from "../quick-ask-settings.js";
+import { normalizeBotDraftSettings } from "../bot-draft-settings.js";
 import { captureQuickAskConversation } from "../quick-ask-context.js";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
@@ -609,7 +611,7 @@ export class DshClientSession {
 			} catch (err) {
 				lastErr = err;
 				if (i === delays.length) break;
-				await new Promise((r) => setTimeout(r, delays[i]!));
+				await sleep(delays[i]!);
 			}
 		}
 		throw lastErr;
@@ -3743,6 +3745,7 @@ export class DshClientSession {
 			this.cachedPromptSections.length > 0 ? this.cachedPromptSections : this.buildFallbackPromptSections();
 		const settings: UiSettingsState = {
 			nativeCliInheritModel: { ...this.stateStore.getSettingsSnapshot(this.clientId).nativeCliInheritModel },
+			...normalizeBotDraftSettings(this.stateStore.getSettingsSnapshot(this.clientId)),
 			...normalizeQuickAskSettings(this.stateStore.getSettingsSnapshot(this.clientId)),
 			steeringMode: "all",
 			followUpMode: "all",
@@ -3839,6 +3842,7 @@ export class DshClientSession {
 		quickAskThinking?: QuickAskSettings["quickAskThinking"];
 		quickAskSystemPrompt?: QuickAskSettings["quickAskSystemPrompt"];
 		quickAskExplainPrompt?: QuickAskSettings["quickAskExplainPrompt"];
+		quickAskTranslateModel?: QuickAskSettings["quickAskTranslateModel"];
 		quickAskTranslateEnabled?: QuickAskSettings["quickAskTranslateEnabled"];
 		quickAskTranslateTarget?: QuickAskSettings["quickAskTranslateTarget"];
 		quickAskTranslateStyle?: QuickAskSettings["quickAskTranslateStyle"];

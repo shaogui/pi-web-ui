@@ -29,7 +29,11 @@ BrowserWindow 的 webContents 加载本地 shell.html，标签与专用 Agent �
 
 启动模式 = `BrowserSettings.defaultMode`（`agent` 默认 / `browser` / `split`）。两个入口写同一份设置：浏览器设置 → 启动模式，以及应用设置弹窗 →「桌面应用」页（仅桌面壳可见，经 `pi-desktop:browser-get/set-startup-mode` 走宿主 IPC）。运行期切换只改当前会话，不写回设置；旧版本存过的 `mode`（上次使用的模式）在首次读取时迁移为 `defaultMode`，老用户升级后启动行为不变。agent / split 启动时 Agent 首帧就绪前不显示 Agent 视图，由 shell 渲染 `pb-boot` 占位（含失败原因与「切换到浏览器模式」出口），就绪后再交给 Agent 视图并聚焦。
 
+**首帧底色：新标签页不许白闪**。`WebContentsView` 在页面画出第一帧之前只露自己的背景色，Electron 的默认值是白色——新建标签页时那块空白先白一帧、再变成新标签页的深色，观感就是「闪白屏」。所以这块颜色归主进程管：`browser/runtime/palette.ts` 给出 `dark` / `midnight` / `light` 三个主题的底色（与 `browser/renderer/browser.css` 的 `--pb-bg-main` 逐值对应，`tests/unit/browser-palette.test.ts` 读 CSS 校验），`BrowserManager` 建标签视图时铺给视图、构造与 `saveSettings` 换主题时铺给窗口（外壳页 `body` 是透明的，没被视图盖住的地方露的就是窗口这块）；渲染层 `html, body` 也直接取 `--pb-bg-main`，`body.pb-*` 的渐变再叠上来。新增「要等脚本才画出来」的内部页照这条路走，别只依赖 DOM 里的类名。
+
 切换模式复用同一个视图并更新可见性、边界和焦点，不重载页面。隐藏页保留有效尺寸，不缩成 1×1。标签关闭时关闭对应 WebContents；应用关闭时清理标签、下载、Agent 和挂起通道。
+
+**开发者工具是用户的逃生口**：内置浏览器没有「另开一个真 Chrome」这条退路，网站自己出问题（验证码一直转圈、脚本报错）时控制台就在这里。`F12` / `Ctrl+Shift+I` 两条路都开当前标签页的 DevTools（独立窗口，不影响分栏布局）：页面拿着键盘焦点时由 `BrowserManager.createTab` 里的 `before-input-event` 接管（外壳页根本收不到那个键），焦点在外壳（地址栏 / 面板）时由 `shell.ts` 的 keydown 发 `devtools.toggle`；两条最终都落到 `BrowserManager.toggleDevTools()`（空 id 回退当前标签，已开着就关）。**这只给用户用**：agent 的浏览器工具没有这条通道，自动注入脚本也不该借用它。
 
 原生视图不能被普通 DOM 的 z-index 覆盖，所以外壳面板（书签 / 历史 / 下载 / 设置 / 扩展）**不再用 DOM 浮层 + 隐藏内容区**：一块面板 = 一个 `panel.html` 视图（`WebContentsView`），比页面视图晚加入 `contentView` 即盖在它上面，宿主按面板自己回报的尺寸把它摆成工具栏下沿、贴窗口右侧的一块矩形（`desktop/browser-policy.ts` 的 `panelLayerBounds`）。矩形之外的网页与 Agent 分栏照常可见、可点——这正是修「一点开插件列表，页面和聊天全变黑」的地方。
 
@@ -38,10 +42,15 @@ BrowserWindow 的 webContents 加载本地 shell.html，标签与专用 Agent �
 - 面板里的动作要「先办事再收面板」（导航、开扩展页）：视图销毁会带走后面那次 IPC。
 - 内部标签页（新标签页等）自己的浮层仍用本页 DOM：`dialog.show()` 而不是 `showModal()`——不要 `::backdrop` 遮罩、不把整窗变 inert，点面板外或 Esc 收起（`browser/renderer/panels.ts` 的 `handleOutsidePointer`/`handlePanelEscape`）。
 - `overlay` 动作现在只服务外壳的搜索浮层：那是盖满整块内容区的 DOM 浮层，内容视图得让位，和面板是两回事。
+- **新标签页一打开光标就在搜索框里**：`browser/renderer/newtab.ts` 先在本页 `focus()`，再发 `call("focus")` 请宿主把键盘焦点切过来——只做 DOM 聚焦时按键还是进外壳页。宿主的 `focus` 分支只接受「发送方＝当前活动标签」（`sender === getWebContents(activeTabId)`），agent 模式与地址浮层开着时直接拒：启动恢复是多标签同时加载，后台标签的请求不能把焦点从前台标签抢走。
+
+**新标签页导航就是书签树**：默认页不再把收藏拍平成一排胶囊，而是照书签树的层级画格子（`browser/renderer/newtab.ts` 的 `unified-nav` + `browser.css` 的 `.unified-nav*` / `.unified-tile*`）：文件夹是可进的一格（点进去看它的内容，面包屑与 `Esc` / `Backspace` 逐级退回），书签是一格直达。层级只记「文件夹名链」，刷新后重走一遍，被删 / 改名的文件夹自动退到最近还能走到的一层；数据仍只有 `bookmarks.list` 一个源，与书签面板（`panels.ts` 的 `bookmarksPanel`）读同一棵 `{name,type,children}` 树。
 
 Agent 可通过 `piDesktop.browser` 与宿主同步模式与标签状态。
 
 窗口拖拽区（`-webkit-app-region`）不能挂在会消失的布局产物上：Agent 顶栏原先只靠 `.tb-spacer` 供拖拽，而窄分栏进手机视图后媒体查询把 spacer 收成 `display: contents`（无盒子＝无拖拽区），整个头部就再也拖不动窗口。现在 `body.is-desktop .topbar-flow` 自身声明 `drag`，交互条目逐条 `no-drag`，与 spacer 是否存在无关；回归守卫见 `tests/unit/desktop-agent-input-regions.test.ts`。
+
+拖拽区还必须覆盖**整个顶栏盒子**：只给 `.topbar-flow`（控件行）供拖拽时，`.topbar` 自己的 `padding: 10px 16px` 是 `no-drag`，窗口最顶端那 4~6px 又被 Windows 原生 resize 边框（无边框窗口保留的可调大小边）吃掉，两条叠起来就是一条按下去毫无反应的死带——用户从窗口上沿按下拖不动，必须往下挪一点。现在 `body.is-desktop .topbar` 是 `drag`，顶栏里非按钮的直接子节点（`.plugin-topbar-more` / `.plugin-topbar-menu`）一并补进 `no-drag` 清单。窗口最顶端那几像素的 resize 边框属于 Electron/Windows 原生行为，CSS 改不了。
 
 ## 本地与远端 Web Agent
 
@@ -107,6 +116,15 @@ Electron 44 的扩展上下文只认 **15 个命名空间**（`action alarms dec
 
 浏览器文件与 session 位于 Electron userData/browser；Agent 原有数据目录继续使用原配置。凭据使用 Electron safeStorage，安全加密后端不可用时拒绝保存。保险箱可由用户明确选择填写当前网站，主进程与页面内都检查精确 origin，不自动提交表单。旧 AI Browser 数据可由用户选择旧目录导入，存在的目标文件不会覆盖；导入错误单列报告。
 
+## 书签导入（其他浏览器 → 内置浏览器）
+
+书签面板工具条的「导入书签」→ `bookmarks.import`。**选文件、读盘、解析、合并全在主进程**（`desktop/browser-host.ts`）：导出文件动辄几 MB，渲染层从来不需要正文，回执只有 `{ imported, duplicate, skipped }` 三个数字，与 `passwords.import` / `data.import` 同一条口径。纯逻辑在 `browser/runtime/bookmarks-import.ts`（`parseBookmarks` / `mergeBookmarks`）。
+
+- **认这些文件**：Chrome / Edge / Firefox / Safari 导出的 Netscape 书签 HTML（`<DL>` 分层、`<H3>` 是文件夹名、`<A HREF>` 是书签，实体与 `<DT>`/`<DD>` 噪声都处理）、Chrome 的 `Bookmarks` 数据文件（`{roots:{bookmark_bar,other,…}}`）、Firefox 的 JSON 备份（`uri` + `text/x-moz-place*`），兼容本仓库自己的 `{name,type,children}` 树。判文件夹只看有没有 `children` 数组、判书签只看有没有 `url`/`uri`——各家的 `type` 取值互不兼容，认它会把另一家的文件读空。首字符是 `[`/`{` 就必须是合法 JSON（解析失败直接报错，不静默读出 0 条）。
+- **只认 http(s)**：`javascript:` / `place:` / `chrome://` / 带内嵌账号密码的 URL 一律计 `skipped`，与 `BrowserStorage.saveBookmarks` 的校验同一口径（`isWebUrl`），导入不是绕过校验的后门。空文件夹随导入一起丢掉（备份里的备份常只剩空壳）。
+- **导入不覆盖、不重排**：树里已有同一 URL（忽略首尾空白与末尾斜杠；文件内自己重复也算）→ `duplicate`，丢弃；根为空时新条目直接成为根内容，根非空时整块套一层带日期的文件夹（名字由渲染层按界面语言传入 `{ folderName }`），用户原有的文件夹不会被拆开或改名。一个能进的都没有就**不写盘**，界面提示「这个文件里没有可导入的书签」。
+- **上限**：文件 8MB、条目 20000 条、目录限深 30 层（`browser/storage/index.ts` 读回时同一条限深）、条目名 512 字符（截断而不是丢掉），超出部分计入 `skipped`。UI 侧回归见 `browser/renderer/verify-ui.mjs`，纯函数与合并策略见 `tests/unit/browser-bookmarks-import.test.ts`。
+
 ## 页面脚本注入（Agent → 网页）
 
 Agent 可以给网页注入脚本：`browser_script` 工具（`server/browser-script-tool.ts`）→ `page_request`（`op: "script.list|status|create|update|remove|enable|disable|run"`）→ `desktop/browser-host.ts` 校验调用方 → `browser/automation/scripts.ts` → `BrowserManager`。线协议不新增字段（`op` 仍是字符串），主进程侧才真正注入。
@@ -126,7 +144,7 @@ Agent 可以给网页注入脚本：`browser_script` 工具（`server/browser-sc
 
 ### 共同交互（设计 C：图标工具条）
 
-- **动作只在顶部一行**：面板不给条目挂按钮，动作统一收进标题栏的动作槽（`panels.ts` 的 `.pb-dialog-actions`）。按钮纯图标（无障碍名走 `aria-label`），名字靠 `data-tip` 的 CSS 悬浮气泡（`title` 留空，避免原生提示叠加）；最右两个图标用 `data-tip-end` 贴右对齐，免得被浮层圆角裁掉。工具条随标签切换：密码是 `添加 ｜ 填入 / 显示密码 / 编辑 / 删除`，TOTP 是 `扫码 / 导入图片 / 添加 ｜ 填入 / 导出此条 / 导出全部 / 改名 / 上移 / 下移 / 删除`。
+- **动作只在顶部一行**：面板不给条目挂按钮，动作统一收进标题栏的动作槽（`panels.ts` 的 `.pb-dialog-actions`）。按钮纯图标（无障碍名走 `aria-label`），名字靠 `data-tip` 的 CSS 悬浮气泡（`title` 留空，避免原生提示叠加）；最右两个图标用 `data-tip-end` 贴右对齐，免得被浮层圆角裁掉。工具条随标签切换：密码是 `添加 / 导入 CSV ｜ 填入 / 显示密码 / 编辑 / 删除`，TOTP 是 `扫码 / 导入图片 / 添加 ｜ 填入 / 导出此条 / 导出全部 / 改名 / 上移 / 下移 / 删除`。
 - **先选中再操作**：点条目或键盘 ↑↓ 选中，工具条作用于选中那条；没选中时动作图标 `disabled`（灰度、`::after` 气泡不弹），首尾两端的上/下移也置灰。命中当前标签页的条目打开即选中并置顶，所以「打开面板 → 点填入」两下就完事。`Enter` 填到页面；TOTP 标签的 `Shift+Enter` 复制验证码、密码标签的是显示/收起密码。
 - 设置面板里的「密码库」段只留一句说明和一个入口（`vaultSection`），真正的增删改都在这里，避免两处各维护一套列表。
 - 面板浮层视图（`panel.html`，`body.pb-panel-layer`）是第三套根：`[hidden]` 的全局豁免名单里必须带上它，否则 `.pb-form{display:flex}` 之类的规则会把 `hidden=true` 的表单照样画出来（「添加」表单默认展开的 bug 就出在这里）。
@@ -134,9 +152,40 @@ Agent 可以给网页注入脚本：`browser_script` 工具（`server/browser-sc
 ### 密码
 
 - **列表不下发明文**：`passwords.list` 返回投影 `{ id, name, url, username, createdAt, hasPassword }`（主进程 `browser-host.ts` 里去掉 `password`），和 TOTP 的「secret 不出主进程」同一条口径。要明文只有两条口子：`passwords.reveal { id }`（用户点「显示密码」时取一次，界面 10 秒后自动盖回）和 `passwords.fill`（主进程内部取出来直接填页面，明文不经过渲染层）。
-- **写回只走细粒度动作**：`passwords.upsert { id?, name, url, username, password? }`（`id` 存在即更新，`password` 留空表示沿用旧密码）与 `passwords.remove { id }`。渲染层拿不到整份明文，所以不能让它 `save` 全量列表——旧的 `passwords.save` 只保留给冒烟测试/迁移用。
-- **填密码校验同源**：`passwords.fill` → `fillCredential()`，要求当前标签页与条目 `url` 的 **origin 完全相等**，且页面上只有一个可见密码框；填完只发 `input`/`change`，由用户自己点提交。
+- **写回只走细粒度动作**：`passwords.upsert { id?, name, url, username, password? }`（`id` 存在即更新，`password` 留空表示沿用旧密码；`username` 可以留空——路由器这类登录框只要密码）与 `passwords.remove { id }`。渲染层拿不到整份明文，所以不能让它 `save` 全量列表——旧的 `passwords.save` 只保留给冒烟测试/迁移用。
+- **整份 CSV 导入走主进程**：工具条的导入图标发 `passwords.import`（无参数），宿主自己 `dialog.showOpenDialog` 选文件、读盘、解析后合并，回执只有 `{ imported, updated, duplicate, skipped }` 四个数字——这份 500 行明文从不经过渲染层，与「list 不下发明文」同一条口径。解析/合并纯逻辑在 `browser/runtime/credentials-csv.ts`（`parseCredentialCsv` / `mergeCredentials`）：RFC 4180 引号与 `""` 转义、BOM、CRLF、制表符分隔、表头同义词白名单（Chrome / Edge / Bitwarden / 1Password / LastPass 的列名）都会被认，认不出表头就按 `名称,网址,账号,密码` 的位置取；缺密码或网址不是 http(s) 的整行算 `skipped`，绝不半条入库。**同网址同账号（大小写不敏感）就是同一条**：密码不同视为「文件里的更新」覆盖旧值并计入 `updated`，完全一致计入 `duplicate`。文件上限 8MB / 5000 行。
+- **填密码校验同源**：`passwords.fill` → `fillCredential()`，要求当前标签页与条目 `url` 的 **origin 完全相等**，且页面上只有一个可见密码框；填完只发 `input`/`change`，由用户自己点提交。账号框的站位顺序：`autocomplete="username"` → `type=email` → **密码框前面最近的那个文本框**；不能按文档里第一个文本框挑（页头搜索框会被当成账号框）。
+- **点输入框就出下拉（浏览器式自动填充）**：页面注入脚本 `browser/renderer/autofill.js`（`browser/runtime/autofill.ts` 读源码、`manager.ts` 在 `dom-ready`/`did-finish-load` 只对 http(s) 页面注入，与 `dock.js` 同一条路），聚焦账号/密码框时发 `lookup()` → 主进程按**发送方 frame 的 origin** 过滤出候选，只回 `{ id, name, username }`（无明文）；点一条就 `pick(id)` → 主进程用同一个 `fillCredential()` 填。两条口径不破：**明文永不下到页面脚本**（页面只能主动“请主进程填”），且只认 `isTrusted` 的焦点/点击（合成事件一律不弹、不填）。桥在 `browser/preload.cts`（`__piAutofill`）——网页拿到它也只能填自己这个 origin 的凭据，主进程两边都再校一次 session + frame origin。
 - 加密仍然走 `BrowserStorage` 的 `enc:<safeStorage>`，`passwords.available`（= `isEncryptionAvailable()`）为假时面板显示保险库锁定。
+
+### 悬浮 Dock（右下角刷新圆钮）
+
+注入在每个页面右下角的一颗圆钮：单击刷新、悬停展开前进/后退/收藏/复制 Markdown，可拖动（位置存 `localStorage.__aib_dock_pos`），`smartDock` 开关可整体关掉。**功能不难，难的是「某些网站上看不见」**——六条底线都写在 `browser/renderer/dock.js` 头部注释里：
+
+- **宿主挂在 top layer**：`popover="manual"` + `showPopover()`，圆钮不参与页面的层叠上下文，所以站点的 z-index 战争（包括同样用 `2147483647` 的全屏遮罩）、祖先 `transform`/`filter`/`contain` 造成的「`position:fixed` 退化成相对定位」、`overflow:hidden` 的裁剪统统影响不到它。UA 给 popover 的 `fit-content`/`margin:auto`/`overflow:auto` 一律用 inline `!important` 盖回「铺满视口 + `pointer-events:none`」；**开不出来就摘掉 `popover` 属性**退回普通 `fixed`（否则 `[popover]:not(:popover-open){display:none}` 反而会把钮藏掉）。
+- **全屏之后重排**：`fullscreenchange` 里 `hidePopover()` / `showPopover()`，圆钮即排到顶层末尾，压在视频/全屏元素之上（看门狗每秒补一次，防页面吞掉事件）。
+- **被摘掉就挂回去**：MutationObserver 盯 `documentElement` 与 `body` 的直接子节点（SPA 清空 body、换掉整个 body），加 1 秒一次的看门狗：页面 `hidePopover()`、`remove()` 宿主、把宿主 inline 样式改成 `display:none`，最迟下一拍自己恢复。
+- **不碰 `innerHTML`、不建 TT policy**：Google 系站点开着 `require-trusted-types-for 'script'` 且限制 policy 名，`createPolicy()` 也建不出来——旧实现 `setMarkup()` 一失败整颗钮连按钮都没有（这才是「某些网站看不见」最常见的原因）。现在整段 DOM 走 `createElement`/`createElementNS`；样式优先 `adoptedStyleSheets`（构造式样式表不吃页面 CSP `style-src`），拿不到才退回 `<style>`。
+- **位置按当前视口夹一遍**：拖出来的坐标按 origin 存在 `localStorage.__aib_dock_pos`，宽窗口拖到右下、换窄窗口（分栏 / 还原 / 小屏）恢复时就成了屏幕外——**「只有某个站整颗钮看不见」最常见的成因**。恢复与拖动都走同一个 `clampPosition()`，`resize` 之后再夹一次并写回。
+- **一列钮一样大、悬停不放大、不被边缘切掉**：主钮 / 展开菜单钮 / 插槽里的下载钮（`.pi-dl-fab`）统一 32px、图标统一 15px，悬停只换底色，`transform: scale()` 从 hover 和 `dock-pulse` 呼吸态里全删（列宽一抖就点不准）。纵向摆位跟着视口算：默认主钮在下、菜单往上长；主钮贴顶边时整列翻转（`.dock-flip` 的 `column-reverse` + 把锚点从 `bottom` 换成 `top`），主钮留在原处、菜单往下长；两边都装不下（窗口比一列还矮）才把 `--dock-menu-max` 压到真实空间并让菜单自己滚——**任何状态下都不把按钮交给视口边缘去切**。翻不翻转只由 `place()` 一处裁定，拖动 / `resize` / 下载钮冒出来（`reposition()`）都走它；回归：`tests/unit/browser-dock-layout.test.ts`。
+- **可见性自愈**：看门狗每秒不只查「还在 DOM 里」，还查 `getBoundingClientRect()` 有没有面积、`display/visibility/opacity` 有没有被站点改过；看不见就先按标准样式重建一次，再不行摘掉 `popover` 退回普通 `fixed`。
+- **不透明**：`.dock-container` 以前空闲态 `opacity: 0.35`，在浅色站上几乎看不见；刷新钮是要被找到并点的，现在恒为全不透明。
+- **内部页判据连协议一起判**：`location.protocol === "file:" && /(?:^|/)(?:shell|newtab).html$/i`——只看 pathname 会把 `github.com/<owner>/<repo>/blob/main/browser/renderer/shell.html` 这类正常网页当成内部页（主进程侧的注入闸门同一口径，见 `manager.ts` 的 `isInternalPage()`）。
+- **插槽**：`window.__AIB_DOCK__.slot(id)` 给下载圆钮留位（见下一节），让它和刷新钮同列、一起拖动。
+- **残留边界**：站点 `showModal()` 的 `<dialog>` 打开期间，页面把其他内容设成 inert——圆钮仍画在它上面，但点不动，`dialog` 一关就恢复；这是 Chromium 的定数，页面注入赢不了。
+- **单源**：注入源码只有 `browser/renderer/dock.js` 一份，`browser/runtime/dock.ts` 只负责按候选路径读文件（读不到返回空串 + 告警），不再留会跑偏的内联复制品；`scripts/build-browser.mjs` 的 `filesToCopy` 必须带上它。回归：`tests/unit/browser-dock.test.ts`。
+
+### 下载圆钮（并进右下角悬浮球）
+
+站内点下载时主进程直接落盘，页面上一点反馈都没有：用户既不知道下没下完，也不知道存哪去了。现在下载钮**住在右下角悬浮球那一列**：
+
+- **摆在哪**：`browser/renderer/downloads.js` 通过 `window.__AIB_DOCK__.slot("downloads")`（`browser/renderer/dock.js` 暴露的插槽）把自己挂进刷新钮上方，跟着刷新钮一起摆、一起拖动；`smartDock` 关掉时退回自建宿主（仍在右下角），功能不受影响。**没有下载任务就整颗收起**，有任务才和刷新钮一起出现。
+- **谁注入**：`browser/runtime/downloads.ts` 按 dock 的同一套候选路径读源码，`manager.ts` 在 `dom-ready` / `did-finish-load` 注入。它**不受 `smartDock` 开关管**——那是导航玩具的开关，这是「文件下来了」的状态提示；内部页不注入，与 dock 同一口径（判据是 `manager.ts` 的 `isInternalPage()` 与页面里的 `location.protocol === "file:"`，**不再拿 pathname 子串判**，否则 `github.com/<owner>/<repo>/blob/main/browser/renderer/shell.html` 这种正常网页会被误杀）。`scripts/build-browser.mjs` 的 `filesToCopy` 要带上这份文件，漏了装包后就没有提示。
+- **显示什么**：角标 = 进行中数量；点开列最近 8 条（文件名 + 进度条 + 状态）。新任务出现时自动亮出面板，几秒后自己收起。已完成的行给两颗药丸：**打开文件夹**（在系统文件管理器里定位）与**复制路径**（剪贴板被站点策略挡住就把路径摊开显示，不假装成功）。
+- **状态是单向下推**：`manager.ts` 的 `pushDownloads()` 只推当前活动标签（同一时刻只有它那块视图可见），切标签与「新文档注入完」各补推一次；已结束的任务只在 30 秒内继续推（`DOWNLOAD_NOTICE_MS`），否则每打开一个页面都会把上次那个「已完成」再亮一遍。载体是 `executeJavaScript` 里的一句 `window.__PI_DOWNLOADS__.update(<json>)`，字面量经 `scriptLiteral()` 转义（文件名是网站给的，` ` / `<` 这类字符必须在这里消化）。
+- **能力边界（一条窄桥）**：脚本跑在网站的主世界，网页任何脚本都能调它，所以反向只有一个动作——`window.__piDownloads.reveal(id)`（`browser/preload.cts` 暴露）。**只传 id**：路径由主进程按自己的下载记录解析，只认 `state === "completed"`，发送方必须是浏览器 session 里的网站 frame（`browser-host.ts` 的 `webFrameOrigin()`），落点固定是 `shell.showItemInFolder()`——页面既拿不到任意路径，也没有执行文件的能力。可信外壳的「下载」面板另有 `download.open`（执行）与 `download.reveal`（定位）两个动作。
+- 注入失败不再静默：`manager.ts` 的 `reportInjection()` 把「某站注入失败 + URL + 原因」写进主进程日志，用户报「某站看不见」时有据可查。
+- 回归：`tests/unit/browser-downloads-notice.test.ts`（注入脚本可取 / 打包清单 / 插槽挂载 / 无 innerHTML / 窄桥只收 id / 内部页判据 / 只推活动标签 / 字面量转义）。
 
 ### TOTP
 
@@ -149,6 +198,20 @@ Agent 可以给网页注入脚本：`browser_script` 工具（`server/browser-sc
 - 排序（`totp.reorder`）、改名/改绑定（`totp.update`）、删除（`totp.remove`）都在工具条上，写回同一份加密文件；列表顺序就是 `order` 字段，未列出的条目在重排后保留在尾部，不丢数据。
 - 纯逻辑（Base32/HOTP/TOTP 的 RFC 6238 向量、otpauth 各种变体、投影、排序、origin 匹配、二维码位图解码）全在 `tests/unit/totp.test.ts`，不依赖 Electron。
 
+## Passkey（WebAuthn）
+
+**先说限制**：Electron 自己**不提供平台认证器**（Windows Hello / 手机扫码 hybrid）——这部分在 Chromium 里属于 chrome/ 层（谁弹 UI、什么时候调 `webauthn.dll`），Electron 只编 content/device 层，所以默认情况下页面看到的是 `isUserVerifyingPlatformAuthenticatorAvailable() === false`、`passkeyPlatformAuthenticator === false`，GitHub 这类站点会直接报 “this browser is reporting partial passkey support”。实测把 `WebAuthenticationUseNativeWinApi` 这个编进二进制的特性开关打开也一样（缺的是宿主实现，不是开关）；macOS 上 Electron 另有 `app.configureWebAuthn({ touchID })`（本轮未用）。
+
+**我们的做法：CDP 虚拟认证器当平台认证器**（`browser/runtime/passkeys.ts` + `manager.ts`）：
+
+- **挂认证器**：每个标签在 `dom-ready` 时（`ensurePasskeyAuthenticator`）attach 调试器 → `WebAuthn.enable` → `WebAuthn.addVirtualAuthenticator({ protocol: ctap2, transport: internal, hasResidentKey, hasUserVerification, isUserVerified })`。有了它，页面侧 `isUVPAA()` / `passkeyPlatformAuthenticator` 都变 true，网站愿意跟我们做 passkey。
+- **存凭据**：CDP 的 `WebAuthn.credentialAdded` 事件里 **privateKey（PKCS8 base64）是直接给的**，所以 `browser/storage/index.ts` 的 `passkeys.json` 只加密 `privateKey`（同一条 `enc:<safeStorage>` 口径），其余字段（rpId / 账号 / 凭据 id）明文保留——锁定时也能列出条目。面板拿到的是 `PublicPasskey` 投影，**私钥永不出主进程**。
+- **用凭据**：每进一个页面先 `WebAuthn.clearCredentials` 再把 `passkeysForHost()`（WebAuthn 的 rpId 后缀语义：`example.com` 覆盖 `www.example.com`，反之不行）的凭据 `addCredential` 装回去，所以换站不会串台；登录后 `credentialAsserted` 事件里回写 `signCount`。
+- **已验证的闭环**：本地测站上 create → 落盘（加密）→ 新 manager 实例重开标签页 → 用存下的凭据 get 成功（见提交说明里的 e2e 探针）。
+- **代价（不要美化）**：user verification 由客户端“代为确认”（`isUserVerified: true`），**不是生物识别**，私钥由 safeStorage 加密保管（不享受 TPM）；凭据只在本浏览器有效，**不与 Windows Hello / 手机 passkey 同步**；要求 attestation 的站点会拒（虚拟认证器只给 `none`）；**手机扫码（hybrid）仍不支持**，得等上游。
+- **本地确认闸门（“假生物识别”，但不说假话）**：虚拟认证器把 UV 直接置为已满足，网站要 UV 时我们本来会**静默通过**。`browser/renderer/passkey-gate.js`（document-start 注入，源码单源在 `browser/runtime/passkey-gate.ts`；走 CDP `Page.addScriptToEvaluateOnNewDocument` + 当前文档补一次）把 `navigator.credentials.create/get` 包一层：先 `__piPasskey.confirm()` 请主进程弹一个无边框小窗（“正在验证本机凭据…” → 0.9s 后“已通过”自动关，`browser/runtime/passkey-prompt.ts` 生成页面），批准后才真正发起 ceremony；拒绝则抛 `NotAllowedError` 让网站走自己的失败分支。**文案明说是“本地确认、本机无可用生物识别”**——不做假指纹、也不假装做了生物识别。闸门是体验层：桥不在、注入失败、调用异常一律**直接放行**（fail-open），不能因为它把 passkey 弄坏。
+- **面板**：凭据保险库第三个标签「Passkey」（`vault.ts` 的 `passkeyRow`），只列 + 删；条目由网站注册时产生，不在面板里手写。
+
 ## 自定义新标签页与主题覆盖（用户改 / Agent 设计）
 
 内置页（shell / panel / newtab / office / workspace）是构建产物，只读且打包后不可写；用户与 Agent 的自定义内容一律落在 **Electron `userData/browser/custom/`**：`newtab.html`（新标签页，自包含 HTML）与 `theme.css`（主题覆盖）。单源在 `browser/runtime/customize.ts`（`BrowserCustomization`：路径、大小上限、原子写、状态、回落规则）。
@@ -159,9 +222,24 @@ Agent 可以给网页注入脚本：`browser_script` 工具（`server/browser-sc
 - **改完立刻生效**：写/删新标签页 → 所有停在新标签页上的标签重载（内置 ↔ 自定义互相拨）；写/删主题 → 已打开的内部页标签先撤旧 key 再 `insertCSS`，**不整页刷新**（Office / 工作区里的未保存编辑不能因为换配色被刷掉）。外壳与面板不是标签，由 `DesktopBrowserHost.applyChromeTheme()` 在各自 `dom-ready` 与写入后注入。
 - **两条入口，一套实现**：设置面板「新标签页 / 主题」（`browser/renderer/panels.ts` 的 `designEditor`：正文框 + 保存 / 预览 / 恢复默认，显示文件绝对路径）与 Agent 工具 `browser_design`（`server/browser-design-tool.ts`）都只说 `design.status|get|save|reset`，落到 `desktop/browser-host.ts` 的 `call()` 与 `BrowserManager` 同一组方法上。
 - **预览必须有可见页面**：Electron 对隐藏 / 未挂载的 `WebContentsView` 调 `capturePage()` 会返回空图或挂住（实测），所以 `design.preview` 会开或激活一块新标签页、必要时把窗口切到 browser 模式，再截图（≤1280px、JPEG）；抓不到就如实报「需要可见页面」，不做假成功。
+- **后台标签截图同样要求可见**：`browser_page shot` 以前直接 `capturePage()`，目标标签在后台时返回空图或直接挂住（`UnknownVizError` / 永不 resolve），工具只能等 30s 超时。现在与预览同一条纪律：先 `activateTab(target)` 让 view 挂上合成器 → 等 120ms 出帧 → 每次 `capturePage` 带 5s 上限、空图最多重试 3 次 → 截完切回原标签；仍拿不到就报「截图需要页面可见（窗口最小化或被完全遮挡）」，不挂住工具调用。外部 Chrome 的 page-picker 路径本来就是「切过去 → `captureVisibleTab` → 切回」，不需要改。
 - **自动化线上不加新字段**：工具仍走既有 `page_request`，`op` 为 `design.status|get|save|reset|preview`（`browser/automation/design.ts` 的 `BrowserDesignHost`），在 `createBrowserExecutor` 里先于「选目标标签」分支处理——浏览器只剩内部页时也照常可用。
 - **写坏了怎么退**：主题是一份任意 CSS，理论上能把外壳藏没。恢复路径只有一条且必须真实可用——删掉 `userData/browser/custom/theme.css`（或 `newtab.html`）后重启，或让 Agent 跑 `design.reset`；设置面板里也直接显示这两个文件的绝对路径，方便外部编辑器处理。
 - 回归：`tests/unit/browser-customize.test.ts`（存储 / 大小 / 原子写 / URL 识别）、`browser-design-tool.test.ts`（工具契约、kind 与 `browser/contracts.ts` 同构、`get` 截断）、`browser-design-ops.test.ts`（executor 分支）。
+
+## 网页翻译（划词 / 全页）
+
+**复用随手问引擎，不另建翻译服务**：服务端 `server/browser-translate.ts` 的 `POST /api/translate` 用 `quickAsk*` 设置 + `createQuickAskRuntime`，输入 `{ texts, target?, style? }` 输出 `{ translations[] }`——无会话历史、无附件、不污染随手问话题。多段文本用 `[[n]]…[[/n]]` 标记一次批量翻译，解析时宽松兜底：漏段/错标记一律回原文，数组长度恒等（防模型幻觉把坏译文写回页面）。长度/条数有硬上限（64 段 / 单段 2000 字 / 总量 16000 字），prompt 明确把段间文本当数据而非指令。
+
+**一条窄桥，不给网页任何多余能力**：`browser/preload.cts` 的 `__piTranslate.translate(texts, target?, style?)` 只把文本送主进程拿译文字符串。`desktop/translate-bridge.ts` 做纯函数校验：目标地址由主进程从 `agentUrl` 派生（`translateEndpoint`：只留 origin + token，丢掉 Agent 的 path/hash），页面传来的任何 URL 一概不接受；`browser-host.ts` 的 `pi-browser:translate` 复用 `autofillOrigin` 那套校验——只认 browser session 里的 http(s) frame，命中不了直接拒绝。页面拿不到 sidecar 地址、模型配置或其它标签的内容。
+
+**页面侧脚本单源**：`browser/renderer/translate.js`（由 `browser/runtime/translate.ts` 读取注入、`scripts/build-browser.mjs` 复制进 dist），只在 http(s) 网站注入——内部页、新标签页、`file://` 全部跳过（`file://` 注入脚本正是之前 PDF 滚动卡的根因）。划词浮层由主进程右键菜单触发；**全页翻译的入口收在悬浮 Dock 的展开菜单里**（`dock.js` 的 `btn-translate`，之前页面右下角的独立徽标按钮已删掉，它和 Dock 重叠还没有进度反馈）：DOM 文本节点按块级元素聚合，跳过 `script/style/code/pre/textarea` 与 `.notranslate/[translate=no]`，按 1200 字分批、最多 3 路并发翻译（翻完一段立刻回填一段，页面边翻边变，不等全翻完；并发数封顶，不打爆模型），原文存 `WeakMap`，点「显示原文」瞬时还原不重新请求。注入靠 `window.__PI_TRANSLATE__` 占位幂等。
+
+**翻译过程看得见**：`translate.js` 用 `getState()` / `onState(cb)` 对外发布 `{ pageState, done, total, failed, model }`，点了按钮立刻 Toast「正在翻译全文（共 N 段）…」；翻译中按钮进呼吸态，悬停 title 实时显示 `done/total`，翻译中再点只报进度不重复开工；完成报模型与失败段数（失败段保留原文），再点一次显示原文。Dock 与翻译脚本同属页面主世界，直接读 `window.__PI_TRANSLATE__`，不经过任何新桥。
+
+**目标语言跟随手问走**：复用 `quickAskTranslateTarget` / `quickAskTranslateStyle` / `quickAskTranslatePrompt`，浏览器不另设一套语言设置；浮层与徽标的文案是注入脚本内的固定中文（与 dock.js 同口径，不进 i18n 字典）。**模型默认跟随手问，可在设置里单独指定**：`quickAskTranslateModel` 为空时跟随 `quickAskModel`，非空时须为 `provider/id`；`POST /api/translate` 按「独立翻译模型 → 随手问模型 → 第一个可用模型」解析。
+
+回归：`tests/unit/browser-translate-server.test.ts`（请求校验、prompt 防注入、解析兜底）、`tests/unit/browser-translate-bridge.test.ts`（URL 派生、桥参数校验）。
 
 ## 构建与验证
 

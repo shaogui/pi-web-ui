@@ -1,10 +1,13 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import type { McpExposure } from "@earendil-works/pi-coding-agent";
+import { describeCommandLaunchFailure, resolveCommandLaunch, type CommandSpawnOptions } from "./command-spawn.js";
 import { getMcpAccessToken, refreshMcpAccessToken } from "./mcp-oauth.js";
 import type { PluginAgentTool } from "./plugins.js";
 import type { UiMcpToolInfo } from "./protocol.js";
+import { spawnChildPiped, type SpawnedChild } from "./spawn-child.js";
 
 export function expandEnvVars(val: string): string {
 	return val.replace(/\$\{([^}]+)\}/g, (_, k) => process.env[k] ?? "");
@@ -47,6 +50,10 @@ export interface McpServerSpec {
 	protocolVersion?: string;
 	enabled?: boolean;
 	description?: string;
+	/** 服务器默认的工具暴露方式，缺省 `codemode`（与 pi 同口径）。 */
+	exposure?: McpExposure;
+	/** 单个工具的暴露方式，覆盖 `exposure`：exact 名优先，其次书写顺序第一个命中的 `*` 模式。 */
+	toolExposure?: Record<string, McpExposure>;
 }
 
 interface RpcIncoming {
@@ -85,7 +92,8 @@ interface PendingRequest {
 }
 
 export class McpClient {
-	private child: ChildProcess | null = null;
+	private child: ChildProcessWithoutNullStreams | null = null;
+	private childStop: SpawnedChild["stop"] | null = null;
 	private buffer = "";
 	private pending = new Map<string, PendingRequest>();
 	private log: (...a: unknown[]) => void;
@@ -101,12 +109,20 @@ export class McpClient {
 
 	constructor(
 		name: string,
-		readonly spec: McpServerSpec,
+		public spec: McpServerSpec,
 		log?: (...a: unknown[]) => void,
 		private readonly clientOpts: McpClientOptions = {},
 	) {
 		this.name = name;
 		this.log = log ?? (() => {});
+	}
+
+	/**
+	 * 只换配置投影：`exposure` / `toolExposure` 这类字段不改变连接，热加载时就地刷新，
+	 * 免得为了改一个曝光方式重启服务器进程。
+	 */
+	updateSpec(spec: McpServerSpec): void {
+		this.spec = spec;
 	}
 
 	get isHttp(): boolean {
@@ -155,7 +171,6 @@ export class McpClient {
 		if (!command) {
 			throw new Error("MCP 服务器规格未声明 command 启动命令");
 		}
-		this.log(`[mcp:${this.name}] starting: ${command} ${args.join(" ")}`);
 		this.buffer = "";
 		const spawnedEnv: Record<string, string> = { ...(process.env as Record<string, string>) };
 		if (env) {
@@ -163,16 +178,34 @@ export class McpClient {
 				spawnedEnv[k] = expandEnvVars(v);
 			}
 		}
-		const child = spawn(command, args, {
+		// 命令解析用子进程自己的环境：mcp.json 的 env 能改写 PATH，解析就得看同一套，否则会跟旧行为对不上
+		let launch: ReturnType<typeof resolveCommandLaunch>;
+		try {
+			launch = resolveCommandLaunch(command, args, {
+				cwd: cwd ?? undefined,
+				env: spawnedEnv,
+				...this.clientOpts.spawnOptions,
+			});
+		} catch (err) {
+			throw new Error(this.launchFailure(command, err instanceof Error ? err.message : String(err)));
+		}
+		this.log(`[mcp:${this.name}] starting: ${[launch.file, ...launch.args].join(" ")}`);
+		const spawned = spawnChildPiped({
+			cmd: launch.file,
+			args: launch.args,
 			cwd: cwd ?? undefined,
 			env: spawnedEnv,
-			stdio: ["pipe", "pipe", "pipe"],
-			windowsHide: true,
 		});
+		const child = spawned.child;
 		this.child = child;
-		child.stdin?.on("error", () => {});
+		this.childStop = spawned.stop;
+		child.stdin.on("error", () => {});
 		child.stderr.on("data", (d) => this.log(`[mcp:${this.name}] stderr:`, d.toString().trimEnd()));
-		child.on("error", (err) => this.rejectAll(new Error(`[mcp:${this.name}] spawn error: ${err.message}`)));
+		child.on("error", (err) => {
+			// spawn 失败不会有 exit 事件：留着 child 会让后续调用误以为「进程还在」，一路等到超时
+			if (this.child === child) this.child = null;
+			this.rejectAll(new Error(this.launchFailure(command, err.message)));
+		});
 		child.on("exit", (code, sig) => {
 			this.child = null;
 			this.buffer = "";
@@ -205,15 +238,11 @@ export class McpClient {
 			this.tools = Array.isArray(listed.tools) ? listed.tools : [];
 			this.log(`[mcp:${this.name}] ready, ${this.tools.length} tools`);
 			if (this.shuttingDown) {
-				try {
-					child.kill();
-				} catch {}
+				this.stopChild();
 				if (this.child === child) this.child = null;
 			}
 		} catch (err) {
-			try {
-				child.kill();
-			} catch {}
+			this.stopChild();
 			if (this.child === child) this.child = null;
 			throw err;
 		}
@@ -272,6 +301,9 @@ export class McpClient {
 			this.starting = null;
 		});
 		await this.starting;
+		// 懒重启（子进程退出 / HTTP 会话失效）后工具表可能变了：通知桥重新聚合，
+		// 否则界面与工具白名单会一直停留在进程崩溃前的那份快照上。
+		this.onToolsChanged?.();
 	}
 
 	getTools(): McpToolDefinition[] {
@@ -379,9 +411,7 @@ export class McpClient {
 		this.rejectAll(new Error("[mcp] client closed"));
 		for (const controller of this.notificationControllers) controller.abort();
 		if (this.child) {
-			try {
-				this.child.kill();
-			} catch {}
+			this.stopChild();
 			this.child = null;
 		}
 		if (this.isHttp && this.sessionId && this.spec.url) {
@@ -770,11 +800,15 @@ export class McpClient {
 		const child = this.child;
 		this.child = null;
 		this.rejectAll(err);
-		if (child) {
-			try {
-				child.kill();
-			} catch {}
-		}
+		if (child) this.stopChild();
+	}
+
+	/** 关停子进程：整棵树收口到单源 `stop()`；**发起后不等**（退出由 `exit` 事件收场）。 */
+	private stopChild(): void {
+		const stop = this.childStop;
+		this.childStop = null;
+		if (!stop) return;
+		void stop().catch(() => {});
 	}
 
 	private handleProgress(params: { progressToken?: number | string; progress?: number; total?: number }): void {
@@ -827,6 +861,11 @@ export class McpClient {
 		}
 	}
 
+	/** 解析 / spawn 失败统一带上 Windows 上批处理 shim 的常见处置，错误会进 getServerStatus 显示在界面上。 */
+	private launchFailure(command: string, detail: string): string {
+		return `[mcp:${this.name}] ${describeCommandLaunchFailure(command, detail)}`;
+	}
+
 	private rejectAll(err: Error): void {
 		for (const [, p] of this.pending) {
 			clearTimeout(p.timer);
@@ -840,6 +879,65 @@ export interface McpToolDefinition {
 	name: string;
 	description?: string;
 	inputSchema?: Record<string, unknown>;
+}
+
+/** pi 接受的 MCP 工具暴露方式（与 SDK 的 `McpExposure` 同口径）。 */
+const MCP_EXPOSURES: readonly string[] = ["codemode", "deferred", "direct", "hidden"];
+/** 旧写法：`codemode-deferred` 归一成 `codemode`（pi 读取配置时也这么做）。 */
+const MCP_EXPOSURE_ALIASES: Record<string, McpExposure> = { "codemode-deferred": "codemode" };
+
+export type { McpExposure };
+
+/**
+ * 归一化一个 exposure 取值：别名换成现名，其余非法值返回 `undefined`。
+ * 旧 `mcp.json` 里写坏的值一律忽略，不因此让整个服务器条目失效。
+ */
+export function normalizeMcpExposure(value: unknown): McpExposure | undefined {
+	if (typeof value !== "string") return undefined;
+	const resolved = MCP_EXPOSURE_ALIASES[value] ?? value;
+	return MCP_EXPOSURES.includes(resolved) ? (resolved as McpExposure) : undefined;
+}
+
+/** `toolExposure` 的一项：`*` 匹配任意字符，其余字符按字面匹配（与 pi 的工具名模式同口径）。 */
+function toolPatternRegExp(pattern: string): RegExp {
+	const source = pattern
+		.split("*")
+		.map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
+		.join(".*");
+	return new RegExp(`^${source}$`);
+}
+
+/** 服务器工具命名空间：`mcp__<server>`，服务器名里的 `-` 换成 `_`（与 pi 生成的工具名一致）。 */
+export function mcpToolNamespace(server: string): string {
+	return `mcp__${server.replace(/-/g, "_")}`;
+}
+
+/** 单个工具的 exposure：exact 名优先，其次书写顺序第一个命中的 `*` 模式，最后服务器默认 `codemode`。 */
+export function resolveMcpToolExposure(spec: McpServerSpec, toolName: string): McpExposure {
+	const overrides = spec.toolExposure ?? {};
+	const exact = overrides[toolName];
+	if (exact !== undefined) return exact;
+	for (const [pattern, exposure] of Object.entries(overrides)) {
+		if (pattern.includes("*") && toolPatternRegExp(pattern).test(toolName)) return exposure;
+	}
+	return spec.exposure ?? "codemode";
+}
+
+/**
+ * 工具注册元数据：命名、namespace、exposure 的唯一来源。
+ * 少了 namespace / exposure，SDK 只能把 MCP 工具当 `direct` 内联声明进上下文。
+ */
+export function mcpToolRegistration(
+	serverName: string,
+	spec: McpServerSpec,
+	toolName: string,
+): { name: string; namespace: { name: string; description?: string }; exposure: McpExposure } {
+	const namespace = mcpToolNamespace(serverName);
+	return {
+		name: `${namespace}__${sanitizeToolName(toolName)}`,
+		namespace: { name: namespace, ...(spec.description ? { description: spec.description } : {}) },
+		exposure: resolveMcpToolExposure(spec, toolName),
+	};
 }
 
 export function parseMcpConfig(text: string): { servers: Record<string, McpServerSpec> } | null {
@@ -874,9 +972,22 @@ export function parseMcpConfig(text: string): { servers: Record<string, McpServe
 			enabled: typeof entry.enabled === "boolean" ? entry.enabled : true,
 			description: typeof entry.description === "string" ? entry.description : undefined,
 			protocolVersion: typeof entry.protocolVersion === "string" ? entry.protocolVersion : undefined,
+			exposure: normalizeMcpExposure(entry.exposure),
+			toolExposure: parseToolExposureMap(entry.toolExposure),
 		};
 	}
 	return { servers };
+}
+
+/** 逐个条目归一化 `toolExposure`：写坏的那一条只丢掉自己，其余（含书写顺序）照原样留下。 */
+function parseToolExposureMap(value: unknown): Record<string, McpExposure> | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const out: Record<string, McpExposure> = {};
+	for (const [tool, raw] of Object.entries(value as Record<string, unknown>)) {
+		const exposure = normalizeMcpExposure(raw);
+		if (exposure) out[tool] = exposure;
+	}
+	return Object.keys(out).length > 0 ? out : undefined;
 }
 
 export function readMcpConfig(dataDir: string): { servers: Record<string, McpServerSpec> } {
@@ -904,11 +1015,21 @@ export function mcpServerSnapshot(spec: McpServerSpec): Record<string, unknown> 
 		enabled: spec.enabled !== false,
 		description: spec.description ?? null,
 		protocolVersion: spec.protocolVersion ?? null,
+		exposure: spec.exposure ?? null,
+		toolExposure: spec.toolExposure ?? null,
 	};
 }
 
+/** 连接参数（不含 exposure / toolExposure）：只影响工具注册、不影响连接的差异不该重启子进程。 */
+function connectionSnapshot(spec: McpServerSpec): string {
+	const snapshot = mcpServerSnapshot(spec);
+	delete snapshot.exposure;
+	delete snapshot.toolExposure;
+	return JSON.stringify(snapshot);
+}
+
 function sameMcpSpec(a: McpServerSpec, b: McpServerSpec): boolean {
-	return JSON.stringify(mcpServerSnapshot(a)) === JSON.stringify(mcpServerSnapshot(b));
+	return connectionSnapshot(a) === connectionSnapshot(b);
 }
 
 const mcpToolServers = new WeakMap<object, string>();
@@ -917,12 +1038,14 @@ export function getMcpToolServer(tool: object): string | undefined {
 }
 
 function adaptMcpTool(serverName: string, mcpTool: McpToolDefinition, client: McpClient): PluginAgentTool {
-	const name = sanitizeToolName(mcpTool.name);
+	const registration = mcpToolRegistration(serverName, client.spec, mcpTool.name);
 	const adapted: PluginAgentTool = {
-		name,
+		name: registration.name,
 		label: `${serverName} · ${mcpTool.name}`,
 		description: mcpTool.description ?? `Tool ${mcpTool.name} provided by MCP server "${serverName}"`,
 		promptSnippet: firstSentenceSnippet(mcpTool.description) ?? `MCP tool ${mcpTool.name} (server: ${serverName})`,
+		namespace: registration.namespace,
+		exposure: registration.exposure,
 		parameters: mcpTool.inputSchema ?? {},
 		execute: async (_toolCallId: string, params: Record<string, unknown>, signal?: AbortSignal) => {
 			return client.call(mcpTool.name, params ?? {}, undefined, signal);
@@ -956,6 +1079,8 @@ export interface McpReloadSummary {
 
 export interface McpClientOptions {
 	agentDir?: string;
+	/** 覆盖命令解析环境（单测注入假 PATH；生产留空走 process.env）。 */
+	spawnOptions?: CommandSpawnOptions;
 }
 
 export interface McpBridgeOptions {
@@ -1009,7 +1134,10 @@ export class McpBridge {
 			return {
 				status: "running",
 				...(this.serverErrors.has(name) ? { error: this.serverErrors.get(name), usingPreviousConfig: true } : {}),
-				tools: client.getTools().map((t) => ({ name: t.name, description: t.description })),
+				// 对外一律用注册名（`mcp__<server>__<tool>`）：那才是模型实际要调用的名字（issue #941）。
+				tools: client
+					.getTools()
+					.map((t) => ({ name: mcpToolRegistration(name, client.spec, t.name).name, description: t.description })),
 			};
 		}
 		if (this.serverErrors.has(name)) {
@@ -1099,6 +1227,7 @@ export class McpBridge {
 			const spec = cfg.servers[client.name];
 			if (!spec || spec.enabled === false || !sameMcpSpec(spec, client.spec)) continue;
 			next.set(client.name, client);
+			client.updateSpec(spec);
 			this.serverErrors.delete(client.name);
 			kept++;
 		}

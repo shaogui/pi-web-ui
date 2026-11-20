@@ -3,17 +3,18 @@ import { FiChevronDown, FiChevronUp, FiPlus, FiUsers } from "react-icons/fi";
 import { appUrl } from "../base-url";
 import { DeviceGroupMembers } from "./DeviceGroupMembers";
 import { DeviceGroupBotDialog } from "./DeviceGroupBotDialog";
+import { DeviceGroupEditDialog } from "./DeviceGroupEditDialog";
 import { withToken } from "../auth-token";
 import { useT } from "../i18n";
 import { openContextMenu } from "../context-menu-state";
 import type { UiSlotEntry } from "../ui-slots";
 import { hostEntryIcon } from "../host-icon";
 
-export type SidebarDeviceGroup = { id: string; name: string; botIds: string[] };
+export type SidebarDeviceGroup = { id: string; name: string; botIds: string[]; scope?: "local" | "shared" };
 export const DEVICE_GROUPS_CHANGED = "pi-web-ui:device-groups-changed";
 const ACTION_LABELS = {
 	rename: "deviceGroupManagerRename",
-	members: "deviceGroupManagerManageMembersTitle",
+	edit: "edit",
 	clear: "deviceGroupSectionClearMessages",
 	delete: "deviceGroupSectionDeleteGroup",
 } as const;
@@ -29,20 +30,46 @@ export class DeviceGroupRequestError extends Error {
 	constructor(
 		readonly status: number,
 		readonly code: string,
+		/**
+		 * 本地接口（目前只有 `bot-drafts`）明确允许展示的原因文本；Hub 上游的 `error` 永远不会落到这里。
+		 * 见 `server/device-center/local.ts` 的 `draftDetail`。
+		 */
+		readonly detail = "",
 	) {
 		super(`Device group request failed (${status})`);
 	}
 }
 
+/** 只有本地草案接口会写 `detail`：路径写死，避免把 Hub 上游文本读上来。 */
+const DETAIL_PATHS = ["bot-drafts"];
+
+/** 普通设备中心请求的默认超时。 */
+const DEVICE_REQUEST_TIMEOUT_MS = 15_000;
+/**
+ * 起草/确认草案要等一次真实模型调用（服务端上限 90s），15s 会先把客户端超时掉：
+ * 界面报"失败"，服务端其实还在跑。这里给足余量，且只对 `bot-drafts` 生效。
+ */
+export const BOT_DRAFT_REQUEST_TIMEOUT_MS = 120_000;
+
+function mayCarryDetail(path: string): boolean {
+	return DETAIL_PATHS.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
+}
+
 export async function deviceGroupRequest<T>(path: string, signal: AbortSignal, body?: object): Promise<T> {
 	const response = await fetch(withToken(appUrl(`/api/device-center/${path}`)), {
-		signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
+		signal: AbortSignal.any([
+			signal,
+			AbortSignal.timeout(mayCarryDetail(path) ? BOT_DRAFT_REQUEST_TIMEOUT_MS : DEVICE_REQUEST_TIMEOUT_MS),
+		]),
 		...(body === undefined
 			? {}
 			: { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
 	});
 	const data = await response.json().catch(() => ({}));
-	if (!response.ok) throw new DeviceGroupRequestError(response.status, typeof data?.code === "string" ? data.code : "");
+	if (!response.ok) {
+		const detail = mayCarryDetail(path) && typeof data?.detail === "string" ? data.detail.trim() : "";
+		throw new DeviceGroupRequestError(response.status, typeof data?.code === "string" ? data.code : "", detail);
+	}
 	return data as T;
 }
 
@@ -53,6 +80,9 @@ export function deviceGroupErrorKind(error: unknown): "bind" | "running" | "forb
 	if (error.status === 403) return "forbidden";
 	return "failed";
 }
+
+/** `chat-status` 投影：配对身份（`hubUrl`/`deviceId`）与“房间能不能列”（`roomsReady`，本机引擎永远 true）。 */
+type ChatStatus = { hubUrl?: string; deviceId?: string; roomsReady?: boolean };
 
 export function createDeviceGroupRefresh(
 	load: (signal: AbortSignal) => Promise<SidebarDeviceGroup[]>,
@@ -115,21 +145,24 @@ export function DeviceGroupSection({
 	selectedRoomId,
 	flex,
 	onCollapsedChange,
-	hideHeader = false,
-	onRoomCountChange,
+	hideWhenEmpty = false,
+	autoHeight = false,
 }: {
 	active?: boolean;
 	entry?: UiSlotEntry;
 	selectedRoomId?: string | null;
 	flex?: number;
 	onCollapsedChange?: (collapsed: boolean) => void;
-	hideHeader?: boolean;
-	onRoomCountChange?: (count: number) => void;
+	/** 一条群组都没有时不占位（建群入口在「智能体」标题行）。 */
+	hideWhenEmpty?: boolean;
+	/** 与智能体、项目树同层排开：按内容高度排布，超出时自身滚动，不参与弹性分配。 */
+	autoHeight?: boolean;
 }) {
 	const t = useT();
 	const title = entry?.labelExplicit ? entry.label : t("deviceGroups");
 	const [collapsed, setCollapsed] = useState(false);
 	const [addingBots, setAddingBots] = useState<SidebarDeviceGroup | null>(null);
+	const [editingRoom, setEditingRoom] = useState<SidebarDeviceGroup | null>(null);
 	const [expandedRooms, setExpandedRooms] = useState<Set<string>>(() => new Set());
 	useEffect(() => onCollapsedChange?.(collapsed), [collapsed, onCollapsedChange]);
 	const [rooms, setRooms] = useState<SidebarDeviceGroup[]>([]);
@@ -156,17 +189,34 @@ export function DeviceGroupSection({
 		let confirmedBound = false;
 		const poll = createDeviceGroupRefresh(
 			async (signal) => {
-				const status = await deviceGroupRequest<{ hubUrl?: string; deviceId?: string }>("chat-status", signal);
-				confirmedBound = !!(status.hubUrl && status.deviceId);
+				const status = await deviceGroupRequest<ChatStatus>("chat-status", signal);
+				// 房间引擎在本机：不再要求“已配对远端 Hub”才去拉列表（旧 Hub 也能列本地房间）。
+				confirmedBound = status.roomsReady === true || !!(status.hubUrl && status.deviceId);
 				if (!confirmedBound) return [];
-				const result = await deviceGroupRequest<{ rooms: SidebarDeviceGroup[] }>("rooms", signal);
-				if (!Array.isArray(result.rooms)) throw new Error("Invalid rooms response");
-				return result.rooms;
+				const [local, shared] = await Promise.all([
+					deviceGroupRequest<{ rooms: SidebarDeviceGroup[] }>("rooms", signal),
+					// 共享群组：未配对（409）或远端不可达时视为空，不挡本机列表。
+					deviceGroupRequest<{ rooms: SidebarDeviceGroup[] }>("shared-rooms", signal).catch(() => ({
+						rooms: [] as SidebarDeviceGroup[],
+					})),
+				]);
+				if (!Array.isArray(local.rooms)) throw new Error("Invalid rooms response");
+				const seen = new Set<string>();
+				const merged: SidebarDeviceGroup[] = [];
+				for (const room of local.rooms) {
+					seen.add(room.id);
+					merged.push(room.scope ? room : { ...room, scope: "local" as const });
+				}
+				for (const room of Array.isArray(shared.rooms) ? shared.rooms : []) {
+					if (seen.has(room.id)) continue;
+					seen.add(room.id);
+					merged.push(room.scope ? room : { ...room, scope: "shared" as const });
+				}
+				return merged;
 			},
 			(next) => {
 				setBound(confirmedBound);
 				setRooms(next);
-				onRoomCountChange?.(next.length);
 				setError(null);
 				setLoading(false);
 			},
@@ -205,8 +255,10 @@ export function DeviceGroupSection({
 		setBusy(true);
 		setError(null);
 		try {
+			// 后端对 rooms/:id* 有共享回退，直连本地前缀即可；显式共享前缀少一次 404。
+			const prefix = room.scope === "shared" ? "shared-rooms" : "rooms";
 			await deviceGroupRequest(
-				`rooms/${encodeURIComponent(room.id)}/${action}`,
+				`${prefix}/${encodeURIComponent(room.id)}/${action}`,
 				controller.signal,
 				action === "rename" ? { name: name.trim() } : {},
 			);
@@ -224,7 +276,7 @@ export function DeviceGroupSection({
 	const menu = (event: React.MouseEvent, room: SidebarDeviceGroup) => {
 		event.preventDefault();
 		event.stopPropagation();
-		const entries: UiSlotEntry[] = (["rename", "members", "clear", "delete"] as const).map((action, order) => ({
+		const entries: UiSlotEntry[] = (["rename", "edit", "clear", "delete"] as const).map((action, order) => ({
 			id: `host:device-group-${action}`,
 			slot: "contextmenu.project",
 			source: "host",
@@ -248,13 +300,15 @@ export function DeviceGroupSection({
 				if (entry.action === "rename") {
 					setRenaming(room.id);
 					setName(room.name);
-				} else if (entry.action === "members") openGroup({ roomId: room.id, manage: true });
+				} else if (entry.action === "edit") setEditingRoom(room);
 				else if (entry.action === "clear" || entry.action === "delete") void mutate(room, entry.action);
 			},
 		});
 	};
 
 	if (bound === false || (bound === null && loading)) return null;
+	// 空群组不占位：左栏要的是“有就显示”，不让空态挤着下面的项目树。
+	if (hideWhenEmpty && rooms.length === 0 && !error) return null;
 
 	const body = (
 		<div className="lp-section-body dg-side-body">
@@ -310,7 +364,12 @@ export function DeviceGroupSection({
 							onContextMenu={(event) => menu(event, room)}
 						>
 							<FiUsers />
-							<span className="dg-side-name">{room.name}</span>
+							<span className="dg-side-name">
+								{room.name}
+								{room.scope === "shared" && (
+									<small style={{ marginInlineStart: 6, opacity: 0.75 }}>{t("deviceGroupManagerSharedSuffix")}</small>
+								)}
+							</span>
 						</div>
 						<button
 							type="button"
@@ -356,22 +415,9 @@ export function DeviceGroupSection({
 		</div>
 	);
 
-	if (hideHeader) {
-		return (
-			<section
-				className="lp-section dg-side-section"
-				aria-label={title}
-				style={flex !== undefined ? { flex: `${flex} 1 0px` } : undefined}
-			>
-				{body}
-				{addingBots && <DeviceGroupBotDialog room={addingBots} onClose={() => setAddingBots(null)} />}
-			</section>
-		);
-	}
-
 	return (
 		<section
-			className={`lp-section dg-side-section ${collapsed ? "collapsed" : ""}`}
+			className={`lp-section dg-side-section${collapsed ? " collapsed" : ""}${autoHeight ? " lp-section-auto" : ""}`}
 			aria-label={title}
 			style={!collapsed && flex !== undefined ? { flex: `${flex} 1 0px` } : undefined}
 		>
@@ -383,8 +429,10 @@ export function DeviceGroupSection({
 					title={collapsed ? t("deviceGroupSectionExpand") : t("deviceGroupSectionCollapse")}
 					onClick={() => setCollapsed(!collapsed)}
 				>
-					<span className="lp-section-title-text">
-						{entry && hostEntryIcon(entry)} {title} ({rooms.length})
+					<span className="lp-section-title-text lp-section-title-chip">
+						{entry && hostEntryIcon(entry)}
+						<span>{title}</span>
+						<span className="lp-section-count">({rooms.length})</span>
 					</span>
 					<span className="lp-section-chevron">{collapsed ? <FiChevronDown /> : <FiChevronUp />}</span>
 				</button>
@@ -402,6 +450,7 @@ export function DeviceGroupSection({
 			</div>
 			{!collapsed && body}
 			{addingBots && <DeviceGroupBotDialog room={addingBots} onClose={() => setAddingBots(null)} />}
+			{editingRoom && <DeviceGroupEditDialog roomId={editingRoom.id} onClose={() => setEditingRoom(null)} />}
 		</section>
 	);
 }

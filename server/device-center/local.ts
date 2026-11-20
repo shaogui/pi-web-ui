@@ -6,6 +6,8 @@ import { randomUUID } from "node:crypto";
 import { createMobileNotificationForwarder } from "./mobile-notification-forwarder.js";
 import { getLocalBotOptions, type BotCatalogSources } from "./bot-catalog.js";
 import { applyLocalBotPreset } from "./bot-presets.js";
+import { listBotChatTranscripts } from "./bot-chat.js";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { BotDraft, BotDraftStore } from "./bot-drafts.js";
 import { botMemoryRoot, createBotMemory, type BotMemory } from "./bot-memory.js";
 import { appendIdentityChange } from "./bot-identity.js";
@@ -15,7 +17,9 @@ import { writeAtomic } from "../atomic-file.js";
 import { installHubSetupRoutes } from "./hub-setup.js";
 import { DeviceWorkspaceError, validateDeviceProject } from "./workspaces.js";
 import { createLocalDeviceHub } from "./local-hub.js";
+import { isLocalTaskRuntime } from "./local-task-bridge.js";
 import { createLocalBotRegistry, type LocalBotRegistry, type LocalBotInput } from "./bots.js";
+import { installSharedRoomRoutes } from "./shared-rooms.js";
 import { loadExecutionSettings, saveExecutionSettings, type DeviceExecutionSettings } from "./execution-settings.js";
 import type { TaskSchedulerSnapshot } from "./task-scheduler.js";
 import { hostWithoutPort, isLoopbackHost } from "../host-guard.js";
@@ -36,14 +40,29 @@ export interface LocalDeviceConfig {
 	credential: string;
 	uiCredential?: string;
 	allowExecution: boolean;
+	/**
+	 * 稳定的引擎身份串（只有本机 loopback Hub 会设）。本机 Hub 每次启动换随机端口，
+	 * `hubUrl` 不能当持久化作用域键：会话恢复、任务恢复、报告 outbox、文件同步目录、
+	 * 工作区锁都按它分桶。见 `server/device-center/runtime.ts` 的 `hubKey`。
+	 */
+	hubIdentity?: string;
 }
 interface Connection {
 	close(): void | Promise<void>;
 	isConnected?(): boolean;
+	/**
+	 * 设备运行时：`getSchedulerSnapshot` 等三个是设备中心 UI 必需；
+	 * 其余为实现"本机任务直调"才需要——缺失时 installLocalDeviceCenter 会继续走 relay。
+	 */
 	runtime?: {
 		getSchedulerSnapshot(): TaskSchedulerSnapshot;
 		updateExecutionSettings(next: unknown): DeviceExecutionSettings;
 		cancelScheduledTask(taskId: string, attemptId?: string): boolean;
+		onTask?: import("./local-task-bridge.js").LocalTaskRuntime["onTask"];
+		steerTask?: import("./local-task-bridge.js").LocalTaskRuntime["steerTask"];
+		answerTaskInteraction?: import("./local-task-bridge.js").LocalTaskRuntime["answerTaskInteraction"];
+		recovery?: import("./local-task-bridge.js").LocalTaskRuntime["recovery"];
+		reportOutbox?: import("./local-task-bridge.js").LocalTaskRuntime["reportOutbox"];
 	};
 }
 interface Options {
@@ -52,8 +71,15 @@ interface Options {
 	connect(config: LocalDeviceConfig, syncBots: () => Promise<void>): Connection | Promise<Connection>;
 	bots?: LocalBotRegistry;
 	botDrafts?: BotDraftStore;
+	/**
+	 * 「一句话建 Bot」的服务端执行者：跑一次模型调用产出草案（不占会话）。
+	 * 由宿主注入（需要 agentDir / 工具白名单 / 模型），设备中心本身不碰模型。
+	 */
+	draftBotFromRequest?: (request: string, signal?: AbortSignal, cwd?: string) => Promise<BotDraft>;
 	botCatalog?: BotCatalogSources;
 	allowHosts?: readonly string[];
+	/** 显式声明的同源例外（dev 的 Vite 代理：页面 origin 与后端 Host 不同）。 */
+	allowOrigins?: readonly string[];
 	lanAccess?: DeviceLanAccess;
 }
 
@@ -156,7 +182,27 @@ export async function requestDeviceHub(
  * list is non-empty), so extending that decision here keeps a proxied deployment
  * usable without weakening DNS-rebinding protection.
  */
-function localOnly(allowHosts: ReadonlySet<string>) {
+/**
+ * 写请求的 origin 判定（单源）：
+ * - 常规：Origin 与 Host 同源（浏览器直连、反向代理都成立）；
+ * - 例外：运维在 PI_WEB_ALLOW_ORIGINS 里显式声明的 origin（dev 的 Vite 代理会改写 Host）。
+ * 放行的只是"这个声明过的页面"，不改变同源判定本身。
+ */
+export function allowsLocalWriteOrigin(
+	originHeader: string | undefined,
+	hostHeader: string | undefined,
+	allowOrigins: ReadonlySet<string>,
+): boolean {
+	try {
+		const origin = new URL(originHeader ?? "");
+		if (!["http:", "https:"].includes(origin.protocol)) return false;
+		return allowOrigins.has(origin.origin) || origin.host === hostHeader;
+	} catch {
+		return false;
+	}
+}
+
+function localOnly(allowHosts: ReadonlySet<string>, allowOrigins: ReadonlySet<string>) {
 	return (req: Request, res: Response, next: NextFunction): void => {
 		const peer = req.socket.remoteAddress?.replace(/^::ffff:/, "");
 		if (!(peer === "::1" || peer?.startsWith("127."))) {
@@ -174,14 +220,12 @@ function localOnly(allowHosts: ReadonlySet<string>) {
 			res.status(403).json({ code: "LOCAL_ONLY", error: "Use localhost to configure device access" });
 			return;
 		}
-		if (!["GET", "HEAD"].includes(req.method)) {
-			try {
-				const origin = new URL(req.headers.origin ?? "");
-				if (!["http:", "https:"].includes(origin.protocol) || origin.host !== req.headers.host) throw new Error();
-			} catch {
-				res.status(403).json({ code: "LOCAL_ONLY", error: "Same-origin request required" });
-				return;
-			}
+		if (
+			!["GET", "HEAD"].includes(req.method) &&
+			!allowsLocalWriteOrigin(req.headers.origin, req.headers.host, allowOrigins)
+		) {
+			res.status(403).json({ code: "LOCAL_ONLY", error: "Same-origin request required" });
+			return;
 		}
 		res.setHeader("Cache-Control", "no-store");
 		next();
@@ -191,11 +235,21 @@ function localOnly(allowHosts: ReadonlySet<string>) {
 export async function installLocalDeviceCenter(options: Options) {
 	const file = join(options.dataDir, "device-center.json");
 	const bots = options.bots ?? (await createLocalBotRegistry(options.dataDir));
+	const botDrafts = options.botDrafts;
+	const draftBotFromRequest = options.draftBotFromRequest;
 	let config: LocalDeviceConfig | undefined;
 	let connection: Connection | undefined;
 	let localHub: Awaited<ReturnType<typeof createLocalDeviceHub>> | undefined;
 	let localStarting: Promise<void> | undefined;
 	const activeConfig = () => config ?? localHub?.config;
+	/**
+	 * 房间引擎（直聊 + 群组）的**唯一权威**：永远是本机 local hub。
+	 *
+	 * Bot 在本机跑、历史在本机落盘，房间就不该寄居在远端 Hub 上（它一旧/一断，侧栏就整块“加载失败”）。
+	 * 远端配对（`config`）现在只剩两件事：设备级功能（设备列表/打开设备/LAN/P2P/升级），
+	 * 以及把 Bot 列表镜像过去（阶段二才用它跑远程群组/Bot）。
+	 */
+	const roomConfig = () => localHub?.config;
 	function forAgent(captured: LocalDeviceConfig) {
 		const { uiCredential: _uiCredential, ...agentConfig } = captured;
 		return {
@@ -206,13 +260,17 @@ export async function installLocalDeviceCenter(options: Options) {
 		};
 	}
 	async function ensureLocalHub() {
-		if (config || localHub || closed) return;
+		// 房间引擎永远本机：配对与否都起，不再“配对后就把房间交给远端”。
+		if (localHub || closed) return;
 		if (!localStarting) {
 			localStarting = (async () => {
 				const hub = await createLocalDeviceHub(options.dataDir, () => loadExecutionSettings(options.dataDir));
 				try {
 					localHub = hub;
-					connection = await options.connect(forAgent(hub.config), syncBots);
+					connection = await connectRuntime(hub);
+					// 本机设备：任务直调（不绕 WS + 本地调度）。远程设备仍然走 relay。
+					if (connection.runtime && isLocalTaskRuntime(connection.runtime))
+						hub.attachLocalDeviceRuntime(connection.runtime);
 					await syncBots();
 				} catch (error) {
 					await connection?.close();
@@ -226,6 +284,28 @@ export async function installLocalDeviceCenter(options: Options) {
 			});
 		}
 		await localStarting;
+	}
+	/**
+	 * 拉起运行时并把「本机」接到它该接的那台 Hub 上。
+	 *
+	 * 已配对 → 必须用**配对得来的设备身份**（`config`）接远端 Hub：设备在线表、任务投递、
+	 * LAN/P2P/升级都按那个 deviceId 认人；拿本机 Hub 的占位身份（`local-device`）去接，
+	 * 远端永远看到“设备不在线”，派出去的任务直接判失败。
+	 * 未配对 → 接本机 Hub（只为了让房间引擎拿到运行时，不涉及任何远端协作）。
+	 */
+	async function connectRuntime(hub: { config: LocalDeviceConfig }) {
+		const paired = config;
+		if (!paired) return options.connect(forAgent(hub.config), syncBots);
+		try {
+			// 身份给远端（设备在线表/投递按它认人），但**分桶身份**仍用本机引擎的：
+			// 会话/恢复/锁的键不能跟着远端 URL 或本机随机端口漂（重启后 resume 才不会全丢）。
+			return await options.connect(forAgent({ ...paired, hubIdentity: hub.config.hubIdentity }), syncBots);
+		} catch (error) {
+			// 远端 Hub 暂时连不上不该把本机房间一起拖下水：先用本机身份把运行时拉起来，
+			// 下次 `reconnect()`（轮询/配对/执行开关变化）会再试一次真实身份。
+			console.warn("[device-center] Hub connection failed; local rooms stay available", error);
+			return options.connect(forAgent(hub.config), syncBots);
+		}
 	}
 	let pending: { hubUrl: string; name: string; pollToken: string; expiresAt: number; generation: number } | undefined;
 	let generation = 0;
@@ -253,22 +333,23 @@ export async function installLocalDeviceCenter(options: Options) {
 		connection = undefined;
 		await localHub?.close();
 		localHub = undefined;
-		await bots.setScope(config ? JSON.stringify([config.hubUrl, config.deviceId]) : "unpaired");
-		if (config && !closed) {
-			connection = await options.connect(forAgent(config), syncBots);
-		}
+		if (closed) return;
+		// Bot 身份是本机的（`LOCAL_BOT_SCOPE`），不再跟着配对重算；房间引擎也永远本机。
+		await ensureLocalHub();
 	}
-	async function syncBots() {
-		const captured = activeConfig();
-		if (!captured || closed) return;
-		const response = await fetch(`${captured.hubUrl}/api/agent/bots`, {
+	/**
+	 * 把本机 Bot 列表推给一台 Hub（`PUT /api/agent/bots`）。被认证的 Hub 才能确认 owner。
+	 * 抛出（非 2xx）就是“这台 Hub 没登记成功”，调用方自己决定是不是致命。
+	 */
+	async function pushBots(target: LocalDeviceConfig) {
+		const response = await fetch(`${target.hubUrl}/api/agent/bots`, {
 			method: "PUT",
 			redirect: "error",
 			signal: AbortSignal.timeout(15000),
 			headers: {
 				"Content-Type": "application/json",
-				"X-Device-Id": captured.deviceId,
-				Authorization: `Bearer ${captured.credential}`,
+				"X-Device-Id": target.deviceId,
+				Authorization: `Bearer ${target.credential}`,
 			},
 			body: JSON.stringify({
 				bots: bots.list().map(({ id, name, description, enabled, revision, tools }) => ({
@@ -288,11 +369,27 @@ export async function installLocalDeviceCenter(options: Options) {
 		// Only the authenticated Hub supplies the owner, never a publication command's wire scope.
 		const result = await response.json();
 		const accountId = result && typeof result === "object" && "accountId" in result ? result.accountId : undefined;
-		if (activeConfig() !== captured || closed) throw new Error("Device binding changed during Bot synchronization");
 		if (typeof accountId === "string" && accountId) {
-			if (captured.accountId && captured.accountId !== accountId) throw new Error("Device account binding changed");
-			if (!captured.accountId) captured.accountId = accountId;
+			if (target.accountId && target.accountId !== accountId)
+				throw Object.assign(new Error("Device account binding changed"), { code: "ACCOUNT_BINDING_CHANGED" });
+			if (!target.accountId) target.accountId = accountId;
 		}
+	}
+	/**
+	 * Bot 列表同步：本机房间引擎是权威（推进去失败就算保存失败），远端配对 Hub 只是镜像
+	 * （阶段二才用它跑远程群组；镜像失败不能拖死本地保存）。
+	 */
+	async function syncBots() {
+		if (closed) return;
+		const engine = roomConfig();
+		if (!engine) return;
+		await pushBots(engine);
+		const remote = config;
+		if (remote && remote !== engine)
+			await pushBots(remote).catch((error) => {
+				// 账号被换绑是安全信号，不能当“镜像失败”吞掉；其余镜像失败不该拖死本地保存。
+				if ((error as { code?: string })?.code === "ACCOUNT_BINDING_CHANGED") throw error;
+			});
 	}
 	async function hubRequest(hubUrl: string, path: string, body: unknown) {
 		const response = await fetch(`${hubUrl}${path}`, {
@@ -345,10 +442,22 @@ export async function installLocalDeviceCenter(options: Options) {
 	const mobileNotifications = createMobileNotificationForwarder({ dataDir: options.dataDir, getBinding: activeConfig });
 	// entries are normalised exactly like the global guard does.
 	const allowHosts = new Set((options.allowHosts ?? []).map((entry) => hostWithoutPort(String(entry))).filter(Boolean));
-	const guard = localOnly(allowHosts);
+	const allowOrigins = new Set(
+		(options.allowOrigins ?? [])
+			.map((entry) => {
+				try {
+					return new URL(String(entry)).origin;
+				} catch {
+					return "";
+				}
+			})
+			.filter(Boolean),
+	);
+	const guard = localOnly(allowHosts, allowOrigins);
 	// Public incoming webhook forwarding (authenticates via webhook token inside hub)
 	options.app.post("/api/rooms/:id/webhooks/incoming/:webhookId", async (req, res) => {
-		const captured = activeConfig();
+		// 房间引擎在本机，webhook 也只能落到本机这套房间上。
+		const captured = roomConfig();
 		if (!captured) return res.status(503).json({ error: "Device hub not paired" });
 		try {
 			const queryIndex = req.url.indexOf("?");
@@ -452,10 +561,18 @@ export async function installLocalDeviceCenter(options: Options) {
 				name: current?.name,
 				remark: current?.remark,
 				...(!config ? { local: true } : {}),
+				// 房间引擎永远在本机：远端配对与否都不影响侧栏能不能列房间。
+				roomsReady: !!roomConfig(),
 			});
 		} catch {
 			res.status(503).json({ code: "LOCAL_HUB_UNAVAILABLE", error: "Local collaboration could not start" });
 		}
+	});
+	// 跨设备共享群组：成员含其他设备时走配对远端 Hub（显式 shared-* 接口，不动本地链路）。
+	installSharedRoomRoutes(options.app, {
+		getPaired: () => config,
+		ensureReady: () => serialize(ensureLocalHub),
+		isClosed: () => closed,
 	});
 	const activeRequests = new Set<AbortController>();
 	let inFlight = 0;
@@ -467,7 +584,7 @@ export async function installLocalDeviceCenter(options: Options) {
 			res.sendStatus(503);
 			return;
 		}
-		const captured = activeConfig();
+		const captured = roomConfig();
 		const capturedGeneration = generation;
 		if (!captured?.uiCredential) {
 			res.sendStatus(409);
@@ -484,6 +601,8 @@ export async function installLocalDeviceCenter(options: Options) {
 		res.once("close", cancel);
 		req.once("aborted", cancel);
 		try {
+			// 房间事件流只打本机引擎：跨设备共享群组走显式 `shared-rooms/:id/events`（shared-rooms.ts），
+			// 这里不做透明回退——否则 local-first 会被「本机 404 就转发远端」破穿，本地流量也外泄。
 			const upstream = await fetch(
 				`${captured.hubUrl}/api/device-user/rooms/${encodeURIComponent(String(req.params.id))}/events`,
 				{
@@ -492,12 +611,12 @@ export async function installLocalDeviceCenter(options: Options) {
 					headers: { "X-Device-Id": captured.deviceId, Authorization: `Bearer ${captured.uiCredential}` },
 				},
 			);
-			if (!upstream.ok || !upstream.body || !upstream.headers.get("content-type")?.startsWith("text/event-stream")) {
+			if (!upstream.ok || !upstream.body) {
 				await upstream.body?.cancel();
 				res.sendStatus(502);
 				return;
 			}
-			if (closed || generation !== capturedGeneration || activeConfig() !== captured) return;
+			if (closed || generation !== capturedGeneration || roomConfig() !== captured) return;
 			res.set({ "Content-Type": "text/event-stream", "Cache-Control": "no-store", "X-Accel-Buffering": "no" });
 			res.flushHeaders();
 			const reader = upstream.body.getReader();
@@ -509,7 +628,7 @@ export async function installLocalDeviceCenter(options: Options) {
 						closed ||
 						controller.signal.aborted ||
 						generation !== capturedGeneration ||
-						activeConfig() !== captured ||
+						roomConfig() !== captured ||
 						chunk.value.byteLength > 65536 ||
 						!res.write(chunk.value)
 					)
@@ -537,9 +656,9 @@ export async function installLocalDeviceCenter(options: Options) {
 		binding?: { config: LocalDeviceConfig; generation: number },
 	): Promise<any> {
 		await serialize(ensureLocalHub);
-		if (binding && (activeConfig() !== binding.config || generation !== binding.generation))
+		if (binding && (roomConfig() !== binding.config || generation !== binding.generation))
 			throw Object.assign(new Error("Device binding changed; refresh"), { status: 409 });
-		const captured = activeConfig();
+		const captured = roomConfig();
 		const capturedGeneration = generation;
 		if (!captured || closed) throw Object.assign(new Error("Pair this computer first"), { status: 409 });
 		if (inFlight >= 8) throw Object.assign(new Error("Device center busy"), { status: 429 });
@@ -551,7 +670,7 @@ export async function installLocalDeviceCenter(options: Options) {
 				user: true,
 				signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
 			});
-			if (closed || activeConfig() !== captured || generation !== capturedGeneration)
+			if (closed || roomConfig() !== captured || generation !== capturedGeneration)
 				throw Object.assign(new Error("Device binding changed; refresh"), { status: 409 });
 			return data;
 		} finally {
@@ -571,7 +690,7 @@ export async function installLocalDeviceCenter(options: Options) {
 			: undefined;
 	async function workItems(method: string, args: Record<string, unknown> = {}): Promise<unknown> {
 		await serialize(ensureLocalHub);
-		const config = activeConfig();
+		const config = roomConfig();
 		if (!config || closed) throw Object.assign(new Error("Pair this computer first"), { status: 409 });
 		const binding = { config, generation };
 		const request = (path: string, method = "GET", body?: unknown) =>
@@ -677,15 +796,25 @@ export async function installLocalDeviceCenter(options: Options) {
 			}
 		});
 	}
-	function userRoute(method: "get" | "post", path: string, fields: string[]) {
+	function userRoute(
+		method: "get" | "post" | "put",
+		path: string,
+		fields: string[],
+		limits: { maxBytes?: number } = {},
+	) {
+		const writes = method !== "get";
 		const supportsContract = method === "post" && fields.includes("contract");
+		const maxBytes = limits.maxBytes ?? 32768;
 		options.app[method](`/api/device-center/${path}`, async (req, res) => {
 			try {
 				await serialize(ensureLocalHub);
 			} catch {
 				return res.status(503).json({ code: "LOCAL_HUB_UNAVAILABLE", error: "Local collaboration could not start" });
 			}
-			const captured = activeConfig();
+			// 房间/Bot 类路径落到本机引擎；只有设备级路径（`devices*`）才回远端配对。
+			// 房间在本机 = 侧栏/对话不再受 Hub 版本与在线状态影响（阶段二再把远程群组接回来）。
+			const currentTarget = () => (path.startsWith("devices") ? (config ?? roomConfig()) : roomConfig());
+			const captured = currentTarget();
 			const capturedGeneration = generation;
 			if (!captured) return res.status(409).json({ code: "NOT_PAIRED", error: "Pair this computer first" });
 			if (!captured.uiCredential)
@@ -695,13 +824,13 @@ export async function installLocalDeviceCenter(options: Options) {
 			if (closed || inFlight >= 8) return res.status(429).json({ code: "BUSY", error: "Device center busy" });
 			const body = req.body ?? {};
 			if (
-				method === "post" &&
+				writes &&
 				(!body ||
 					typeof body !== "object" ||
 					Array.isArray(body) ||
 					Object.keys(body).some((key) => !fields.includes(key)) ||
 					Buffer.byteLength(JSON.stringify(body)) >
-						(supportsContract && body.contract !== undefined ? MAX_CONTRACT_REQUEST_BYTES : 32768))
+						(supportsContract && body.contract !== undefined ? MAX_CONTRACT_REQUEST_BYTES : maxBytes))
 			)
 				return res.status(400).json({ code: "INVALID_BODY", error: "Invalid group request" });
 			if (path === "devices/:id/open" && body.preferLan === true) {
@@ -740,7 +869,7 @@ export async function installLocalDeviceCenter(options: Options) {
 						"X-Device-Id": captured.deviceId,
 						Authorization: `Bearer ${captured.uiCredential}`,
 					},
-					...(method === "post" ? { body: JSON.stringify(body) } : {}),
+					...(writes ? { body: JSON.stringify(body) } : {}),
 				});
 				if (!response.body) throw new Error("Empty response");
 				const reader = response.body.getReader();
@@ -757,7 +886,7 @@ export async function installLocalDeviceCenter(options: Options) {
 				} finally {
 					await reader.cancel();
 				}
-				if (closed || activeConfig() !== captured || generation !== capturedGeneration)
+				if (closed || currentTarget() !== captured || generation !== capturedGeneration)
 					return res.status(409).json({ code: "DEVICE_CHANGED", error: "Device binding changed; refresh" });
 				if (!response.ok) {
 					let failure: { code?: unknown; error?: unknown } | null = null;
@@ -796,7 +925,10 @@ export async function installLocalDeviceCenter(options: Options) {
 						data.transport = "hub";
 						const id = String((req.params as Record<string, string>).id);
 						const valid = () =>
-							!closed && !controller.signal.aborted && activeConfig() === captured && generation === capturedGeneration;
+							!closed &&
+							!controller.signal.aborted &&
+							currentTarget() === captured &&
+							generation === capturedGeneration;
 						const open = (preferLan: boolean, p2pOffer?: DeviceP2PSignal, signal?: AbortSignal) =>
 							requestDeviceHub(
 								captured,
@@ -845,8 +977,7 @@ export async function installLocalDeviceCenter(options: Options) {
 							connect: async (candidate) => {
 								if (!valid()) return null;
 								const connection = await probeDeviceLan(candidate, { signal: controller.signal });
-								if (connection)
-									return { connection, expiresAt: (candidate as { expiresAt: number }).expiresAt, transport: "lan" };
+								if (connection) return { connection, expiresAt: connection.expiresAt, transport: "lan" };
 								if (!valid()) return null;
 								if (!p2pAvailable) {
 									console.warn(
@@ -910,7 +1041,7 @@ export async function installLocalDeviceCenter(options: Options) {
 				}
 				res.status(response.status).json(data);
 			} catch {
-				if (!res.destroyed && (closed || activeConfig() !== captured || generation !== capturedGeneration))
+				if (!res.destroyed && (closed || currentTarget() !== captured || generation !== capturedGeneration))
 					return res.status(409).json({ code: "DEVICE_CHANGED", error: "Device binding changed; refresh" });
 				if (!res.destroyed)
 					res.status(502).json({ code: "HUB_UNAVAILABLE", error: "Hub request failed or exceeded response limit" });
@@ -924,6 +1055,59 @@ export async function installLocalDeviceCenter(options: Options) {
 	}
 	options.app.get("/api/device-center/local-bots", (_req, res) => {
 		res.json({ bots: bots.list() });
+	});
+	/**
+	 * 左栏「智能体」区的唯一读取入口：Bot 身份、草案、直聊房间**全部读本机**。
+	 *
+	 * Bot 在本机跑、房间引擎也是本机的，所以 Hub 旧版本 / 离线 / 未配对都只影响
+	 * `roomsAvailable`（本机引擎异常时的降级位），不会让整块列表变成「加载失败」。
+	 * 远端配对只负责把这份列表镜像过去（`syncBots()`），阶段二才用它跑远程群组。
+	 */
+	options.app.get("/api/device-center/bot-panel", (req, res) => {
+		const controller = new AbortController();
+		const cancel = () => {
+			if (!res.writableEnded) controller.abort();
+		};
+		req.once("aborted", cancel);
+		res.once("close", cancel);
+		void (async () => {
+			await serialize(ensureLocalHub);
+			const engine = roomConfig();
+			if (!engine) throw new Error("Local room engine is unavailable");
+			const drafts = botDrafts ? await botDrafts.list().catch(() => []) : [];
+			if (controller.signal.aborted) return;
+			const deviceName = config?.name ?? hostname();
+			// 忙碌来自本机 Hub 的任务视图：左栏据此显示"执行中"，用户不会在 Bot 跑任务时以为它空闲。
+			const busy = localHub?.busyBots?.() ?? new Set<string>();
+			const bots_ = bots.list().map(({ id, name, enabled, cwd }) => ({
+				id,
+				name,
+				enabled,
+				cwd,
+				busy: busy.has(id),
+				deviceName,
+				online: true,
+				local: true,
+			}));
+			res.json({ bots: bots_, drafts });
+		})()
+			.catch(() => {
+				if (!res.destroyed && !res.headersSent)
+					res.status(500).json({ code: "BOT_PANEL_FAILED", error: "Bot list could not be read from this device" });
+			})
+			.finally(() => {
+				req.off("aborted", cancel);
+				res.off("close", cancel);
+			});
+	});
+	// 这个 Bot 的历史私聊：默认入口只回最近一份，改成“新开对话”后旧记录也要有地方打开。
+	// 打开仍走既有 `switch_session`（bot-sessions 在允许目录里），绑定由转录锚点重建。
+	options.app.get("/api/device-center/local-bots/:id/sessions", (req: Request, res: Response) => {
+		const botId = String(req.params.id);
+		if (!bots.get(botId)) return res.status(404).json({ code: "BOT_NOT_FOUND", error: "Bot not found" });
+		res.setHeader("Cache-Control", "no-store");
+		const agentDir = options.botCatalog?.agentDir ?? getAgentDir();
+		res.json({ sessions: listBotChatTranscripts(agentDir, botId) });
 	});
 	options.app.get("/api/device-center/local-bots/:id", (req, res) => {
 		res.setHeader("Cache-Control", "no-store");
@@ -1006,6 +1190,10 @@ export async function installLocalDeviceCenter(options: Options) {
 							"skills",
 							"mcpServers",
 							"enabled",
+							// GET 会回传这两个字段（身份台账 / 存量元数据），编辑时必须允许原样带回：
+							// 客户端把读到的 Bot 改一改再 POST 是正常用法。写入时身份由服务端重盖。
+							"identity",
+							"trigger",
 						];
 				if (
 					!input ||
@@ -1020,8 +1208,25 @@ export async function installLocalDeviceCenter(options: Options) {
 						? bots.get(String((input as { id: string }).id))
 						: undefined;
 				let saved: Awaited<ReturnType<LocalBotRegistry["upsert"]>> | undefined;
-				if (remove) await bots.remove(String(req.params.id), input.revision);
-				else saved = await bots.upsert(input as LocalBotInput);
+				if (remove) {
+					const botId = String(req.params.id);
+					await bots.remove(botId, input.revision);
+					// 删 Bot 连带删它的"家"（身份 + 记忆）：只删注册表会留下永远读不到的孤儿记忆，
+					// 用户以为删干净了、磁盘上却还在。工作目录属于项目，不动。
+					memoryStores.delete(botId);
+					await rm(join(options.dataDir, "bot-agents", botId), { recursive: true, force: true }).catch(() => {});
+				} else {
+					const next = { ...(input as LocalBotInput) };
+					// 这条路由是人工编辑（本机设备中心）：身份账本必须记下人改的，
+					// 不能沿用草案留下的 "model"  authorship。触发形态不在可改字段里，按原值保留。
+					next.identity = {
+						authoredBy: "human",
+						authoredAt: Date.now(),
+						modelRevision: previous?.identity?.modelRevision ?? 0,
+					};
+					if (next.trigger === undefined && previous?.trigger) next.trigger = previous.trigger;
+					saved = await bots.upsert(next);
+				}
 				if (saved) {
 					try {
 						await appendIdentityChange(options.dataDir, saved, previous);
@@ -1046,14 +1251,12 @@ export async function installLocalDeviceCenter(options: Options) {
 		};
 	}
 	options.app.get("/api/device-center/local-bot-options", async (req, res) => {
-		if (req.headers.origin || req.headers["sec-fetch-site"] === "cross-site") {
-			try {
-				const origin = new URL(req.headers.origin ?? "");
-				if (!["http:", "https:"].includes(origin.protocol) || origin.host !== req.headers.host) throw new Error();
-			} catch {
-				res.status(403).json({ code: "LOCAL_ONLY", error: "Same-origin request required" });
-				return;
-			}
+		if (
+			(req.headers.origin || req.headers["sec-fetch-site"] === "cross-site") &&
+			!allowsLocalWriteOrigin(req.headers.origin, req.headers.host, allowOrigins)
+		) {
+			res.status(403).json({ code: "LOCAL_ONLY", error: "Same-origin request required" });
+			return;
 		}
 		res.setHeader("Cache-Control", "no-store");
 		const controller = new AbortController();
@@ -1082,15 +1285,6 @@ export async function installLocalDeviceCenter(options: Options) {
 			res.off("close", cancel);
 		}
 	});
-	/** 首轮自举：让 Bot 自己写 profile / 记忆，而不是服务端替它编一份身份。 */
-	function bootstrapText(name: string): string {
-		return [
-			`你是刚创建出来的智能体「${name}」。请完成首轮自举：`,
-			"1) 用一两句话介绍你自己（你是谁、负责什么、你打算怎么工作）；",
-			"2) 把职责与工作约定写进你的个人记忆（profile / MEMORY.md 允许的方式），并确认你的工作目录可读、记忆可写；",
-			"3) 如果缺少必要信息，只问最关键的一个问题，别罗列清单。",
-		].join("\n");
-	}
 	async function scaffoldBotHome(bot: { id: string; name: string; description: string }, draft: BotDraft) {
 		const memoryRoot = botMemoryRoot(options.dataDir, bot.id);
 		await mkdir(join(options.dataDir, "bot-agents", bot.id, "identity"), { recursive: true });
@@ -1110,12 +1304,12 @@ export async function installLocalDeviceCenter(options: Options) {
 				"",
 			].join("\n"),
 		);
+		// MEMORY.md 是 index 的投影：初始化就写一行“描述”既不在索引里，也会被下一次渲染覆盖。
+		// 描述属于身份（profile.md）；常驻区空着，等 promote 进来。
 		await writeAtomic(
 			join(memoryRoot, "MEMORY.md"),
 			[
 				"<!-- Resident memory: promoted entries only. Injected every session; keep it short. -->",
-				"",
-				`- [${new Date(draft.createdAt).toISOString().slice(0, 10)}] ${bot.description}`,
 				"",
 				"<!-- 0 resident · 0 scoped · index: index.jsonl -->",
 				"",
@@ -1132,9 +1326,40 @@ export async function installLocalDeviceCenter(options: Options) {
 			message: known?.message ?? "Bot draft operation failed",
 		};
 	}
+	/**
+	 * 草案失败时给界面一段**可以展示**的原因（例如“套餐不含这个模型”）。
+	 * 为什么另开字段而不让前端直接用 `error`：那条通道是给 Hub 上游用的，上游文本可能带凭据，
+	 * 前端（`deviceGroupRequest`）故意只读 `code`。`detail` 只由本地草案接口写，前端也只对 `bot-drafts` 路径读它。
+	 */
+	/**
+	 * 草案的落地项目：优先用请求里带的当前项目；默认工作区是主目录 / 卷根 / 数据目录内时退回最近项目。
+	 * （dev 从 home 启动是常态；不这样兜底，"一句话建 Bot"会在确认阶段才炸。）
+	 */
+	async function resolveBotProjectCwd(requested?: string): Promise<string> {
+		// 当前工作区可能是主目录 / 数据目录内（dev 从 home 启动很常见）：逐个候选试，
+		// 第一个能作为项目的胜出。草案卡会把最终目录显示出来，确认前人能看到落在哪。
+		const candidates = [
+			requested,
+			options.botCatalog?.defaultCwd ?? process.cwd(),
+			...((await options.botCatalog?.projects?.()) ?? []).map((project) => project.path),
+		].filter((candidate): candidate is string => typeof candidate === "string" && candidate.length > 0);
+		for (const candidate of new Set(candidates)) {
+			try {
+				return await validateDeviceProject(candidate, options.dataDir);
+			} catch {}
+		}
+		throw new DeviceWorkspaceError(
+			400,
+			"WORKSPACE_INVALID",
+			"Pick a concrete project directory; home and volume roots cannot host a Bot",
+		);
+	}
+	function draftDetail(message: string) {
+		const flat = message.replace(/\s+/g, " ").trim();
+		return flat.length > 300 ? `${flat.slice(0, 297)}...` : flat;
+	}
 
-	if (options.botDrafts) {
-		const botDrafts = options.botDrafts;
+	if (botDrafts) {
 		options.app.get("/api/device-center/bot-drafts", (req: Request, res: Response) => {
 			void botDrafts.list().then(
 				(drafts) => res.json({ drafts }),
@@ -1144,12 +1369,44 @@ export async function installLocalDeviceCenter(options: Options) {
 				},
 			);
 		});
+		// 一句话建 Bot：AI 只产出草案，创建仍走 approve（人按一次确认）。
+		if (draftBotFromRequest)
+			options.app.post("/api/device-center/bot-drafts", (req: Request, res: Response) => {
+				const request =
+					typeof (req.body as { request?: unknown } | undefined)?.request === "string"
+						? ((req.body as { request: string }).request as string)
+						: "";
+				const rawCwd =
+					typeof (req.body as { cwd?: unknown } | undefined)?.cwd === "string"
+						? ((req.body as { cwd: string }).cwd as string)
+						: undefined;
+				const controller = new AbortController();
+				res.once("close", () => controller.abort());
+				void resolveBotProjectCwd(rawCwd)
+					.then((cwd) => draftBotFromRequest(request, controller.signal, cwd))
+					.then(
+						(draft) => res.json({ draft }),
+						(error) => {
+							const failure = draftFailure(error);
+							if (!res.headersSent)
+								res.status(failure.status).json({
+									code: failure.code,
+									error: failure.message,
+									detail: draftDetail(failure.message),
+								});
+						},
+					);
+			});
 		options.app.post("/api/device-center/bot-drafts/:id/discard", (req: Request, res: Response) => {
 			void botDrafts.discard(String(req.params.id)).then(
 				() => res.json({ discarded: true }),
 				(error) => {
 					const failure = draftFailure(error);
-					res.status(failure.status).json({ code: failure.code, error: failure.message });
+					res.status(failure.status).json({
+						code: failure.code,
+						error: failure.message,
+						detail: draftDetail(failure.message),
+					});
 				},
 			);
 		});
@@ -1166,7 +1423,8 @@ export async function installLocalDeviceCenter(options: Options) {
 				const smuggled = approved.filter((tool) => !draft.tools.includes(tool));
 				if (smuggled.length)
 					throw new DeviceWorkspaceError(400, "DRAFT_TOOLS_INVALID", `Unknown tools: ${smuggled.join(", ")}`);
-				const confirmed = await botDrafts.approve(draft.id, approved);
+				// 只校验、不落状态：upsert 失败时草案仍是 pending，用户可以直接重试或取消。
+				const confirmed = await botDrafts.assertApprovable(draft.id, approved);
 				const bot = await bots.upsert({
 					name: confirmed.name,
 					description: confirmed.description,
@@ -1179,8 +1437,10 @@ export async function installLocalDeviceCenter(options: Options) {
 					enabled: true,
 					trigger: confirmed.trigger,
 					identity: { authoredBy: confirmed.createdBy, authoredAt: confirmed.createdAt, modelRevision: 1 },
+					// 模型起草 + 人工确认的工具清单：注册表据此再校验一次高权限项（不落库）。
+					approvedTools: approved,
 				} as LocalBotInput);
-				await botDrafts.markCreated(draft.id, bot.id);
+				await botDrafts.markCreated(draft.id, bot.id, approved);
 				await scaffoldBotHome(bot, confirmed);
 				// 本机 Hub 可能还没被任何设备中心请求唤醒：先把协作通道拉起来，
 				// 否则 Bot 同步与直聊房间会被静默跳过（只有 synced:true 的假象）。
@@ -1191,39 +1451,17 @@ export async function installLocalDeviceCenter(options: Options) {
 				} catch {
 					synced = false;
 				}
-				const captured = activeConfig();
-				let roomId: string | undefined;
-				let bootstrapped = false;
-				if (captured && synced) {
-					try {
-						const room = (await requestDeviceHub(
-							captured,
-							`/api/device-user/bots/${encodeURIComponent(bot.id)}/direct-room`,
-							"POST",
-							{},
-							{ user: true },
-						)) as { room?: { id?: string } };
-						roomId = room.room?.id;
-					} catch {}
-					if (roomId && confirmed.bootstrap) {
-						try {
-							await requestDeviceHub(
-								captured,
-								`/api/device-user/rooms/${encodeURIComponent(roomId)}/messages`,
-								"POST",
-								{ text: bootstrapText(bot.name), idempotencyKey: `bootstrap:${bot.id}` },
-								{ user: true },
-							);
-							bootstrapped = true;
-						} catch {}
-					}
-				}
-				return { bot, synced, roomId, bootstrapped };
+				return { bot, synced };
 			}).then(
 				(data) => res.json(data),
 				(error) => {
 					const failure = draftFailure(error);
-					res.status(failure.status).json({ code: failure.code, error: failure.message });
+					res.status(failure.status).json({
+						code: failure.code,
+						error: failure.message,
+						// 草案接口专用的可展示原因（前端只对 bot-drafts 路径读 detail）。
+						detail: draftDetail(failure.message),
+					});
 				},
 			);
 		});
@@ -1289,7 +1527,8 @@ export async function installLocalDeviceCenter(options: Options) {
 	memoryRoute("post", "/promote", async (memory, req) => {
 		const id = typeof req.body?.id === "string" ? req.body.id : "";
 		if (!id) throw new DeviceWorkspaceError(400, "MEMORY_PROMOTE", "Pass an entry id");
-		return { entry: await memory.promote(id) };
+		// 人在这里点'晋升'就是显式确认：未确认条目先转 confirmed 再进常驻区。
+		return { entry: await memory.promote(id, { confirm: req.body?.confirm === true }) };
 	});
 	memoryRoute("post", "/compact", async (memory) => memory.compact());
 
@@ -1334,7 +1573,14 @@ export async function installLocalDeviceCenter(options: Options) {
 				enabled: true,
 				// 导入的 Bot 一定是按需触发：不允许一个包把新设备变成常驻消耗。
 				trigger: "on_demand",
-				...(bundle.bot.identity ? { identity: bundle.bot.identity } : {}),
+				// 导入是人的显式动作：身份盖成 human（保留原 modelRevision 供追溯），
+				// 并把包里的工具全部当作已确认——否则模型起草的包会在新设备上被高权限校验拦住。
+				identity: {
+					authoredBy: "human",
+					authoredAt: Date.now(),
+					modelRevision: bundle.bot.identity?.modelRevision ?? 0,
+				},
+				approvedTools: tools,
 			});
 			const imported = await importBotHome(options.dataDir, bundle, bot.id);
 			if (!imported.profile)
@@ -1350,21 +1596,7 @@ export async function installLocalDeviceCenter(options: Options) {
 			} catch {
 				synced = false;
 			}
-			const captured = activeConfig();
-			let roomId: string | undefined;
-			if (captured && synced) {
-				try {
-					const room = (await requestDeviceHub(
-						captured,
-						`/api/device-user/bots/${encodeURIComponent(bot.id)}/direct-room`,
-						"POST",
-						{},
-						{ user: true },
-					)) as { room?: { id?: string } };
-					roomId = room.room?.id;
-				} catch {}
-			}
-			return { bot, synced, roomId, ...imported };
+			return { bot, synced, ...imported };
 		}).then(
 			(data) => res.json(data),
 			(error) => {
@@ -1376,9 +1608,6 @@ export async function installLocalDeviceCenter(options: Options) {
 	options.app.post("/api/device-center/local-bots", botMutation(false));
 	options.app.post("/api/device-center/local-bots/:id/delete", botMutation(true));
 	userRoute("get", "bots", []);
-	userRoute("post", "bots/:id/direct-room", []);
-	userRoute("post", "bots/:id/share", ["sourceRoomId", "targetRoomId", "mode", "messageIds", "note", "idempotencyKey"]);
-	userRoute("get", "direct-rooms", []);
 	userRoute("get", "devices", []);
 	userRoute("post", "devices/:id/open", ["preferLan", "desktop", "basePath"]);
 	userRoute("post", "devices/:id/remark", ["remark"]);
@@ -1498,6 +1727,15 @@ export async function installLocalDeviceCenter(options: Options) {
 		"executionMode",
 		"contract",
 	]);
+	// 群黑板：UI 用 PUT 保存（`GroupBlackboardView`），Hub 侧上限 512kb，代理照抄同一档。
+	userRoute("get", "rooms/:id/blackboard", []);
+	userRoute("put", "rooms/:id/blackboard", ["content", "expectedVersion", "title", "sections"], {
+		maxBytes: 512 * 1024,
+	});
+	userRoute("put", "rooms/:id/blackboard/sections/:sectionId", ["content", "expectedVersion", "title"], {
+		maxBytes: 512 * 1024,
+	});
+	userRoute("get", "rooms/:id/locks", []);
 	userRoute("get", "rooms/:id/webhooks", []);
 	userRoute("post", "rooms/:id/webhooks", [
 		"name",

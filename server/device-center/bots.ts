@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DeviceWorkspaceError, validateDeviceProject } from "./workspaces.js";
+import { isBotToolHighPrivilege } from "./bot-execution.js";
 
 export interface LocalBot {
 	id: string;
@@ -24,7 +25,15 @@ export interface LocalBot {
 	/** 身份来源与修订：谁写的 systemPrompt、被改写几次。 */
 	identity?: { authoredBy: "human" | "model"; authoredAt: number; modelRevision: number };
 }
-export type LocalBotInput = Omit<LocalBot, "id" | "revision"> & { id?: string; revision?: number };
+export type LocalBotInput = Omit<LocalBot, "id" | "revision"> & {
+	id?: string;
+	revision?: number;
+	/**
+	 * 仅用于写入校验、不进注册表：模型起草的 Bot 若带高权限工具，必须在人工确认时逐项列进这里。
+	 * （人通过设备中心编辑时 authoredBy 会被盖成 human，不受此限。）
+	 */
+	approvedTools?: string[];
+};
 export interface LocalBotLease {
 	bot: LocalBot;
 	root: string;
@@ -37,6 +46,8 @@ export interface LocalBotRegistry {
 	get(id: string): LocalBot | undefined;
 	upsert(input: LocalBotInput): Promise<LocalBot>;
 	remove(id: string, revision: number): Promise<void>;
+	/** 是否有执行租约（群/设备任务在跑）。私聊发消息前用它做一次可读的忙检查。 */
+	busy(id: string): boolean;
 	acquire(id: string): Promise<LocalBotLease>;
 }
 function fail(status: number, code: string, message: string): never {
@@ -112,12 +123,67 @@ function validate(input: LocalBot): LocalBot {
 	};
 }
 
+/**
+ * 本机 Bot 身份的作用域。
+ *
+ * Bot 属于**这台机器**，不属于某次 Hub 配对；旧版本按 `[hubUrl, deviceId]` 分文件，
+ * 换配对/断连一次就“Bot 全不见了”。现在固定一个机器级 scope（见 `adoptLegacyScope`）。
+ */
+export const LOCAL_BOT_SCOPE = "local";
+
+/** 候选文件必须是完整合法的 registry（解析 + 每个条目过校验），否则不配当唯一单源。 */
+function parseRegistry(content: string): boolean {
+	try {
+		const parsed: unknown = JSON.parse(content);
+		if (!Array.isArray(parsed)) return false;
+		for (const entry of parsed) validate(entry as LocalBot);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * 一次性迁移：首次运行（本机 scope 文件还不存在）时，按修改时间从新到旧找一个**合法**的旧
+ * scope 文件搬过来。坏文件 / 异构文件一律跳过——迁移只是便利，绝不能把启动搞挂
+ * （旧文件全部保留，可人工回滚；迁移幂等）。
+ */
+async function adoptLegacyScope(directory: string, target: string): Promise<void> {
+	try {
+		await stat(target);
+		return;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+	}
+	const candidates: { path: string; mtime: number }[] = [];
+	try {
+		for (const entry of await readdir(directory, { withFileTypes: true })) {
+			if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+			const path = join(directory, entry.name);
+			if (path === target) continue;
+			const info = await stat(path).catch(() => undefined);
+			if (info) candidates.push({ path, mtime: info.mtimeMs });
+		}
+	} catch {
+		return;
+	}
+	candidates.sort((a, b) => b.mtime - a.mtime);
+	for (const candidate of candidates) {
+		const content = await readFile(candidate.path, "utf8").catch(() => undefined);
+		if (!content || !parseRegistry(content)) continue;
+		await writeFile(target, content, { mode: 0o600, flag: "wx" }).catch(() => undefined);
+		return;
+	}
+}
+
 export async function createLocalBotRegistry(dataDir: string): Promise<LocalBotRegistry> {
 	await mkdir(dataDir, { recursive: true });
 	const directory = join(dataDir, "device-bots");
 	await mkdir(directory, { recursive: true });
 	const scopeFile = (scope: string) => join(directory, `${createHash("sha256").update(scope).digest("hex")}.json`);
-	let file = scopeFile("unpaired");
+	const localFile = scopeFile(LOCAL_BOT_SCOPE);
+	await adoptLegacyScope(directory, localFile);
+	let file = localFile;
 	let bots = new Map<string, LocalBot>();
 	const leases = new Map<string, number>();
 	let serial: Promise<unknown> = Promise.resolve();
@@ -181,6 +247,18 @@ export async function createLocalBotRegistry(dataDir: string): Promise<LocalBotR
 		upsert: (input) =>
 			enqueue(async () => {
 				if (!input || typeof input !== "object") fail(400, "BOT_INVALID", "Invalid Bot");
+				// 模型只能起草、不能授权：模型 authorship 的 Bot 携带高权限工具时，
+				// 必须由确认卡把每一项列进 approvedTools，否则这里再拒一次（前端漏判也拦得住）。
+				if (input.identity?.authoredBy === "model") {
+					const approved = new Set(input.approvedTools ?? []);
+					const unapproved = (input.tools ?? []).filter((tool) => isBotToolHighPrivilege(tool) && !approved.has(tool));
+					if (unapproved.length)
+						fail(
+							400,
+							"BOT_NEEDS_APPROVAL",
+							`High-privilege tools require explicit human approval: ${unapproved.join(", ")}`,
+						);
+				}
 				const current = input.id ? mutable(input.id, input.revision) : undefined;
 				const bot = validate({ ...input, id: current?.id ?? randomUUID(), revision: (current?.revision ?? 0) + 1 });
 				bot.cwd = await validateDeviceProject(bot.cwd, dataDir);
@@ -196,6 +274,7 @@ export async function createLocalBotRegistry(dataDir: string): Promise<LocalBotR
 				next.delete(id);
 				await commit(next);
 			}),
+		busy: (id) => leases.has(id),
 		acquire: (id) =>
 			enqueue(async () => {
 				const bot = bots.get(id);

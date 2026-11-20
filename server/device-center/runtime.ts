@@ -7,6 +7,7 @@ import { VerificationStopUnconfirmedError } from "./local-verification.js";
 import { canonicalPath, computeCanonicalRepositoryId, git, verifyRepoRoot } from "../workspace-handle.js";
 import type { LocalBotRegistry } from "./bots.js";
 import { createDeviceCollabService } from "./collab-service.js";
+import { acquireWithBusyWait } from "./bot-lease-wait.js";
 import { botMemoryRoot, buildBotMemoryInjection, createBotMemory } from "./bot-memory.js";
 import type { DeviceCollabExecutionContext } from "./collab-tool.js";
 import {
@@ -43,7 +44,19 @@ import { assertPublishIntentScope, validatePublishIntent } from "./publish-inten
 import { readPublicationJournal, loadPublicationJournals } from "./publication-journal.js";
 import { PublicationStopUnconfirmedError } from "./local-publication.js";
 
-type Config = { hubUrl: string; deviceId: string; credential: string; allowExecution: boolean; accountId?: string };
+type Config = {
+	hubUrl: string;
+	deviceId: string;
+	credential: string;
+	allowExecution: boolean;
+	accountId?: string;
+	/**
+	 * 稳定的 Hub 身份串（本机引擎用）。本机 loopback Hub 每次启动换随机端口，
+	 * `hubUrl` 因此不能当作用域键：会话 transcript 绑定、任务恢复、报告 outbox、
+	 * 文件同步目录、工作区锁全都按它分桶，换端口就等于"历史全不认识"。
+	 */
+	hubIdentity?: string;
+};
 type Files = ReturnType<typeof createDeviceFileSync>;
 type Executor = {
 	run(task: DeviceExecutorTask): Promise<string>;
@@ -96,12 +109,14 @@ export function createDeviceRuntime(options: {
 	let generation = new AbortController();
 	const active = new Set<TaskOwner>();
 	const transferOperations = new Set<Promise<unknown>>();
+	// 一切"属于哪个 Hub"的持久化作用域都用稳定身份，不用会变的 URL。
+	const hubKey = config.hubIdentity ?? config.hubUrl;
 	const recovery = new TaskRecoveryManager({
 		dataDir: options.dataDir,
 		deviceId: config.deviceId,
-		hubUrl: config.hubUrl,
+		hubUrl: hubKey,
 	});
-	const reportOutbox = createTaskReportOutbox(options.dataDir, config.deviceId, config.hubUrl);
+	const reportOutbox = createTaskReportOutbox(options.dataDir, config.deviceId, config.hubUrl, config.hubIdentity);
 	const schedulerFile = options.dataDir ? join(options.dataDir, "task-scheduler-state.json") : undefined;
 	let schedulerSaveTimer: ReturnType<typeof setTimeout> | undefined;
 	let schedulerStatePending = false;
@@ -208,7 +223,7 @@ export function createDeviceRuntime(options: {
 	async function acquire(botId: string, signal?: AbortSignal, cancellationId?: string) {
 		enabled(signal);
 		await sweep();
-		const lease = await bots.acquire(botId);
+		const lease = await acquireWithBusyWait(() => bots.acquire(botId), { signal });
 		try {
 			enabled(signal);
 			await assertPublicationWorkspaceIdle(botId, lease.root);
@@ -249,7 +264,7 @@ export function createDeviceRuntime(options: {
 			if (!options.dataDir) throw new Error("File synchronization storage unavailable");
 			const canonicalRoot = resolve(lease.root);
 			const scopeToken = createHash("sha256")
-				.update(JSON.stringify([config.hubUrl, config.deviceId, roomId, botId, lease.revision, canonicalRoot]))
+				.update(JSON.stringify([hubKey, config.deviceId, roomId, botId, lease.revision, canonicalRoot]))
 				.digest("hex")
 				.slice(0, 32);
 			const scopedDataDir = join(options.dataDir, "scoped-transfers", scopeToken);
@@ -638,7 +653,7 @@ export function createDeviceRuntime(options: {
 					binding = createHash("sha256")
 						.update(
 							JSON.stringify([
-								config.hubUrl,
+								hubKey,
 								config.deviceId,
 								task.roomId,
 								lease.bot.id,
@@ -649,14 +664,29 @@ export function createDeviceRuntime(options: {
 						.digest("hex");
 					const stored = transcripts[task.conversationId];
 					if (task.resume) {
-						if (!stored || stored.binding !== binding)
-							throw new DeviceTaskError("Conversation unavailable or configuration changed");
-						try {
-							if (!statSync(stored.path).isFile()) throw new Error();
-						} catch {
-							throw new DeviceTaskError("Conversation transcript unavailable");
+						// resume 是"接着上一轮"的优化，不是会话不变量：Hub 对同一 conversationId 的后续轮次
+						// 一律带 resume=true，但转录要等上一轮真的跑出会话后才落盘。首轮失败 / 从未启动时
+						// 根本没有记录，旧行为在这里直接报 "Conversation unavailable or configuration changed"，
+						// 结果这条会话被永久判死（以后每条消息都复现同一个错）。没有记录 = 不可能丢历史，
+						// 所以当场降级为"开一轮新会话"；已有记录但 binding 对不上 / 文件没了仍报错，
+						// 那是真的配置不一致或转录被删，不能静默洗白成另一个会话。
+						if (!stored) {
+							// 执行器要求 `resume` 与 `resumePath` 严格一致（`executor.ts` 的"Resume requires an
+							// authorized local transcript path"），所以降级必须连标志一起改，而不是只留空路径。
+							task.resume = false;
+							console.warn(
+								`[DeviceRuntime] conversation ${task.conversationId} has no session yet (previous turn never produced one); starting a fresh session for task ${task.id}`,
+							);
+						} else {
+							if (stored.binding !== binding)
+								throw new DeviceTaskError("Conversation unavailable or configuration changed");
+							try {
+								if (!statSync(stored.path).isFile()) throw new Error();
+							} catch {
+								throw new DeviceTaskError("Conversation transcript unavailable");
+							}
+							resumePath = stored.path;
 						}
-						resumePath = stored.path;
 					} else if (stored) throw new DeviceTaskError("Conversation already exists; explicit resume required");
 				}
 				const memoryRoot = options.dataDir ? botMemoryRoot(options.dataDir, task.botId) : undefined;
@@ -664,6 +694,8 @@ export function createDeviceRuntime(options: {
 					? (
 							await buildBotMemoryInjection(createBotMemory({ root: memoryRoot }), {
 								cwd: executionCwd,
+								// 没有 memory 工具时不要叫模型 "去 search"：提示必须和实际能力一致。
+								searchable: lease.bot.tools.includes("memory"),
 							})
 						)?.text
 					: undefined;

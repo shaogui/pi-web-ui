@@ -1,4 +1,5 @@
 import {
+	app,
 	BrowserWindow,
 	dialog,
 	ipcMain,
@@ -36,6 +37,10 @@ import {
 	type InstalledExtension,
 } from "../browser/runtime/extension-state.js";
 import { fillCredential, fillTotpCode, publicCredential } from "../browser/runtime/credentials.js";
+import { mergeCredentials, parseCredentialCsv } from "../browser/runtime/credentials-csv.js";
+import { BOOKMARK_FILE_MAX_BYTES, mergeBookmarks, parseBookmarks } from "../browser/runtime/bookmarks-import.js";
+import { publicPasskey } from "../browser/runtime/passkeys.js";
+import { PASSKEY_PROMPT_MS, passkeyPromptDataUrl } from "../browser/runtime/passkey-prompt.js";
 import {
 	clampPopupSize,
 	placePopup,
@@ -45,7 +50,7 @@ import {
 	type PopupPoint,
 	type PopupSize,
 } from "../browser/runtime/extension-popup.js";
-import { isWebUrl } from "../browser/runtime/urls.js";
+import { isWebUrl, webOrigin } from "../browser/runtime/urls.js";
 import {
 	createTotpEntry,
 	normalizeOrigin,
@@ -86,6 +91,7 @@ import {
 	MIN_SPLIT_RATIO,
 	MAX_SPLIT_RATIO,
 } from "./browser-policy.js";
+import { parseTranslateBridgeRequest, translateEndpoint } from "./translate-bridge.js";
 
 const TEXT_EXTENSIONS = new Set([
 	".txt",
@@ -106,6 +112,8 @@ const TEXT_EXTENSIONS = new Set([
 	".svg",
 ]);
 const MAX_FILE_BYTES = 32 * 1024 * 1024;
+/** 密码 CSV 导入的文件上限：5000 行导出撑死几百 KB，超过就是选错文件了。 */
+const MAX_CREDENTIAL_CSV_BYTES = 8 * 1024 * 1024;
 const object = (value: unknown): Record<string, unknown> =>
 	value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 const text = (value: unknown): string => (typeof value === "string" ? value : "");
@@ -201,6 +209,8 @@ export class DesktopBrowserHost {
 	private networkRuleCount = 0;
 	private mode: BrowserMode;
 	private splitRatio: number;
+	/** passkey 本地确认小窗（同一时刻只留一个）。 */
+	private passkeyPrompt: BrowserWindow | null = null;
 	private agentUrl = "";
 	private agentReady = false;
 	private agentGeneration = 0;
@@ -239,6 +249,8 @@ export class DesktopBrowserHost {
 		"pi-desktop:browser-get-state",
 		"pi-desktop:browser-create-tab",
 		"pi-browser:capture-visible-tab",
+		"pi-browser:translate",
+		"pi-browser:downloads-reveal",
 	];
 
 	constructor(
@@ -248,6 +260,8 @@ export class DesktopBrowserHost {
 			browserPreload: string;
 			agentPreload: string;
 			dataDir: string;
+			/** Agent 页就绪（含重新加载）：主进程用它把双击文件/点链接的待打开目标送进界面。 */
+			onAgentReady?: () => void;
 		},
 	) {
 		this.browser = new BrowserManager({
@@ -391,12 +405,141 @@ export class DesktopBrowserHost {
 			if (this.mode === "agent") this.setMode("split");
 			return tabId;
 		});
+		// 网页侧自动填充下拉的两个口子（`browser/renderer/autofill.js`）
+		ipcMain.handle("pi-browser:autofill-lookup", (event) => {
+			const origin = this.webFrameOrigin(event);
+			return this.browser.storage
+				.listPasswords()
+				.filter((entry) => webOrigin(entry.url) === origin)
+				.map((entry) => ({ id: entry.id, name: entry.name, username: entry.username }));
+		});
+		// 网页划词/全页翻译：只认 browser session 的 http(s) frame，按 origin 校验，
+		// 目标地址由主进程从 agentUrl 派生，页面传来的任何 URL 一律不接受。
+		ipcMain.handle("pi-browser:translate", async (event, payload: unknown) => {
+			this.webFrameOrigin(event);
+			const request = parseTranslateBridgeRequest(payload);
+			if (!this.agentUrl) throw new Error("Agent runtime is not connected yet");
+			const response = await fetch(translateEndpoint(this.agentUrl), {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(request),
+				signal: AbortSignal.timeout(70_000),
+			});
+			if (!response.ok) {
+				const detail = await response.text().catch(() => "");
+				throw new Error(detail.slice(0, 300) || `Translation failed (HTTP ${response.status})`);
+			}
+			return (await response.json()) as { translations: string[]; model: string };
+		});
+		ipcMain.handle("pi-browser:passkey-confirm", async (event) => {
+			const origin = this.webFrameOrigin(event);
+			return await this.confirmPasskey(origin);
+		});
+		ipcMain.handle("pi-browser:autofill-pick", async (event, id: unknown) => {
+			const origin = this.webFrameOrigin(event);
+			const entry = this.browser.storage
+				.listPasswords()
+				.find((item) => item.id === id && webOrigin(item.url) === origin);
+			if (!entry) throw new Error("This credential belongs to a different website");
+			await fillCredential(event.sender, entry);
+			return true;
+		});
+		// 下载圆钮的「打开所在文件夹」（`browser/renderer/downloads.js` → `__piDownloads.reveal`）：
+		// 页面只给 id，路径由主进程自己的下载记录解析。这里不给页面任何「打开任意路径」的能力——
+		// 最差情况也只是把一次它自己刚触发的下载在文件管理器里标出来。
+		ipcMain.handle("pi-browser:downloads-reveal", (event, id: unknown) => {
+			this.webFrameOrigin(event);
+			const item = this.browser.getDownloads().find((entry) => entry.id === id && entry.state === "completed");
+			if (!item) return false;
+			shell.showItemInFolder(item.path);
+			return true;
+		});
 		// 扩展页面的 chrome.tabs.captureVisibleTab → 主进程截图（见 browser/runtime/extension-bridge.ts）
 		ipcMain.handle("pi-browser:capture-visible-tab", async (event, options: unknown) => {
 			if (event.sender.session !== this.browser.session) throw new Error("Untrusted capture request");
 			const origin = event.senderFrame?.url || event.sender.getURL();
 			if (!origin.startsWith("chrome-extension://")) throw new Error("Untrusted capture request");
 			return this.captureVisibleTab(object(options));
+		});
+	}
+
+	/**
+	 * 网页窄桥（自动填充 / 翻译 / passkey 确认 / 下载圆钮）的发送方校验：只认浏览器 session 里的
+	 * **网站 frame**，返回它的 origin。后面所有动作都按这个 origin 或 session 卡。
+	 */
+	private webFrameOrigin(event: IpcMainInvokeEvent): string {
+		if (event.sender.session !== this.browser.session) throw new Error("Untrusted website request");
+		const url = event.senderFrame?.url || event.sender.getURL();
+		const origin = webOrigin(url);
+		if (!origin) throw new Error("This action is only available on websites");
+		return origin;
+	}
+
+	/**
+	 * passkey 的本地确认：弹一个无边框小窗（“正在验证本机凭据…” → “已通过”），到时自动通过。
+	 *
+	 * Electron 没有可用的平台生物识别（见 docs/architecture-browser.md），所以这里**不假装**做了生物识别：
+	 * 文案明说是本地确认。弹窗本身出不来也不拦路——直接放行，passkey 照常用。
+	 */
+	private async confirmPasskey(_origin: string): Promise<boolean> {
+		if (this.passkeyPrompt && !this.passkeyPrompt.isDestroyed()) {
+			try {
+				this.passkeyPrompt.close();
+			} catch {}
+		}
+		let prompt: BrowserWindow;
+		try {
+			prompt = new BrowserWindow({
+				parent: this.window,
+				width: 372,
+				height: 86,
+				show: false,
+				frame: false,
+				resizable: false,
+				minimizable: false,
+				maximizable: false,
+				fullscreenable: false,
+				skipTaskbar: true,
+				alwaysOnTop: true,
+				focusable: false,
+				roundedCorners: true,
+				backgroundColor: "#1b1d24",
+				webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, devTools: false },
+			});
+		} catch {
+			return true;
+		}
+		this.passkeyPrompt = prompt;
+		return await new Promise<boolean>((resolve) => {
+			let settled = false;
+			const finish = (): void => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				if (!prompt.isDestroyed()) {
+					try {
+						prompt.destroy();
+					} catch {}
+				}
+				if (this.passkeyPrompt === prompt) this.passkeyPrompt = null;
+				resolve(true);
+			};
+			const timer = setTimeout(finish, PASSKEY_PROMPT_MS);
+			prompt.once("closed", finish);
+			void prompt
+				.loadURL(passkeyPromptDataUrl(app.getLocale()))
+				.then(() => {
+					if (prompt.isDestroyed()) return;
+					if (this.window && !this.window.isDestroyed()) {
+						const bounds = this.window.getBounds();
+						prompt.setBounds({
+							x: Math.round(bounds.x + (bounds.width - 372) / 2),
+							y: Math.round(bounds.y + (bounds.height - 86) / 2),
+						});
+					}
+					prompt.showInactive();
+				})
+				.catch(finish);
 		});
 	}
 
@@ -737,7 +880,18 @@ export class DesktopBrowserHost {
 		if (params.isEditable) {
 			template.push({ role: "cut" }, { role: "copy" }, { role: "paste" }, { type: "separator" }, { role: "selectAll" });
 		} else if (params.selectionText.trim()) {
-			template.push({ role: "copy" }, { type: "separator" });
+			template.push({ role: "copy" });
+			// 划词翻译：内容脚本注入了 showSelection，调它弹出译文浮层；
+			// 脚本尚未注入时用 selectionText 兜底，直接把译文塞进浮层做不到——故只在该帧加菜单项。
+			template.push({
+				label: "翻译选中内容 / Translate selection",
+				click: () => {
+					void contents
+						.executeJavaScript("window.__PI_TRANSLATE__ && window.__PI_TRANSLATE__.showSelection()")
+						.catch(() => {});
+				},
+			});
+			template.push({ type: "separator" });
 		}
 		let extensionItems: Electron.MenuItem[] = [];
 		try {
@@ -994,6 +1148,11 @@ export class DesktopBrowserHost {
 				this.publish();
 				// 启动占位消失在 Agent 模式时，把焦点交给刚就绪的页面，避免用户再点一下
 				if (this.mode === "agent") this.agent.webContents.focus();
+				try {
+					this.options.onAgentReady?.();
+				} catch (error) {
+					console.warn("[desktop] onAgentReady failed:", error);
+				}
 			});
 			this.agent.webContents.on("render-process-gone", (_event, details) =>
 				this.setAgentError(`Agent renderer: ${details.reason}`),
@@ -1033,6 +1192,15 @@ export class DesktopBrowserHost {
 		switch (action) {
 			case "state":
 				return this.getState();
+			case "focus": {
+				// 内部页要键盘焦点（新标签页的搜索框）：只认「自己就是当前活动标签」的请求。
+				// Agent 模式或地址浮层开着时不给——那时用户正在别处打字，抢走就是丢字。
+				if (this.mode === "agent" || this.overlay) return false;
+				const active = this.browser.getWebContents(this.browser.getActiveTabId() ?? "");
+				if (!active || active.isDestroyed() || active !== sender) return false;
+				active.focus();
+				return true;
+			}
 			case "overlay":
 				// 搜索浮层专用：外壳 DOM 盖住整块内容区时，内容视图得让位（原生视图不能被 DOM 覆盖）
 				if (sender === this.window.webContents) {
@@ -1084,6 +1252,8 @@ export class DesktopBrowserHost {
 			case "reload":
 				this.browser.reload();
 				return true;
+			case "devtools.toggle":
+				return this.browser.toggleDevTools(text(args.id) || undefined);
 			case "mode":
 				this.setMode(text(args.mode) as BrowserMode);
 				return true;
@@ -1101,6 +1271,35 @@ export class DesktopBrowserHost {
 				this.browser.saveBookmarks({ type: "folder", name: "Bookmarks", children: args.bookmarks });
 				this.publish();
 				return true;
+			case "bookmarks.import": {
+				// 导出文件由宿主读、宿主解析：书签 HTML 可能几 MB，渲染层不需要正文，只要回执里的条数
+				const chosen = await dialog.showOpenDialog(this.window, {
+					properties: ["openFile"],
+					filters: [
+						{ name: "书签文件（HTML / JSON）", extensions: ["html", "htm", "json"] },
+						{ name: "Chrome Bookmarks 数据文件", extensions: ["*"] },
+					],
+				});
+				if (chosen.canceled || !chosen.filePaths[0]) return null;
+				const source = chosen.filePaths[0];
+				const info = await stat(source);
+				if (info.size > BOOKMARK_FILE_MAX_BYTES)
+					throw new Error(`That file is over ${BOOKMARK_FILE_MAX_BYTES / 1024 / 1024} MB`);
+				const parsed = parseBookmarks(await readFile(source, "utf8"));
+				const root = this.browser.listBookmarks();
+				const merged = mergeBookmarks(root.children ?? [], parsed.nodes, {
+					folderName: text(args.folderName),
+				});
+				if (merged.imported) {
+					this.browser.saveBookmarks({ ...root, type: "folder", children: merged.children });
+					this.publish();
+				}
+				return {
+					imported: merged.imported,
+					duplicate: merged.duplicate,
+					skipped: parsed.skipped + merged.skipped,
+				};
+			}
 			case "design.status":
 				return this.browser.designStatuses();
 			case "design.get":
@@ -1134,7 +1333,7 @@ export class DesktopBrowserHost {
 				const url = object(args) && typeof args.url === "string" ? args.url.trim() : "";
 				const username = text(args.username).trim();
 				const password = typeof args.password === "string" ? args.password : "";
-				if (!name || !url || !username) throw new Error("Name, URL and username are required");
+				if (!name || !url) throw new Error("Name and URL are required");
 				if (id) {
 					const index = entries.findIndex((item) => item.id === id);
 					if (index < 0) throw new Error("This credential no longer exists");
@@ -1154,6 +1353,27 @@ export class DesktopBrowserHost {
 				this.browser.storage.savePasswords(entries);
 				return this.browser.storage.listPasswords().map(publicCredential);
 			}
+			case "passwords.import": {
+				// 密码 CSV 的正文只在主进程里过一遍：渲染层既读不到文件也看不到这 500 行明文
+				const chosen = await dialog.showOpenDialog(this.window, {
+					properties: ["openFile"],
+					filters: [{ name: "CSV 密码文件", extensions: ["csv", "tsv", "txt"] }],
+				});
+				if (chosen.canceled || !chosen.filePaths[0]) return null;
+				const source = chosen.filePaths[0];
+				const info = await stat(source);
+				if (info.size > MAX_CREDENTIAL_CSV_BYTES)
+					throw new Error(`That file is over ${MAX_CREDENTIAL_CSV_BYTES / 1024 / 1024} MB`);
+				const parsed = parseCredentialCsv(await readFile(source, "utf8"));
+				const merged = mergeCredentials(this.browser.storage.listPasswords(), parsed.rows);
+				if (merged.imported || merged.updated) this.browser.storage.savePasswords(merged.entries);
+				return {
+					imported: merged.imported,
+					updated: merged.updated,
+					duplicate: merged.duplicate,
+					skipped: parsed.skipped,
+				};
+			}
 			case "passwords.remove": {
 				const id = text(args.id);
 				const next = this.browser.storage.listPasswords().filter((item) => item.id !== id);
@@ -1164,6 +1384,16 @@ export class DesktopBrowserHost {
 				return this.browser.storage.savePasswords(args.entries ?? args.passwords);
 			case "passwords.available":
 				return this.browser.storage.isEncryptionAvailable();
+			case "passkeys.list":
+				// 同样只下发投影：privateKey 永远不出主进程
+				return this.browser.storage.listPasskeys().map(publicPasskey);
+			case "passkeys.remove": {
+				const id = text(args.id);
+				if (!id) throw new Error("passkeys.remove requires an id");
+				return this.browser.storage
+					.savePasskeys(this.browser.storage.listPasskeys().filter((entry) => entry.id !== id))
+					.map(publicPasskey);
+			}
 			case "passwords.fill": {
 				const entry = this.browser.storage.listPasswords().find((entry) => entry.id === args.id);
 				const contents = this.browser.getWebContents(this.browser.getActiveTabId() ?? "");
@@ -1229,6 +1459,13 @@ export class DesktopBrowserHost {
 				const item = this.browser.getDownloads().find((item) => item.id === args.id && item.state === "completed");
 				if (!item) throw new Error("Download not available");
 				return shell.openPath(item.path);
+			}
+			// 在文件管理器里定位（不执行文件）：传的只是 id，路径永远由主进程自己的记录给
+			case "download.reveal": {
+				const item = this.browser.getDownloads().find((item) => item.id === args.id && item.state === "completed");
+				if (!item) throw new Error("Download not available");
+				shell.showItemInFolder(item.path);
+				return true;
 			}
 			case "extensions.list":
 				return await this.listExtensions();

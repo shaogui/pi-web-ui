@@ -19,6 +19,7 @@ import { MessageList } from "./components/MessageList";
 import { ChatInput } from "./components/ChatInput";
 import { GoalBar } from "./components/GoalBar";
 import { SandboxModal } from "./components/SandboxModal";
+import { ProjectPickerHost } from "./components/ProjectPickerHost";
 import { DesktopSplitResizer } from "./components/DesktopSplitResizer";
 import { WorktreeView, useWorktreeRefresh } from "./components/WorktreeBanner";
 import { FiRefreshCw, FiFeather } from "react-icons/fi";
@@ -28,6 +29,7 @@ import { useOverlayZIndex } from "./overlay-stack";
 import { FooterBar } from "./components/FooterBar";
 import { formatSessionHash, parseSessionHash } from "./session-url";
 import { SideDock } from "./components/SideDock";
+import type { BarHostProps } from "./components/BarItem";
 import { Dialog } from "./components/Dialog";
 import { QuestionQueue } from "./components/QuestionQueue";
 import { resolveQuestionQueue, mergeOwnedPending } from "./question-queue";
@@ -95,7 +97,7 @@ import {
 import { setFenceSend, syncFenceRenderers, syncMessageWidgets } from "./plugin-fence";
 import { findFileHandler, syncFileHandlers, type FileHandlerPlugin } from "./plugin-file-handlers";
 const PiSetupModal = lazy(() => import("./components/PiSetupModal").then((m) => ({ default: m.PiSetupModal })));
-import { isDesktopShell } from "./desktop";
+import { getDesktopOpenFilesBridge, isDesktopShell } from "./desktop";
 const ModelConfigModal = lazy(() =>
 	import("./components/ModelConfigModal").then((m) => ({ default: m.ModelConfigModal })),
 );
@@ -151,6 +153,7 @@ import {
 	FiCheck,
 	FiChevronLeft,
 	FiChevronRight,
+	FiCpu,
 	FiInfo,
 	FiTrash2,
 	FiUpload,
@@ -199,8 +202,9 @@ import { useWallpaperEffect } from "./wallpaper";
 export interface PendingAttachment {
 	path: string;
 	name: string;
-	mode?: "inline" | "reference" | "lines" | "page" | "conversation" | "quote" | "canvas";
+	mode?: "inline" | "reference" | "lines" | "page" | "conversation" | "quote" | "canvas" | "terminal";
 	quote?: import("./types").TextQuote;
+	terminalId?: string;
 	conversationId?: string;
 	sessionPath?: string;
 	isDir?: boolean;
@@ -490,6 +494,17 @@ export function App() {
 			isOpen: () => previewOpenRef.current || pluginFileOpenRef.current !== null,
 		});
 		return () => registerFilePreviewHost(null);
+	}, [openFile]);
+	// 桌面壳：系统里双击关联文件（或在终端点链接）→ 主进程把绝对路径推过来，按扩展名派发
+	useEffect(() => {
+		const subscribe = getDesktopOpenFilesBridge();
+		if (!subscribe) return;
+		return subscribe(({ files }) => {
+			for (const path of files) {
+				const name = path.replace(/\\/g, "/").split("/").pop() || path;
+				openFile(path, name);
+			}
+		});
 	}, [openFile]);
 	const [lightboxImage, setLightboxImage] = useState<ImageLightboxTarget | null>(null);
 	const lightboxOpenRef = useRef(false);
@@ -834,6 +849,8 @@ export function App() {
 	}, [chat.pluginJobs, chat.ready, t]);
 	const setViewRefForPlugins = useRef(setView);
 	setViewRefForPlugins.current = setView;
+	const localeRefForPlugins = useRef(locale);
+	localeRefForPlugins.current = locale;
 	const uiSlotsRef = useRef(uiSlots);
 	uiSlotsRef.current = uiSlots;
 	useEffect(() => {
@@ -876,6 +893,7 @@ export function App() {
 					];
 				},
 				getConversationId: () => chatRefForPlugins.current.state?.conversationId ?? null,
+				getLocale: () => localeRefForPlugins.current,
 				getConversationOwner: () => chatRefForPlugins.current.state?.sharedConversation?.owner ?? null,
 				isConversationBlank: () => (chatRefForPlugins.current.state?.messages.length ?? 0) === 0,
 				listModels: () =>
@@ -1190,6 +1208,9 @@ export function App() {
 	const [settingsInitialSection, setSettingsInitialSection] = useState<"plugins" | undefined>();
 	const [sandboxModalMode, setSandboxModalMode] = useState<"create" | "promote" | "apply" | null>(null);
 	const openSandboxCreateModal = useCallback(() => setSandboxModalMode("create"), []);
+	// 项目选择器由 App 单实例持有：顶栏 chip、侧栏停靠栏、cwd chip 都能打开同一个。
+	const [projectPickerOpen, setProjectPickerOpen] = useState(false);
+	const openProjectPicker = useCallback(() => setProjectPickerOpen(true), []);
 	const transitionKind = chat.transition?.kind;
 	const transitionTarget = chat.transition?.target;
 	const transitionProgress = chat.transition?.progress;
@@ -2480,6 +2501,7 @@ export function App() {
 						onUiAction={onUiAction}
 						collapsed={termCollapsed}
 						onToggleCollapse={() => setTermCollapsed((v) => !v)}
+						onHide={() => closeDrawer("terminal")}
 					/>
 				</Suspense>
 			),
@@ -2530,6 +2552,32 @@ export function App() {
 		setNativeCliCreating(false);
 		if (id) setNativeCliCreateCwd(null);
 		else pushNotice("error", t("nativeCliCreateFailed"));
+	};
+
+	// 停靠栏与顶栏共用同一份宿主回调（`BarHostProps`）：少传一个就会变成点不动的按钮。
+	const sidebarBarProps: BarHostProps = {
+		chat,
+		view,
+		termOpen: termDrawerOpen,
+		gitOpen: gitDrawerOpen,
+		plugins: enabledPlugins,
+		onViewChange: handleViewChange,
+		onOpenPanel: setDrawer,
+		onOpenSettings: (sec) => {
+			setSettingsInitialSection(sec as any);
+			setSettingsOpen(true);
+		},
+		onOpenGlobalSearch: () => setGlobalSearchOpen(true),
+		onOpenBgTasks: () => setBgTasksOpen(true),
+		onOpenSandboxModal: openSandboxCreateModal,
+		onOpenProjectPicker: openProjectPicker,
+		isProjectPickerOpen: projectPickerOpen,
+		onCreateCli: openNativeCliCreate,
+		onUiAction,
+		uiContextEntries: uiSlots["contextmenu.topbar"],
+		zenMode,
+		onToggleZenMode: toggleZenMode,
+		dropdownProps: { theme, themes, onThemeChange: switchTheme, reloadThemes },
 	};
 
 	return (
@@ -2609,6 +2657,8 @@ export function App() {
 				onOpenGlobalSearch={() => setGlobalSearchOpen(true)}
 				onOpenIconEdit={() => setIconEditOpen(true)}
 				onOpenSandboxModal={() => setSandboxModalMode("create")}
+				onOpenProjectPicker={openProjectPicker}
+				isProjectPickerOpen={projectPickerOpen}
 				themes={themes}
 				theme={theme}
 				onThemeChange={switchTheme}
@@ -2624,6 +2674,11 @@ export function App() {
 					onCreate={createNativeCliConversation}
 				/>
 			)}
+			<ProjectPickerHost
+				open={projectPickerOpen}
+				pathCompletions={chat.pathCompletions ?? []}
+				onClose={() => setProjectPickerOpen(false)}
+			/>
 			{iconEditOpen && (
 				<IconEditor
 					slots={uiSlots}
@@ -2724,34 +2779,7 @@ export function App() {
 					) : (
 						drawer && <div className="drawer-backdrop" onClick={() => setDrawer(null)} />
 					)}
-					<SideDock
-						side="left"
-						onCreateCli={openNativeCliCreate}
-						items={uiSidebarLeft}
-						chat={chat}
-						view={view}
-						plugins={enabledPlugins}
-						dropdownProps={{
-							theme,
-							themes,
-							onThemeChange: switchTheme,
-							reloadThemes,
-						}}
-						onViewChange={handleViewChange}
-						onOpenPanel={setDrawer}
-						onOpenSettings={(sec) => {
-							setSettingsInitialSection(sec as any);
-							setSettingsOpen(true);
-						}}
-						onOpenBgTasks={() => setBgTasksOpen(true)}
-						onOpenGlobalSearch={() => setGlobalSearchOpen(true)}
-						onUiAction={onUiAction}
-						uiContextTopbar={uiSlots["contextmenu.topbar"]}
-						onThemeToggle={() => switchTheme(theme === "light" ? null : "light")}
-						onSoundToggle={() => setSound({ ...sound, enabled: !sound.enabled })}
-						zenMode={zenMode}
-						onToggleZenMode={toggleZenMode}
-					/>
+					<SideDock side="left" items={uiSidebarLeft} barProps={sidebarBarProps} />
 					<div className={`view-pane ${view === "chat" || view === "terminal" || view === "git" ? "" : "hidden"}`}>
 						{!isMobile && leftCollapsed && <PanelRail side="left" onClick={toggleLeft} />}
 						<div
@@ -2779,6 +2807,7 @@ export function App() {
 								activeConversationId={activeGroupId ? "" : chat.activeConversationId}
 								sharedConversationOwner={chat.state?.sharedConversation?.owner}
 								activeGroupId={activeGroupId}
+								activeBotId={activeGroupId ? null : (chat.state?.bot?.id ?? null)}
 								uiContextSession={uiSlots["contextmenu.session"]}
 								uiLeftSessions={uiLeftSessions}
 								uiContextProject={uiSlots["contextmenu.project"]}
@@ -2883,6 +2912,12 @@ export function App() {
 											)}
 											{chat.state ? (
 												<>
+													{!sharedReadOnly && chat.state.bot && (
+														<div className="bot-chat-bar" role="status">
+															<FiCpu aria-hidden />
+															<span>{t("botChatWith", { name: chat.state.bot.name })}</span>
+														</div>
+													)}
 													{!sharedReadOnly && chat.state.sandbox && (
 														<div className="sandbox-banner" role="region" aria-label={chat.state.sandbox.name}>
 															<div className="sandbox-banner-info">
@@ -3227,6 +3262,7 @@ export function App() {
 													chat.state?.sharedConversation?.owner,
 												)}
 												activeConversationId={activeConvId}
+												currentCwd={chat.state?.cwd}
 												mode={chat.settings?.questionPresentation ?? "queue"}
 											/>
 											<ToolApprovalDialog
@@ -3307,6 +3343,7 @@ export function App() {
 													sessionDraft={chat.state?.draft ?? null}
 													sessionId={chat.state?.sessionId ?? ""}
 													preserveDraftAcrossConversations={chat.settings?.preserveDraftAcrossConversations ?? false}
+													goal={chat.goal}
 												/>
 											)}
 										</>
@@ -3414,34 +3451,7 @@ export function App() {
 							failed={failedPluginViews.includes(view.slice("plugin:".length))}
 						/>
 					)}
-					<SideDock
-						side="right"
-						onCreateCli={openNativeCliCreate}
-						items={uiSidebarRight}
-						chat={chat}
-						view={view}
-						plugins={enabledPlugins}
-						dropdownProps={{
-							theme,
-							themes,
-							onThemeChange: switchTheme,
-							reloadThemes,
-						}}
-						onViewChange={handleViewChange}
-						onOpenPanel={setDrawer}
-						onOpenSettings={(sec) => {
-							setSettingsInitialSection(sec as any);
-							setSettingsOpen(true);
-						}}
-						onOpenBgTasks={() => setBgTasksOpen(true)}
-						onOpenGlobalSearch={() => setGlobalSearchOpen(true)}
-						onUiAction={onUiAction}
-						uiContextTopbar={uiSlots["contextmenu.topbar"]}
-						onThemeToggle={() => switchTheme(theme === "light" ? null : "light")}
-						onSoundToggle={() => setSound({ ...sound, enabled: !sound.enabled })}
-						zenMode={zenMode}
-						onToggleZenMode={toggleZenMode}
-					/>
+					<SideDock side="right" items={uiSidebarRight} barProps={sidebarBarProps} />
 				</div>
 				<Suspense fallback={null}>
 					<BottomDock

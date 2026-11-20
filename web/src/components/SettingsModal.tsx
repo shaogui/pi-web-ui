@@ -100,6 +100,7 @@ import {
 } from "../prompt-history";
 import { randomUuid } from "../uuid";
 import { QuickAskSettings, type QuickAskPatch } from "./QuickAskSettings";
+import { BotDraftSettings, type BotDraftPatch } from "./BotDraftSettings";
 import type { UiExtensionInventoryEntry } from "../types";
 import { SubagentTemplateWizard } from "./SubagentTemplateWizard";
 import { formatTokenDraft, parseTokenInput } from "../token-input";
@@ -452,6 +453,7 @@ type SettingsTab =
 	| "models"
 	| "prompt"
 	| "quick-ask"
+	| "bots"
 	| "prompt-history"
 	| "scheduler"
 	| "tools"
@@ -474,7 +476,7 @@ type SettingsTab =
 	| "device-collab"
 	| "desktop";
 
-interface SettingsPatch extends QuickAskPatch {
+interface SettingsPatch extends QuickAskPatch, BotDraftPatch {
 	nativeCliInheritModel?: UiSettingsState["nativeCliInheritModel"];
 	chatUploadMaxMb?: number;
 	workspaceUploadMaxMb?: number;
@@ -1067,6 +1069,7 @@ function LoadedSettingsModal({
 			: []),
 		...(isPi || isDsh ? [{ id: "prompt" as const, icon: <FiFileText />, label: t("settingsSystemPrompt") }] : []),
 		{ id: "quick-ask" as const, icon: <FiMessageSquare />, label: t("quickAskSettingsTitle") },
+		...(isPi ? [{ id: "bots" as const, icon: <FiCpu />, label: t("settingsBotsTitle") }] : []),
 		{
 			id: "prompt-history",
 			icon: <FiClock />,
@@ -1223,6 +1226,7 @@ function LoadedSettingsModal({
 		models: "core",
 		prompt: "core",
 		"quick-ask": "core",
+		bots: "core",
 		presets: "core",
 		"dsh-presets": "core",
 		"subagent-templates": "core",
@@ -1541,7 +1545,7 @@ function LoadedSettingsModal({
 		setPartial(patch);
 	};
 	const disabledMarkers = new Set(settings.disabledMarkers ?? []);
-	// 标记没有独立的全局开关：只要还剩一个开着就是启用，全关 = 不再注入/解析标记。
+	// 标记没有独立的全局开关：只要还剩一个开着就是启用，{t("toolFlowAllOff")} = 不再注入/解析标记。
 	const markersOn = (settings.markers ?? []).filter((m) => m.enabled).length;
 	const markersTotal = settings.markers?.length ?? 0;
 	const toggleMarker = (name: string) => {
@@ -3204,6 +3208,7 @@ function LoadedSettingsModal({
 						)}
 
 						{tab === "quick-ask" && <QuickAskSettings settings={settings} onChange={setPartial} />}
+						{tab === "bots" && <BotDraftSettings settings={settings} onChange={setPartial} />}
 
 						{tab === "prompt" && !isDsh && (
 							<details className="set-section prompt-a-fold">
@@ -3596,13 +3601,16 @@ function LoadedSettingsModal({
 															{t("toolOnDemandTools")} · {onDemandEffectiveCount}
 														</span>
 														<span className="toolflow-count">
-															常驻<b>{rs}</b>
+															{t("toolFlowResident")}
+															<b>{rs}</b>
 														</span>
 														<span className="toolflow-count">
-															按需<b>{lz}</b>
+															{t("toolFlowLazy")}
+															<b>{lz}</b>
 														</span>
 														<span className="toolflow-count">
-															关闭<b>{of}</b>
+															{t("toolFlowOff")}
+															<b>{of}</b>
 														</span>
 													</>
 												);
@@ -3855,7 +3863,7 @@ function LoadedSettingsModal({
 														setPartial({ disabledMarkers: [...keep] });
 													}}
 												>
-													全开
+													{t("toolFlowAllOn")}
 												</button>
 												<button
 													type="button"
@@ -6269,6 +6277,7 @@ function LoadedSettingsModal({
 														pluginUpdates={chat.pluginUpdates}
 														pluginJobs={chat.pluginJobs}
 														inventoryEntries={inventoryEntries}
+														pageEntries={uiSlots["settings.pages"]}
 														models={settings?.subagentModels ?? []}
 														epoch={chat.pluginsEpoch}
 														onTogglePlugin={togglePlugin}
@@ -6734,6 +6743,8 @@ function LoadedSettingsModal({
 												model: "",
 												thinkingLevel: "",
 												enabled: true,
+												// 新建模板显式定为常规：不让名字里的 explore / review 把用户新写的模板悄悄锁成只读
+												securityMode: "normal" as const,
 											});
 											setTplIsNew(true);
 										}}
@@ -6824,6 +6835,12 @@ function LoadedSettingsModal({
 															<span className="tpl-badge default">{t("tplDefaultBadge")}</span>
 														)}
 														{!tp.enabled && <span className="tpl-badge">{t("subagentTemplateClosed")}</span>}
+														{tp.securityMode === "readonly" && (
+															<span className="tpl-badge secure">{t("tplSecurityBadgeReadonly")}</span>
+														)}
+														{tp.securityMode === "verify" && (
+															<span className="tpl-badge secure">{t("tplSecurityBadgeVerify")}</span>
+														)}
 													</div>
 													<div className="set-row-desc">
 														{(!isZhLocale(locale) && tp.descriptionEn ? tp.descriptionEn : tp.description) ||
@@ -6899,7 +6916,7 @@ function LoadedSettingsModal({
 
 						{tab === "device-collab" && isPi && <DeviceExecutionSettings onNotice={() => triggerSyncState()} />}
 
-						{tab === "desktop" && inDesktopShell && <DesktopAppSettings />}
+						{tab === "desktop" && inDesktopShell && <DesktopAppSettings plugins={chat.plugins} />}
 
 						{tab === "approval-rules" && !isDsh && (
 							<div className="set-section">

@@ -25,6 +25,10 @@ bin/ffmpeg/
 
 plugins/*/node_modules/
 plugins/*/package-lock.json
+# 例外：这两个插件的 lock 是仓库自带的构建输入（CI 的「plugin bundle 是最新的」门禁要 npm ci），
+# 必须留痕。没有例外时，`git add -A` 从空索引快照会静默把它们删掉。
+!plugins/db-client/package-lock.json
+!plugins/vscode-editor/package-lock.json
 plugins/voice-input/package*.json
 plugins/voice-input/whisper-cache/
 
@@ -60,6 +64,11 @@ plugin-registry/
 
 dev/wechat-shot*.png
 *.png
+# 例外：仓库自带、被追踪的图（PWA 图标与 dev 预览图）。`*.png` 只收新截图，不能连老资产一起吞。
+!web/public/icons/*.png
+!dev/search-1.png
+!dev/search-2.png
+!dev/notice-preview-dark.png
 *.jpg
 *.jpeg
 !assets/**
@@ -89,5 +98,20 @@ capsule-palettes.html
 
 # 手机调试包（构建产物，不入库）
 /pi-web-ui-mobile-debug.apk
+<<<<<<< HEAD
 tests/
 update.sh
+=======
+/pi-web-ui-mobile-*.apk
+
+# 临时草稿的唯一合法落点（细则见 docs/agent-rules.md §八，守卫 tests/unit/repo-hygiene.test.ts）
+/.scratch/
+# 根级一次性产物：日志 / 备份 / 对比页 / 安装包
+/debug.log
+/*.log
+/.tmp-*
+*.bak
+/preview-*.html
+/*.apk
+/*.msi
+>>>>>>> a3f4f6e72c98e3cf88395c8cfebc7820718a4bed

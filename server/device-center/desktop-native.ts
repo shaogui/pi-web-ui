@@ -1,7 +1,9 @@
+import { parseDesktopCursor, type DesktopCursor, type DesktopCursorMode } from "./desktop-cursor.js";
 import { parseDesktopProfile, type DesktopProfile } from "./desktop-quality.js";
 import { parseDesktopDisplays, type DesktopDisplays } from "./desktop-displays.js";
-import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdtempSync, rm, writeFileSync } from "node:fs";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawnChildPiped, type SpawnedChild } from "../spawn-child.js";
+import { existsSync, mkdtempSync, realpathSync, rm, writeFileSync } from "node:fs";
 import { release, tmpdir } from "node:os";
 import { join } from "node:path";
 import { windowsDesktopScript } from "./native-desktop/windows.js";
@@ -112,6 +114,29 @@ function powershellPath(): string {
 	return join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 }
 
+/**
+ * macOS 上「有没有 Swift 工具链」：等价于 `xcrun --find swift`，但**只查文件系统**。
+ *
+ * 为什么不用 xcrun：它会 fork 一个子进程，而 `nativeDesktopStatus()` 是同步能力探测（会被
+ * UI 状态查询与启动路径直接调用）；一旦 xcrun 卡在「Xcode 许可未同意」的交互上，整个服务端
+ * 事件循环就被钉住（同步子进程没有超时可用）。xcode-select 的落点本身就是文件：
+ * `DEVELOPER_DIR` 环境变量 → `/var/db/xcode_select_link` 符号链接 → CommandLineTools → Xcode.app。
+ */
+function macSwiftToolchainAvailable(): boolean {
+	const candidates: string[] = [];
+	const configured = process.env.DEVELOPER_DIR?.trim();
+	if (configured) candidates.push(configured);
+	try {
+		candidates.push(realpathSync("/var/db/xcode_select_link"));
+	} catch {}
+	candidates.push("/Library/Developer/CommandLineTools", "/Applications/Xcode.app/Contents/Developer");
+	const inside = (dir: string) =>
+		["usr/bin/swift", "usr/bin/swiftc", "Toolchains/XcodeDefault.xctoolchain/usr/bin/swift"].some((rel) =>
+			existsSync(join(dir, rel)),
+		);
+	return candidates.some((dir) => Boolean(dir) && inside(dir)) || existsSync("/usr/bin/swift");
+}
+
 export function nativeDesktopStatus(): { supported: boolean; backend: string; reason?: string } {
 	if (process.platform === "win32") {
 		if (windowsDesktopServicePath()) return { supported: true, backend: "windows-system-desktop" };
@@ -130,17 +155,7 @@ export function nativeDesktopStatus(): { supported: boolean; backend: string; re
 				backend: "macos-screencapturekit",
 				reason: "Native capture requires macOS 14 or newer.",
 			};
-		let swiftAvailable = false;
-		try {
-			swiftAvailable = Boolean(
-				execFileSync("/usr/bin/xcrun", ["--find", "swift"], {
-					encoding: "utf8",
-					timeout: 1500,
-					maxBuffer: 4096,
-					stdio: ["ignore", "pipe", "ignore"],
-				}).trim(),
-			);
-		} catch {}
+		const swiftAvailable = macSwiftToolchainAvailable();
 		return swiftAvailable
 			? { supported: true, backend: "macos-screencapturekit" }
 			: {
@@ -171,16 +186,15 @@ export async function requestNativeDesktopPermissions(
 	return new Promise((resolve, reject) => {
 		let directory: string | undefined;
 		let child: ChildProcessWithoutNullStreams | undefined;
+		let stopChild: SpawnedChild["stop"] | undefined;
 		let settled = false;
 		let closed = false;
 		let stdout = Buffer.alloc(0);
 		let stderr = Buffer.alloc(0);
 		let timeout: ReturnType<typeof setTimeout> | undefined;
-		let killTimer: ReturnType<typeof setTimeout> | undefined;
 		function cleanup() {
 			closed = true;
 			clearTimeout(timeout);
-			clearTimeout(killTimer);
 			signal?.removeEventListener("abort", abort);
 			if (directory) rm(directory, { recursive: true, force: true, maxRetries: 2 }, () => {});
 		}
@@ -189,23 +203,17 @@ export async function requestNativeDesktopPermissions(
 			settled = true;
 			clearTimeout(timeout);
 			signal?.removeEventListener("abort", abort);
-			if (child && !closed) {
-				child.kill("SIGTERM");
-				if (!closed) {
-					killTimer = setTimeout(() => child?.kill("SIGKILL"), 1500);
-					killTimer.unref();
-				}
-			}
+			// 先 SIGTERM，宽限后由 stop() 收整棵树（原路径只 kill 主进程，孙进程会漏）。
+			if (child && !closed) void stopChild?.({ graceMs: 1500 });
 			reject(error);
 		}
 		function abort() {
 			fail(new Error("Native desktop permission request aborted."));
 		}
 		try {
-			child = spawn(helper, [`permissions-${kind}`], {
-				stdio: ["pipe", "pipe", "pipe"],
-				windowsHide: true,
-			});
+			const spawned = spawnChildPiped({ cmd: helper, args: [`permissions-${kind}`] });
+			child = spawned.child;
+			stopChild = spawned.stop;
 			child.stdout.on("data", (chunk: Buffer) => {
 				if (settled) return;
 				if (stdout.length + chunk.length > 4096) {
@@ -262,6 +270,7 @@ export async function requestNativeDesktopPermissions(
 }
 
 export type NativeDesktopOptions = {
+	onCursor?: (cursor: DesktopCursor) => void;
 	onVideoAlive?: () => void;
 	onRawFrame?: (frame: { data: Buffer; width: number; height: number }, ack: () => void) => void;
 	onDisplays?: (displays: DesktopDisplays) => void;
@@ -277,6 +286,7 @@ export type NativeDesktopOptions = {
 	onVideo?: (frame: VideoFrame) => void;
 };
 export type NativeDesktopHandle = {
+	setCursorMode?(mode: DesktopCursorMode): void;
 	requestKeyframe?(): void;
 	videoFeedback?(paused: boolean): void;
 	input(event: NativeDesktopInput): void;
@@ -304,6 +314,7 @@ function startNativeDesktopOnce(
 	const status = nativeDesktopStatus();
 	const readOnly = options.preview === true || options.readOnly !== false;
 	let child: ChildProcessWithoutNullStreams | undefined;
+	let stopChild: SpawnedChild["stop"] | undefined;
 	let directory: string | undefined;
 	let closing = false;
 	let finished = false;
@@ -320,6 +331,7 @@ function startNativeDesktopOnce(
 	let videoCodec: string | undefined;
 	let videoReset = true;
 	let pendingConfiguration: object | undefined;
+	let pendingCursor: DesktopCursorMode | undefined;
 	const splitVideo = () =>
 		createH264Splitter((value) => {
 			if (value.data.length > MAX_FRAME) throw new Error("Encoded desktop frame exceeds limit.");
@@ -352,7 +364,8 @@ function startNativeDesktopOnce(
 		}
 		if (!child.stdin.destroyed) child.stdin.end('{"type":"close"}\n');
 		timer = setTimeout(() => {
-			child?.kill();
+			// 宽限期到：交给 stop() 收整棵进程树（原路径只 kill 主进程，孙进程会漏）。
+			void stopChild?.({ graceMs: 0 });
 		}, 1500);
 		timer.unref();
 	}
@@ -402,7 +415,7 @@ function startNativeDesktopOnce(
 				headerUsed = 0;
 				const length = header.readUInt32BE();
 				if (
-					length < (options.video ? (service ? 1 : 3) : 4) ||
+					length < (options.video ? 1 : 4) ||
 					length > (options.onRawFrame ? 32 * 1024 * 1024 : MAX_FRAME + (service && options.video ? 10 : 0))
 				) {
 					fail("Invalid native desktop frame length (maximum 4 MB).");
@@ -419,7 +432,7 @@ function startNativeDesktopOnce(
 			if (frameUsed === frame.length) {
 				const jpeg = frame;
 				frame = undefined;
-				if (jpeg[0] === 5 && jpeg.length === 1 && service && options.video) {
+				if (jpeg[0] === 5 && jpeg.length === 1 && options.video) {
 					armWatchdog();
 					options.onVideoAlive?.();
 					continue;
@@ -485,19 +498,34 @@ function startNativeDesktopOnce(
 					continue;
 				}
 				if (jpeg[0] === 0x02 && options.onVideo) {
+					if (jpeg.length < 3 || jpeg[1] > 3) return fail("Invalid native video frame.");
 					armWatchdog();
 					try {
-						options.onVideo({ data: jpeg.subarray(2), key: (jpeg[1] & 1) === 1 });
+						const data = jpeg.subarray(2),
+							key = Boolean(jpeg[1] & 1);
+						if (jpeg[1] & 2) videoReset = true;
+						if (displayConfirmed && (!videoReset || key)) {
+							videoCodec = h264Codec(data) ?? videoCodec;
+							options.onVideo({ data, key, reset: videoReset, codec: videoCodec });
+							videoReset = false;
+						}
 					} catch {
 						fail("Native desktop video consumer failed.");
 						return;
 					}
 					continue;
 				}
-				if (jpeg[0] === 123 && jpeg.length <= 8192) {
+				if (jpeg[0] === 123 && jpeg.length <= 45000) {
 					let displays: DesktopDisplays | undefined;
 					try {
-						displays = parseDesktopDisplays(JSON.parse(jpeg.toString("utf8")));
+						const message = JSON.parse(jpeg.toString("utf8"));
+						if (message?.type === "cursor") {
+							const cursor = parseDesktopCursor(message);
+							if (!cursor) return fail("Invalid desktop cursor.");
+							if (displayConfirmed) options.onCursor?.(cursor);
+							continue;
+						}
+						if (jpeg.length <= 8192) displays = parseDesktopDisplays(message);
 					} catch {}
 					if (!displays) {
 						fail("Invalid desktop display metadata.");
@@ -527,7 +555,16 @@ function startNativeDesktopOnce(
 		}
 	}
 	const handle: NativeDesktopHandle = {
-		...(service && options.video && windowsDesktopServiceProfiles(service, "video-flow-v1")
+		...(!options.preview && !inputOnly && (!service || windowsDesktopServiceProfiles(service, "cursor-v1"))
+			? {
+					setCursorMode(mode: DesktopCursorMode) {
+						if (child) write({ type: "cursor_mode", mode });
+						else pendingCursor = mode;
+					},
+				}
+			: {}),
+		...(options.video &&
+		(process.platform === "darwin" || (service && windowsDesktopServiceProfiles(service, "video-flow-v1")))
 			? {
 					videoFeedback(paused: boolean) {
 						if (!closing) write({ type: "video_flow", paused });
@@ -591,21 +628,24 @@ function startNativeDesktopOnce(
 						: inputOnly
 							? "input"
 							: options.video
-								? "video"
+								? readOnly
+									? "video-view"
+									: "video"
 								: options.preview
 									? "preview"
 									: readOnly
 										? "view"
 										: "control";
-			child = spawn(
-				service ?? (windows ? powershellPath() : path),
-				service
+			const spawned = spawnChildPiped({
+				cmd: service ?? (windows ? powershellPath() : path),
+				args: service
 					? ["--client", mode]
 					: windows
 						? ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", path, mode]
 						: [mode],
-				{ stdio: ["pipe", "pipe", "pipe"], windowsHide: true },
-			);
+			});
+			child = spawned.child;
+			stopChild = spawned.stop;
 			child.stdout.on("data", receive);
 			child.stdout.on("error", () => fail("Native desktop capture stream failed."));
 			child.stdin.on("error", () => fail("Native desktop input stream closed."));
@@ -633,6 +673,7 @@ function startNativeDesktopOnce(
 				write({ type: "displays" });
 				if (options.display) write({ type: "display", id: options.display });
 			}
+			if (pendingCursor) write({ type: "cursor_mode", mode: pendingCursor });
 			if (pendingConfiguration) {
 				write(pendingConfiguration);
 				pendingConfiguration = undefined;

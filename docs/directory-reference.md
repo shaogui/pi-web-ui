@@ -16,11 +16,15 @@ pi-web-ui/
 ├── bin/pi-web-ui.mjs           # CLI：前台启动 / server install|uninstall|start|stop|restart|status
 ├── desktop/                    # Electron 桌面壳（sidecar：随机空闲口起 dist/server + BrowserWindow）
 │   ├── main.ts                 # 主进程：ready → 选空闲口 → spawn server(ELECTRON_RUN_AS_NODE) → loadURL
-│   ├── electron-builder.yml    # 打包配置（win nsis / mac dmg / linux AppImage；npmRebuild:false）
+│   ├── runtime-store.ts        # 双层模型 P0：只读决定跑 userData 运行时还是包内自带（协议闸门/隔离/回落）
+│   ├── runtime-manifest.ts     # 双层模型 P1：清单解析 + ed25519 校验 + 四道闸门 + 归档白名单/摘要校验
+│   ├── runtime-updater.ts      # 双层模型 P2：清单拉取→验签→流式下载→校验→解包暂存（切换/回滚由 main 注入）
+│   ├── runtime-config.ts       # 双层模型信任根：内置 ed25519 公钥（留空=拒绝）、壳能力版本、默认 feed
+│   ├── system-integration.ts   # Windows 默认浏览器/文件关联：HKCU 注册表规划、reg 输出解析、argv → 待打开目标
+│   ├── electron-builder.yml    # 打包配置（win nsis / mac dmg / linux AppImage，可选 msi；npmRebuild:false）
 │   └── README.md               # 桌面版说明：跑起来 / 约定 / 发布 / 签名（SignPath）
 ├── deploy/                     # 部署示例：launchd plist / systemd unit / Windows 任务 XML
 ├── themes/                     # 内置主题（完整样式表：:root 变量 + 任意选择器/布局覆盖皆可，styles.css 只是共享基线）
-├── make-light-theme.mjs        # 主题生成器（从 styles.css 的 :root 变量清单生成纯调色板）
 ├── tests/                      # 全部测试脚本（自包含：独立端口 ≥8900 + 临时 data-dir）
 │   ├── run-smoke.mjs           # 零 token 协议冒烟聚合跑器（ALL 列表；插件后台作业/目录同步 plugin-jobs-test、多根工作区
 │   │                           #   workspace-roots-test 都在里面）
@@ -32,6 +36,10 @@ pi-web-ui/
 │   │                           #     context-menu-ui-test（右键菜单槽位）/ ui-layout-ui-test（布局页 ↔ 界面一致性）/ plugin-settings-page-test（插件设置页）/ plugin-settings-select-ui-test（插件设置下拉）/ plugin-topbar-ui-test（顶栏条目 + 面板内后台卸载）/ elsewhere-click-takeover-ui-test（「另一处」行左键两段确认过户）
 │   └── scratch/                # 一次性调试脚本（gitignore，不入库）
 ├── scripts/check-protocol-sync.mjs  # 守护 types.ts shim 单源机制 + protocol.ts 纯类型约束
+├── scripts/bench-remote-scan.mjs # SFTP 远程扫描基准（mock SSH 宽树：层级 × 每层目录数）
+├── scripts/make-light-theme.mjs # 主题生成器（从 styles.css 的 :root 变量清单生成纯调色板）
+├── scripts/build-desktop-runtime.mjs  # 双层模型 P1：打 core tar.zst + 写 runtime-<p>-<a>.json + ed25519 签名（--keygen 出密钥）
+├── scripts/verify-desktop-runtime.mjs # 双层模型 P1：清单↔归档↔签名互验 + 归档条目白名单逐条过（CI 干跑）
 ├── scripts/safe-exec.mjs       # 跨平台防卡死执行器：stdin 接地 + 硬超时/空闲超时杀进程树（复用 killPidTree）+ 日志落盘 + --detach 守护进程托管 + --wait/--status(JSON) 轮询；日志落 .safe-exec/（gitignore）
 ├── .github/workflows/ci.yml    # CI：协议同步 → typecheck → build → vitest → 冒烟
 ├── .github/workflows/release-notes.yml   # tag 推送 → 按 CHANGELOG 建/更新 GitHub Release
@@ -62,6 +70,12 @@ server/
 ├── text-sniff.ts           # 文件预览纯函数（previewKind/looksLikeText/decodeText/sniffImageMime/hexDump/countLines）
 ├── queue-utils.ts          # 排队消息纯函数（removeFirstOccurrence：只移除第一条匹配，重复文本不连带删除）
 ├── process-utils.ts        # 进程工具：snapshotListeningPorts/killPidTree/lookupProcessName
+├── hide-console-windows.ts  # ★ Windows 进程级「不弹控制台」开关：patch spawn/spawnSync/exec/execSync/execFile/execFileSync/fork 注入 windowsHide（单源；CLI/桌面壳用生成件 bin/lib/hide-console-windows.mjs，见 docs/agent-rules.md §四）
+├── spawn-child.ts         # ★ 常驻子进程单源：spawn + 统一 options + stop()（先 grace 再杀整棵树）；raw 流给 LSP/MCP/引擎/采集/二进制协议
+├── run-process.ts          # ★ 子进程执行单源：spawn + 超时/取消杀整棵树 + 行回调 + stdin 接地 + NO_COLOR（调用点不再手写 detached/stdio/windowsHide）
+├── git-run.ts              # ★ git 调用单源：runGit/runGitText + gitEnv/stripGitEnv（quotepath=false、禁提示环境、16MB、失败取 stderr 首行）
+├── shell-quote.ts          # ★ shell / PowerShell 引号单源（CLI 侧镜像件 bin/lib/shell-quote.mjs）
+├── async-utils.ts          # sleep（定时器不 unref，避免收尾路径被提前退出截断）
 ├── client-state.ts         # ClientStateStore：<dataDir>/client-state.json 持久化
 ├── uploads.ts              # 文件对话上传 + 保留期清理
 ├── bg-servers.ts           # 后台任务跟踪（bash 前后端口快照 diff + 存活刷新 + 闲置超阈值自动清理/📌钉住）
@@ -74,11 +88,14 @@ server/
 ├── tool-manager.ts         # ★ Agent 工具统一开关：AGENT_TOOL_CATALOG ＋ tool_manage 出入口（setAgentToolEnabled/applyAgentToolsGating），持久化只有 disabledAgentTools
 ├── tool-approval.ts        # 人机协同拦截与改写执行（HITL：Edit & Run），门禁在 ClientSession.askApproval
 ├── approval-rules.ts       # ★ 审批规则库与匹配引擎（ApprovalRulesStore：<dataDir>/approval-rules.json，多工具/多字段/多模式规则；ask/deny/allow 三种动作；纯函数评估）
-├── compact-context-tool.ts # ★ 主动压缩上下文工具（compact_context）：AI 主动根据当前任务精简上下文，自主控制保留范围并在回合后生效
+├── compact-context-tool.ts # ★ 主动压缩上下文工具（compact_context）：模型自己写压缩正文（必填 summary，长度/分节门禁），回合后生效，不再另发摘要请求
 ├── compaction-markers.ts   # 压缩 transcript 标记 + 修复（issue #235）
 ├── context-budget.ts       # 多级分层上下文预算裁剪（触发 LLM 全文摘要之前的梯度裁剪）
+├── context-recovery.ts     # ★ 压缩后可寻址句柄：给 summary 追加 <context-recovery>（转录路径 + 折叠用户轮次逐字/行号），模型用 grep/read 定点回读原文
 ├── soft-cap.ts             # 自定义上下文压缩软上限（Soft Cap，issue #229/#773；纯函数 normalize/effective/softCapToReserve/softCapReserveFor：后者算出注入 SDK 的 reserve=cw-cap，回合内工具间隙即压）
-├── dangling-tools.ts       # 悬空 toolCall 检测与修复（issue #280）
+├── dangling-tools.ts       # 悬空 toolCall 检测与修复（issue #280）；尾部窗口探针 probeTailDangling ＋ 追加原语 appendDanglingResults（issue #945 打开快路径）
+├── transcript-prepare.ts   # ★ 打开前修复编排：先流式扫元数据 ＋ 只读尾部，判定不了才整份 readFile（issue #945）
+├── transcript-scan.ts      # ★ 转录元数据流式扫描：只留 id/parentId/marker，判定「修复必然不动文件」（issue #945）
 ├── edit-tool.ts            # 覆盖内置 edit：原样转发精确替换，`soft: true` 时改走行核心匹配（原 edit_soft 工具已合并进来，无独立开关）
 ├── read-tool.ts            # 覆盖内置 read：路径是目录时列目录条目（复用 SDK ls 的口径，其余原样转发内置；行为开关 readDirEnabled 在设置「工具」页，不入 AGENT_TOOL_CATALOG）
 ├── present-files-tool.ts   # ★ AI 展示文件（present_files）：只读探测 stat/未知扩展嗅探/文本摘录 → 结构化 items 走 toolResult 的 details → 前端预览卡片；不自动打开任何窗口
@@ -144,6 +161,7 @@ server/
 ├── plugin-updater.ts       # 插件更新辅助（代码目录备份/回滚 + 远端 sha 对比；状态目录不参与）
 ├── fs-copy.ts              # ★ 目录复制原语：跳过项按**相对路径**判定（绝对路径含 node_modules 会把整棵树过滤光），附文件清单/清理空目录
 ├── mcp-bridge.ts           # MCP 工具桥（外部 stdio MCP 服务器的工具接入 pi 会话）
+├── command-spawn.ts        # ★ 用户命令 → 可 spawn 的 {file,args}：Windows npm .cmd shim 还原成 node 入口（issues/934）
 ├── mcp-hot-reload.ts       # mcp.json 热加载（改完即生效，不重启）
 ├── icon-svg.ts             # 插件内联 SVG 图标（manifest `iconSvg`）校验与规范化
 ├── host-metrics.ts         # 见文件头注释
@@ -291,8 +309,8 @@ web/src/
 | `DshPermissionBar.tsx`                                                                    | DSH 权限提示条                                                                                                                                                                                                                                       |
 | `ModelConfigModal.tsx` / `PiSetupModal.tsx`                                               | models.json 管理 / 首次配置引导                                                                                                                                                                                                                      |
 | `ProviderOAuthControls.tsx`                                                               | 服务商 OAuth 授权控件                                                                                                                                                                                                                                |
-| `SettingsModal.tsx`                                                                       | 设置面板（扩展分组并排技能/MCP/插件三个菜单；插件页分「安装的插件 / 插件市场」；DSH 另有问卷页、补丁页，无工具页）                                                                                                                            |
-| `InstalledPluginsPanel.tsx`                                                               | 安装的插件单列折叠列表：界面插件 + Pi 扩展同列表，点行展开配置/插件页/日志或注册能力，启停分别写回两个字段                                                                                                                             |
+| `SettingsModal.tsx`                                                                       | 设置面板（扩展分组并排技能/MCP/插件三个菜单；插件页分「安装的插件 / 插件市场」；DSH 另有问卷页、补丁页，无工具页）                                                                                                                                   |
+| `InstalledPluginsPanel.tsx`                                                               | 安装的插件单列折叠列表：界面插件 + Pi 扩展同列表，点行展开配置/插件页/日志或注册能力，启停分别写回两个字段                                                                                                                                           |
 | `PluginSettingsForm.tsx`                                                                  | 插件声明式设置表单（schema 驱动）                                                                                                                                                                                                                    |
 | `PromptTemplates.tsx`                                                                     | 提示词模板管理                                                                                                                                                                                                                                       |
 | `GoalBar.tsx`                                                                             | 输入框上方目标条：设目标/清除/AI 提炼/轮数下拉                                                                                                                                                                                                       |
@@ -311,7 +329,7 @@ web/src/
 | `SlotTabs.tsx`                                                                            | slot 驱动的 tab 容器（`rightpanel.tabs` 与设置面板共用）：除当前选中项一律不挂载，切走即 cleanup；只有一个标签时不画标签条；选中态存 localStorage                                                                                                    |
 | `SlotErrorBoundary.tsx`                                                                   | slot 内容错误边界                                                                                                                                                                                                                                    |
 | `ContextMenu.tsx`                                                                         | 通用右键菜单渲染层（`contextmenu.*` 槽位）：portal + fixed + 先渲染再实测尺寸钳制；只渲染，点条目交回宿主 `onAction`                                                                                                                                 |
-| `PluginPage.tsx`                                                                          | 插件自定义设置页宿主（`settings.pages` 槽位）：随选中项挂载/卸载；容器子节点只由插件写                                                                                                                                                               |
+| `PluginPage.tsx`                                                                          | 插件页宿主（`settings.pages` 声明页 / 通用插件页）：按 `pageId` 挂载/卸载，把 `ctx.page` 传给插件（声明里的 itemId；通用页为 undefined）；容器子节点只由插件写                                                                                       |
 | `CollapsedMessage.tsx` / `LazyMount.tsx`                                                  | 消息折叠摘要行 / 消息级惰性挂载包装                                                                                                                                                                                                                  |
 | `SearchBar.tsx`                                                                           | 会话内搜索栏（Ctrl+F，CSS Custom Highlight API 高亮）                                                                                                                                                                                                |
 | `HoverDetail.tsx`                                                                         | 悬浮详情（? 提示内容体，配 HintTip 定位）                                                                                                                                                                                                            |

@@ -13,10 +13,11 @@ import {
 } from "./tool-manager.js";
 import { normalizeToolPromptOverrides, type ToolPromptOverrideMap } from "./tool-prompt-overrides.js";
 import { UI_SLOTS } from "./plugin-ui-slots.js";
-import { DEFAULT_PROMPT_DISABLED } from "./prompt-composer.js";
+import { BUILTIN_SOUL_TEXTS, DEFAULT_PROMPT_DISABLED, isPromptToken } from "./prompt-composer.js";
 import { isPromptOnlyPreset } from "./preset-fields.js";
 import type { EngineId, QueueMode, ThinkingLevel, UiAlign, UiLayoutPrefs, UiSlotId } from "./protocol.js";
 import { mergeQuickAskSettings, normalizeQuickAskSettings, type QuickAskSettings } from "./quick-ask-settings.js";
+import { mergeBotDraftSettings, normalizeBotDraftSettings, type BotDraftSettings } from "./bot-draft-settings.js";
 
 export type PromptMode = "append" | "replace";
 
@@ -30,11 +31,27 @@ export function normalizePromptDisabled(
 	if (!stored || stored.promptDisabled === undefined) {
 		return [...DEFAULT_PROMPT_DISABLED];
 	}
-	const list = [...stored.promptDisabled];
+	// 已下线的来源（guidelines / pi_docs 等）从存量名单里剔除，否则面板会一直显示一个不存在的停用项。
+	const list = stored.promptDisabled.filter((t) => typeof t === "string" && isPromptToken(t));
 	if (!stored._promptPluginDevConfigured && !list.includes("plugin_dev")) {
 		list.push("plugin_dev");
 	}
 	return list;
+}
+
+/**
+ * 存量覆盖收敛：
+ * - 已下线 / 不存在的来源键直接丢掉（否则永远删不掉的死子键）；
+ * - soul 文案与内置默认逐字相同 → 丢掉（等于没覆盖，走自动内容才不会在面板里假“已改”）。
+ */
+export function normalizePromptOverrides(overrides?: Record<string, string> | null): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [key, value] of Object.entries(overrides ?? {})) {
+		if (typeof value !== "string" || !isPromptToken(key)) continue;
+		if (key === "soul" && BUILTIN_SOUL_TEXTS.includes(value.trim())) continue;
+		out[key] = value;
+	}
+	return out;
 }
 
 export const DEFAULT_RETRY_MAX_ATTEMPTS = 6;
@@ -433,8 +450,14 @@ export function normalizeSkillsCatalogBudget(v: unknown): number {
 	return DEFAULT_SKILLS_CATALOG_BUDGET;
 }
 
+/**
+ * 延迟加载总闸的出厂默认：**开**（2026-11 产品决定，按当前维护者的工具配置定稿）。
+ * 部署级可用环境变量 `PI_WEB_TOOL_LAZY_LOADING` 覆盖（1/true/on/yes → 开，0/false/off/no → 关），
+ * 只作默认值：用户已存盘的设置优先。名单为空时开与不开等价（没有任何工具可加载）。
+ */
 export const DEFAULT_TOOL_LAZY_LOADING = (() => {
 	const v = (process.env.PI_WEB_TOOL_LAZY_LOADING ?? "").trim().toLowerCase();
+	if (!v) return true;
 	return v === "1" || v === "true" || v === "on" || v === "yes";
 })();
 
@@ -496,8 +519,11 @@ export interface ClientSettings {
 	quickAskEnabled: boolean;
 	quickAskModel: string | null;
 	quickAskThinking: ThinkingLevel;
+	botDraftModel: BotDraftSettings["botDraftModel"];
+	botDraftThinking: BotDraftSettings["botDraftThinking"];
 	quickAskSystemPrompt: string;
 	quickAskExplainPrompt: string;
+	quickAskTranslateModel: QuickAskSettings["quickAskTranslateModel"];
 	quickAskTranslateEnabled: QuickAskSettings["quickAskTranslateEnabled"];
 	quickAskTranslateTarget: QuickAskSettings["quickAskTranslateTarget"];
 	quickAskTranslateStyle: QuickAskSettings["quickAskTranslateStyle"];
@@ -563,21 +589,26 @@ export const DEFAULT_DARK_MINIMAL_SETTINGS: ClientSettings = Object.freeze({
 	disabledAgentTools: [
 		"powershell",
 		"ls",
-		"terminal",
 		"delegate_task",
-		"plan_update",
+		"phone",
 		"patch",
 		"lsp",
 		"eval",
 		"tool_search",
-		"schedule",
-		"compact_context",
 		"mcp_manage",
 		"sandbox",
 		"worktree",
 		"canvas",
 	],
-	toolOnDemandTools: [],
+	toolOnDemandTools: [
+		"terminal",
+		"browser_page",
+		"browser_script",
+		"browser_design",
+		"agent_bot",
+		"schedule",
+		"compact_context",
+	],
 	disabledPluginTools: [
 		"notes_add",
 		"notes_list",
@@ -696,16 +727,24 @@ export const DEFAULT_DARK_MINIMAL_SETTINGS: ClientSettings = Object.freeze({
 		"remote_term",
 		"notes",
 		"frp",
+		"web_capture_state",
+		"web_capture_log",
+		"web_capture_steps",
+		"web_capture_note",
+		"web_capture_clear",
+		"web_capture_report",
 	],
-	nativeCliInheritModel: {},
+	// Native CLIs inherit the conversation's model by default, so claude/codex need no own login;
+	// agy only accepts its own model names, so it stays opt-in.
+	nativeCliInheritModel: { claude: true, codex: true },
 	terminalToolsEnabled: false,
 	terminalBash: false,
 	terminalBashIdleMs: 15_000,
 	terminalBashMaxForegroundMs: 60_000,
-	toolWatchdogTimeoutMs: 2400000,
+	toolWatchdogTimeoutMs: DEFAULT_TOOL_WATCHDOG_TIMEOUT_MS,
 	readDirEnabled: true,
 	bgAutoCleanupMin: 0,
-	toolLazyLoading: false,
+	toolLazyLoading: DEFAULT_TOOL_LAZY_LOADING,
 	codemodeMode: "on",
 	codemodeInlineBudget: 3000,
 	toolApprovalEnabled: true,
@@ -741,8 +780,11 @@ export const DEFAULT_DARK_MINIMAL_SETTINGS: ClientSettings = Object.freeze({
 	quickAskEnabled: true,
 	quickAskModel: null,
 	quickAskThinking: "off",
+	botDraftModel: null,
+	botDraftThinking: "off",
 	quickAskSystemPrompt: "",
 	quickAskExplainPrompt: "解释下: {{input}}",
+	quickAskTranslateModel: null,
 	quickAskTranslateEnabled: true,
 	quickAskTranslateTarget: "auto",
 	quickAskTranslateStyle: "natural",
@@ -903,7 +945,7 @@ export interface MarkerSettings {
 }
 
 /** 出厂默认关闭的内联标记（单源：客户端状态默认值、MarkerService 均取此处）。 */
-export const DEFAULT_DISABLED_MARKERS: readonly string[] = ["notify"];
+export const DEFAULT_DISABLED_MARKERS: readonly string[] = ["notify", "action", "suggest"];
 
 export interface ClientState {
 	lastCwd?: string;
@@ -1253,7 +1295,14 @@ export class ClientStateStore {
 		);
 	}
 
-	/** Record discovered projects into global settings cache (without clobbering tombstones). */
+	/**
+	 * 记录扫盘发现的项目到全局设置（不碰墓碑）。
+	 *
+	 * 只负责「发现」：没登记过的项目才插入，`lastUsed` 用磁盘 mtime 当初始排序值。
+	 * 已登记项目的 `lastUsed` **绝不改写**——它是「最近真实对话」时间，只由 `remember(promote)`
+	 * （用户真的发了消息）写。磁盘 mtime 是「会话文件最后写入时间」，流式输出、打开/切换、
+	 * 持久化都会刷新它；拿它去顶 `lastUsed` 会让「切到别的项目的对话」把那个项目顶到最上面。
+	 */
 	mergeDiscoveredProjects(projects: { path: string; lastUsed: number }[]): void {
 		if (!projects.length) return;
 		const all = this.load();
@@ -1267,15 +1316,9 @@ export class ClientStateStore {
 		let changed = false;
 		for (const p of projects) {
 			const key = normalizePathKey(p.path);
-			if (removedKeys.has(key)) continue;
-			const existing = map.get(key);
-			if (!existing) {
-				map.set(key, p);
-				changed = true;
-			} else if (p.lastUsed > existing.lastUsed) {
-				existing.lastUsed = p.lastUsed;
-				changed = true;
-			}
+			if (removedKeys.has(key) || map.has(key)) continue;
+			map.set(key, p);
+			changed = true;
 		}
 		if (changed) {
 			globalState.projects = [...map.values()].sort((a, b) => b.lastUsed - a.lastUsed).slice(0, 50);
@@ -1371,11 +1414,11 @@ export class ClientStateStore {
 		let promptOverrides: Record<string, string> = {};
 		if (stored?.promptTemplate !== undefined) {
 			promptTemplate = stored.promptTemplate ?? "";
-			promptOverrides = { ...stored?.promptOverrides };
+			promptOverrides = normalizePromptOverrides(stored?.promptOverrides);
 		} else if (stored && typeof stored.customSystemPrompt === "string" && stored.customSystemPrompt.trim()) {
-			promptOverrides = {
+			promptOverrides = normalizePromptOverrides({
 				[stored.promptMode === "replace" ? "soul" : "append"]: stored.customSystemPrompt,
-			};
+			});
 		} else if (!stored) {
 			promptOverrides = { ...DEFAULT_CLIENT_SETTINGS.promptOverrides };
 		}
@@ -1395,7 +1438,9 @@ export class ClientStateStore {
 					: stored
 						? legacyToDisabled(stored ?? {})
 						: [...DEFAULT_CLIENT_SETTINGS.disabledAgentTools],
-			toolOnDemandTools: normalizeToolOnDemandList(stored?.toolOnDemandTools),
+			toolOnDemandTools: normalizeToolOnDemandList(
+				stored?.toolOnDemandTools ?? (stored ? undefined : DEFAULT_CLIENT_SETTINGS.toolOnDemandTools),
+			),
 			disabledPluginTools:
 				stored?.disabledPluginTools !== undefined
 					? normalizeDisabledPluginTools(stored.disabledPluginTools)
@@ -1465,6 +1510,7 @@ export class ClientStateStore {
 			scmCommitMsgPromptMode: stored?.scmCommitMsgPromptMode === "replace" ? "replace" : "append",
 			scmCommitMsgPrompt: stored?.scmCommitMsgPrompt ?? "",
 			...normalizeQuickAskSettings(stored ?? {}),
+			...normalizeBotDraftSettings(stored ?? {}),
 			planModePromptMode: stored?.planModePromptMode === "replace" ? "replace" : "append",
 			planModePrompt: stored?.planModePrompt ?? "",
 			subagentDefaultModel: stored?.subagentDefaultModel ?? null,
@@ -1607,6 +1653,7 @@ export class ClientStateStore {
 			scmCommitMsgPromptMode: settings.scmCommitMsgPromptMode ?? cur.scmCommitMsgPromptMode ?? "append",
 			scmCommitMsgPrompt: settings.scmCommitMsgPrompt ?? cur.scmCommitMsgPrompt ?? "",
 			...mergeQuickAskSettings(cur, settings),
+			...mergeBotDraftSettings(cur, settings),
 			planModePromptMode: settings.planModePromptMode ?? cur.planModePromptMode ?? "append",
 			planModePrompt: settings.planModePrompt ?? cur.planModePrompt ?? "",
 			reviewPrompt: settings.reviewPrompt ?? cur.reviewPrompt ?? "",

@@ -130,6 +130,18 @@ await page.addInitScript(() => {
 					bookmarks = args.bookmarks;
 					return true;
 				}
+				// 书签导入：正文在主进程，渲染层只拿回条数（跟真宿主同一个形状）
+				if (action === "bookmarks.import") {
+					bookmarks = [
+						...bookmarks,
+						{
+							name: args.folderName,
+							type: "folder",
+							children: [{ name: "Imported <b>x</b>", type: "link", url: "https://imported.example.com" }],
+						},
+					];
+					return { imported: 1, duplicate: 2, skipped: 0 };
+				}
 				if (action === "settings.get") return { ...settings };
 				if (action === "settings.save") {
 					settings = { ...settings, ...args.settings };
@@ -392,12 +404,21 @@ try {
 	await page.getByText("No extensions installed yet.", { exact: true }).waitFor();
 	assert.ok(await page.evaluate(() => window.__calls.some((call) => call.action === "extensions.remove")));
 
-	// 新标签页：收藏行不注入外部内容，搜索直达
+	// 新标签页：首页导航就是书签树（文件夹可进、收藏可开），不注入外部内容，搜索直达
 	await page.goto("http://127.0.0.1:8994/newtab.html");
 	// 假体是 +200ms 才挂到 window 上的，先等桥就绪再交互
 	await page.waitForFunction(() => typeof window.piBrowserShell !== "undefined");
 	await page.locator(".unified-bar").waitFor();
-	assert.equal(await page.locator(".unified-flow-row img, .unified-flow-row script").count(), 0);
+	const nav = page.locator(".unified-nav");
+	assert.equal(await nav.locator("img, script").count(), 0);
+	// 文件夹先出一格；点进去看它里面的收藏；面包屑点回根目录
+	await nav.locator(".unified-tile-folder").first().click();
+	await page.locator(".unified-crumb-current").waitFor();
+	assert.equal(await nav.locator(".unified-tile-link").count(), 1);
+	assert.equal(await nav.locator("img, script").count(), 0);
+	await nav.locator(".unified-crumb").first().click();
+	await page.locator(".unified-crumb-current").waitFor({ state: "detached" });
+	assert.equal(await nav.locator(".unified-tile-link").count(), 0);
 	await page.locator(".unified-bar input").fill("hello world");
 	await page.locator(".unified-bar input").press("Enter");
 	await page.waitForFunction(
@@ -422,6 +443,13 @@ try {
 	await panel.getByLabel("URL", { exact: true }).fill("https://new.example.com");
 	await panel.getByRole("button", { name: "Save", exact: true }).click();
 	await panel.getByRole("button", { name: /New bookmark/ }).waitFor();
+	// 导入书签：只发一个动作，回执驱动重新拉取 + 回到根目录，导入的名字仍然只当文本
+	await panel.getByRole("button", { name: "Import bookmarks", exact: true }).click();
+	const imported = panel.getByRole("button", { name: /Imported bookmarks/ });
+	await imported.waitFor();
+	await imported.click();
+	await panel.getByRole("button", { name: /Imported <b>x<\/b>/ }).waitFor();
+	assert.equal(await page.locator("dialog script, dialog img, dialog b").count(), 0);
 	await page.keyboard.press("Escape");
 	assert.ok(
 		await page.evaluate(() => window.__calls.some((call) => call.action === "overlay" && call.args.open === false)),
@@ -433,6 +461,13 @@ try {
 	await page.getByRole("button", { name: "Open", exact: true }).click();
 	assert.ok(
 		await page.evaluate(() => window.__calls.some((call) => call.action === "download.open" && call.args.id === "dl")),
+	);
+	// 「打开文件夹」也是同一份 id：路径永远由宿主自己的下载记录解析
+	await page.getByRole("button", { name: "Show in folder", exact: true }).click();
+	assert.ok(
+		await page.evaluate(() =>
+			window.__calls.some((call) => call.action === "download.reveal" && call.args.id === "dl"),
+		),
 	);
 	await page.keyboard.press("Escape");
 

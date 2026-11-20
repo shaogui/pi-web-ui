@@ -1226,8 +1226,51 @@ ${t("valueTruncated")}`;
         syncActiveView();
       }
     });
+    let offLocale = null;
+    let onLocaleEvent = null;
+    try {
+      offLocale = window.__piWebUiHost?.locale?.onChange?.(() => {
+        try {
+          renderConns();
+        } catch {
+        }
+        try {
+          renderDeps();
+        } catch {
+        }
+        try {
+          if (work?.curTable) renderTables();
+        } catch {
+        }
+      }) ?? null;
+    } catch {
+      offLocale = null;
+    }
+    try {
+      onLocaleEvent = () => {
+        try {
+          renderConns();
+        } catch {
+        }
+        try {
+          renderDeps();
+        } catch {
+        }
+      };
+      window.addEventListener("pi-web-ui:locale", onLocaleEvent);
+    } catch {
+      onLocaleEvent = null;
+    }
     return () => {
       work = null;
+      try {
+        offLocale?.();
+      } catch {
+      }
+      try {
+        if (onLocaleEvent) window.removeEventListener("pi-web-ui:locale", onLocaleEvent);
+      } catch {
+      }
       offData();
       root.remove();
     };

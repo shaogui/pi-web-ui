@@ -6,6 +6,7 @@ import { act } from "react-dom/test-utils";
 import { GoalBar } from "../../web/src/components/GoalBar.js";
 import { LanguageProvider } from "../../web/src/i18n.js";
 import type { GoalStatus } from "../../web/src/types.js";
+import { isGoalCompose, setGoalCompose } from "../../web/src/goal-compose.js";
 
 let root: Root | null = null;
 
@@ -49,6 +50,7 @@ afterEach(() => {
 	if (root) act(() => root!.unmount());
 	root = null;
 	document.body.innerHTML = "";
+	setGoalCompose(false);
 });
 
 describe("目标条活跃芯片跟随 phase", () => {
@@ -149,9 +151,9 @@ describe("目标条历史下拉", () => {
 		return container;
 	}
 
-	it("无历史不渲染入口，有历史点条目回填输入框", () => {
+	it("无历史不渲染入口，有历史点条目进主输入框撰写", () => {
 		const empty = mountInactive(undefined);
-		expect(empty.querySelector(".goalbar-input")).toBeTruthy();
+		expect(empty.querySelector(".goalbar-input")).toBeNull();
 		expect([...empty.querySelectorAll(".goalbar-opt")].some((e) => (e.textContent ?? "").includes("历史"))).toBe(false);
 
 		if (root) act(() => root!.unmount());
@@ -172,7 +174,43 @@ describe("目标条历史下拉", () => {
 		expect(items.some((t) => t.includes("修 flaky 单测"))).toBe(true);
 		const second = [...container.querySelectorAll(".dd-model-cell")][1] as HTMLElement;
 		act(() => second.click());
-		const input = container.querySelector(".goalbar-input") as HTMLInputElement;
-		expect(input.value).toBe("修 flaky 单测");
+		expect(isGoalCompose()).toBe(true);
+	});
+});
+
+describe("目标条收起 = 退出撰写态", () => {
+	function mountEdit() {
+		window.localStorage.setItem("pi-web-ui:lang", "zh");
+		const container = document.createElement("div");
+		document.body.appendChild(container);
+		root = createRoot(container);
+		act(() => {
+			root!.render(
+				createElement(
+					LanguageProvider,
+					null,
+					createElement(GoalBar, {
+						goal: { conversationId: "c-1", goal: null, maxRounds: 0, locked: true, wizard: { active: false } },
+						models: [],
+						modelsLoading: false,
+						activeConversationId: "c-1",
+					} as unknown as Parameters<typeof GoalBar>[0]),
+				),
+			);
+		});
+		return container;
+	}
+
+	it("点药丸进入撰写 → 点收起退出（占位符不能一直挂着）", () => {
+		const container = mountEdit();
+		act(() => (container.querySelector(".goalbar-hint") as HTMLElement).click());
+		expect(isGoalCompose()).toBe(true);
+		const collapse = [...container.querySelectorAll(".goalbar-icon-btn")].find((b) =>
+			(b.getAttribute("aria-label") ?? "").includes("收起"),
+		) as HTMLElement;
+		expect(collapse).toBeTruthy();
+		act(() => collapse.click());
+		expect(isGoalCompose()).toBe(false);
+		expect(container.querySelector(".goalbar-collapsed")).toBeTruthy();
 	});
 });

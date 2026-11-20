@@ -3,7 +3,6 @@ import { applyQueueModesToSession } from "./queue-modes.js";
 import { startTurnTiming, finishTurnTiming } from "./turn-timing.js";
 import { PendingQuestion, type QuestionResult } from "./pending-question.js";
 import { formatSubagentsCompletionNotice } from "./subagent-notify.js";
-import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
 	deliverMobileNotificationEvent,
@@ -38,6 +37,11 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { getSdkBuiltinExtensionFactories, SDK_DISABLED_BUILTIN_EXTENSIONS } from "./sdk-builtin-extensions.js";
+import {
+	getConversationSamplingOverrides,
+	mergeModelSamplingParamsIntoProviderPayload,
+	setConversationSamplingOverrides,
+} from "./provider-payload-overrides.js";
 import { BG_CLEANUP_FALLBACK_MIN, BgServerTracker } from "./bg-servers.js";
 import { JobRegistry, JOB_TASK_PREFIX, type JobSnapshot } from "./job-runner.js";
 import { resolveProjectScripts } from "./project-scripts.js";
@@ -153,7 +157,22 @@ import { SandboxManager, evaluateSandboxJail, isSameOrSubpath, withSandboxJailGa
 import { readPermissionFromSession } from "./permission-preset.js";
 import { McpBridge, getMcpToolServer } from "./mcp-bridge.js";
 import { getBotExecution, type BotExecutionCapability } from "./device-center/bot-execution.js";
+import {
+	BOT_CHAT_ENTRY,
+	BOT_EXECUTION_ENTRY,
+	acquireBotChatLease,
+	botChatSessionDir,
+	botChatBusy,
+	createBotChatCapability,
+	decideTranscriptBotBinding,
+	latestBotChatTranscript,
+	pickBotChatConversation,
+	readBotChatBinding,
+	readBotExecutionAnchor,
+	resolveBotChatBot,
+} from "./device-center/bot-chat.js";
 import { checkGroupTaskPlanGuard } from "./device-center/group-plan-guard.js";
+import { createMemoryWriteQuota, type MemoryWriteQuota } from "./device-center/bot-memory-quota.js";
 import { prepareBotExecutionSystemPrompt } from "./device-center/execution-system-prompt.js";
 import {
 	extractGroupContextMetrics,
@@ -217,6 +236,13 @@ import {
 	hasConversationParentBinding,
 	conversationParent,
 	parentConversationIdentity,
+	conversationHomeByIdentity,
+	conversationHomeOf,
+	registerConversationHome,
+	forgetConversationHome,
+	hasConversationChildren,
+	indexConversationChild,
+	unindexConversationChild,
 } from "./conversation-identity.js";
 
 /**
@@ -361,6 +387,17 @@ import {
 	SUBAGENT_WRITE_TOOL_NAMES,
 } from "./subagent-security-gate.js";
 import { makePresentFilesTool } from "./present-files-tool.js";
+import {
+	ConversationDelivery,
+	compactionBanner,
+	deliveryMode,
+	isCompactionRejection,
+	runningCompaction,
+	type CompactionGate,
+	type DeliveryHost,
+	type DeliveryIntent,
+	type DeliveryMode,
+} from "./conversation-delivery.js";
 import {
 	makeCompactContextTool,
 	buildCompactionInstructions,
@@ -538,6 +575,15 @@ export const OFFLINE_ROW_TTL_MS = (() => {
 	return Math.min(ms, 6 * 60 * 60_000);
 })();
 const UI_MESSAGE_CACHE_CAP = 4096;
+/** 自动收起闲置对话的最小空闲时长：刚切走的对话不立即收，给「切回去接着写」留出窗口。 */
+const EVICT_MIN_IDLE_MS = 120_000;
+/** 已结束子代理的回收节流：扫一次的开销很小，但没必要更密。 */
+const SUBAGENT_RECYCLE_INTERVAL_MS = (() => {
+	const raw = Number(process.env.PI_WEB_SUBAGENT_RECYCLE_MS);
+	return Number.isFinite(raw) && raw >= 0 ? raw : 5 * 60_000;
+})();
+/** 已结束子代理空闲多久后可回收 runtime（issue #944：此前永不回收，只能手动清）。 */
+const SUBAGENT_RECYCLE_IDLE_MS = 15 * 60_000;
 
 export class QuiesceRejectedError extends Error {
 	readonly code = "QUIESCED";
@@ -547,7 +593,7 @@ export class QuiesceRejectedError extends Error {
 	}
 }
 
-import { splitAgentStartPrompt, PI_DOC_PATHS, WINDOWS_PERSONA } from "./persona-chain.js";
+import { splitAgentStartPrompt, WINDOWS_PERSONA } from "./persona-chain.js";
 export { splitAgentStartPrompt };
 
 import { makeKillableBashTool, makeAdaptiveBashTool } from "./bash-tool.js";
@@ -695,6 +741,10 @@ export interface Conversation {
 	lastSdkEventAt: number;
 	agentPreset?: string;
 	presetLocked?: boolean;
+	/** 私聊会话绑定的 Bot 身份（会话级，见 device-center/bot-chat.ts）。 */
+	bot?: BotExecutionCapability;
+	botId?: string;
+	botName?: string;
 	permissionPreset?: string;
 	planMode?: boolean;
 	delegateMode?: boolean;
@@ -730,8 +780,12 @@ export interface Conversation {
 	toolPendingArgs: Map<string, unknown>;
 	activeToolCalls: Map<string, string>;
 	retryState?: { attempt: number; maxAttempts: number; delayMs: number; errorMessage: string } | null;
-	pendingCompaction?: PendingCompaction | null;
-	compactionState?: { reason: string; startedAt: number } | null;
+	/** 投递门：压缩的「已请求 / 进行中」两相唯一真相（见 conversation-delivery.ts）。 */
+	compaction?: CompactionGate | null;
+	/** 门关时攒下的投递意图（子代理完成通知、steer、协作唤醒…）。 */
+	delivery?: ConversationDelivery;
+	/** 对话已移出 / 已释放：排队中的意图不再有落点。 */
+	deliveryClosed?: boolean;
 	lastCompactionTokens?: number | null;
 	pendingTask?: string;
 	pluginRunId?: string;
@@ -752,6 +806,12 @@ export interface Conversation {
 }
 
 import { mapSessionsConcurrent } from "./session-scan.js";
+
+/** 一条待发的子代理完成通知：带上入队时的轮次，防止「入队后又被 steer 重新开工」的误报。 */
+interface SubagentNoticeItem {
+	conv: Conversation;
+	generation: number;
+}
 import { SessionListDiskIndex } from "./session-list-index.js";
 import {
 	searchSessions as searchSessionTranscripts,
@@ -822,6 +882,9 @@ export interface TakeoverPayload {
 }
 
 import { processTreeKillPlan, resolveCwdTarget } from "./process-utils.js";
+import { runGit } from "./git-run.js";
+import { runProcess } from "./run-process.js";
+import { sleep } from "./async-utils.js";
 export function cleanupOrphanedSessionDirs(agentDir: string, maxAgeMs = 24 * 3600_000): void {
 	const cutoff = Date.now() - maxAgeMs;
 	for (const sub of ["subagent-sessions", "ephemeral-sessions"]) {
@@ -870,6 +933,28 @@ interface PreviewIdSeed {
 	uiMessageCache: Map<string, UiMessage>;
 }
 
+/**
+ * 一个持有方（ClientSession）向「别处运行中」列表上报的会话行。
+ * 子代理行由 `isSubagent` + `parentId` 标出来，客户端据此挂到父行下面；
+ * 无人值守持有方（`scheduler:` / `plugin:` 这类伪客户端）也会上报子代理，
+ * 否则定时任务里跑的子代理在侧栏里彻底没有落脚点。
+ */
+export interface ElsewhereClientRow {
+	title: string;
+	cwd: string;
+	isStreaming: boolean;
+	convId: string;
+	independent: boolean;
+	forked: boolean;
+	hasQuestion: boolean;
+	questionTitle?: string;
+	sessionFile?: string;
+	activity: number;
+	isSubagent: boolean;
+	/** 父对话在本持有方内的 id（跨持有方无法解析，故只给同持有方的父行） */
+	parentId?: string;
+}
+
 const LIST_TEXT_MAX = 300;
 export function clipListText(text: string): string {
 	if (text.length <= LIST_TEXT_MAX) return text;
@@ -899,6 +984,8 @@ export class ClientSession {
 	private turnEndWaiters = new Map<string, Set<(o: RoleWaitOutcome) => void>>();
 	private subagentSettleStore?: SubagentSettleRegistry;
 	private subagentSpawnBudgetStore?: SubagentSpawnBudget;
+	/** Model-written checkpoints awaiting the next compaction on that session; consumed once. */
+	private providedCompactionSummaries = new WeakMap<object, string>();
 
 	/**
 	 * 子代理结算边沿：回合结束 / 停止 / 移出 / 问卷变化 都从这里唤醒等待方。
@@ -1011,8 +1098,9 @@ export class ClientSession {
 		});
 		if (opts.event) ledger.event(runId, opts.event);
 	}
-	private pendingSubagentNotices = new Map<string, { timer: NodeJS.Timeout; subagents: Set<Conversation> }>();
-	private deliveringSubagentNotices = new Map<string, number>();
+	/** 子代理完成通知的去抖缓冲：只负责「这一轮是不是真的结束了」，不再代表投递状态。 */
+	private subagentNoticeTimers = new Map<string, { timer: NodeJS.Timeout; subagents: Set<Conversation> }>();
+	private deliverySeq = 0;
 	private pendingCliManagers = new Set<TerminalManager>();
 	private pendingNativeCliConversations = new Map<string, Conversation>();
 
@@ -1170,7 +1258,23 @@ export class ClientSession {
 			cwd,
 			() => this.getLang(),
 			"conversation",
-			(config) => resolveNativeCliModelConnection(config, this.sharedModelRuntime),
+			async (config) => {
+				try {
+					return await resolveNativeCliModelConnection(config, this.sharedModelRuntime);
+				} catch (err) {
+					// An unsupported protocol, a missing model or unusable credentials must not block the
+					// CLI: fall back to the CLI's own login, but say why instead of leaving a bare login
+					// prompt behind the "inherit model" toggle.
+					const reason = err instanceof Error ? err.message : String(err);
+					this.emit({
+						type: "notice",
+						level: "warning",
+						text: `CLI 继承模型不可用，已回退到 CLI 自身登录：${reason}（显式 --model 参数优先；换用该 CLI 支持的模型或协议中转网关可免登录）`,
+						textEn: `CLI model inheritance is unavailable, falling back to the CLI's own login: ${reason} (explicit --model wins; switch to a supported model or a protocol-converting gateway for login-free launch)`,
+					});
+					return undefined;
+				}
+			},
 		);
 		this.configureNativeCliRuntime(conversationId, mgr);
 		mgr.onAgentIdle = (terminalId, idleMs, title, lastLines) =>
@@ -1330,7 +1434,14 @@ export class ClientSession {
 		}
 		if (event.type === "working" || (event.type === "done" && event.aborted)) return;
 		if (this.convs.get(conv.id) !== conv || this.disposed) return;
-		const kind = event.type;
+		// Only the four terminal kinds fan out to clients and mobile. tool / notification / compact /
+		// subagent / end stay status-only until the protocol carries them, so a new hook event can
+		// never be emitted as an unknown kind.
+		const kind =
+			event.type === "approval" || event.type === "done" || event.type === "error" || event.type === "question"
+				? event.type
+				: undefined;
+		if (!kind) return;
 		const sessionId = conv.session.sessionId;
 		this.notifyMobile(conv, kind, `${binding.key}:${event.eventId}`);
 		this.emit({
@@ -1467,10 +1578,11 @@ export class ClientSession {
 							: "exited";
 		const cmdShort = job.command.length > 120 ? `${job.command.slice(0, 120)}…` : job.command;
 		const tail = (job.tail ?? "").trim() || "（无输出）";
+		const ok = job.exitCode === 0 || job.reason === "killed";
 		// 先发一条可见 notice（面板/提示区），再在有归属对话时补一条系统消息。
 		this.emit({
 			type: "notice",
-			level: job.exitCode === 0 || job.reason === "killed" ? "info" : "warning",
+			level: ok ? "info" : "warning",
 			text: `后台任务 ${job.id} 已结束（${reasonText}，退出码 ${job.exitCode ?? "null"}）：${cmdShort}`,
 			textEn: `Background job ${job.id} ended (${reasonEn}, exit ${job.exitCode ?? "null"}): ${cmdShort}`,
 		});
@@ -1488,6 +1600,18 @@ export class ClientSession {
 						customType: "background-job-done",
 						content: [{ type: "text", text }],
 						display: true,
+						// 聊天卡片渲染用结构化字段（无 details 的老会话回落到纯文本）。
+						details: {
+							jobId: job.id,
+							ok,
+							exitCode: job.exitCode,
+							reason: job.reason ?? "exit",
+							reasonText,
+							reasonEn,
+							command: cmdShort,
+							logPath: job.logPath,
+							tail: (job.tail ?? "").trim(),
+						},
 					},
 					{ deliverAs: "nextTurn" },
 				)
@@ -1497,11 +1621,16 @@ export class ClientSession {
 
 	private spawningSubagents = 0;
 	private creatingConversations = new Map<string, number>();
+	/**
+	 * 正在打开中的 transcript（键 = 归一化绝对路径）：同一份记录的并发打开共用一次创建。
+	 * issue #943：去重扫描在任何 await 之前，若只靠 convs 扫描，创建完成前两边都看不见对方 → 两份 runtime 双写。
+	 */
+	private openingSessions = new Map<string, Promise<string | undefined>>();
 
 	private reserveConversationSlot(cwd: string): () => void {
 		const pending = this.creatingConversations.get(cwd) ?? 0;
-		const open = [...this.convs.values()].filter((c) => c.cwd === cwd && !c.isSubagent && !c.isEphemeral).length;
-		if (open + pending >= getMaxOpenConversations()) throw new Error("Project conversation limit reached");
+		if (this.countOpenConversations(cwd) + pending >= getMaxOpenConversations())
+			throw new Error("Project conversation limit reached");
 		this.creatingConversations.set(cwd, pending + 1);
 		let released = false;
 		return () => {
@@ -1555,9 +1684,7 @@ export class ClientSession {
 		if (persist) {
 			const baseCwdForLimit = parentId ? (this.convs.get(parentId)?.cwd ?? this.cwd) : this.cwd;
 			const resolvedCwdForLimit = cwd ? resolve(baseCwdForLimit, cwd) : baseCwdForLimit;
-			const openInProject = [...this.convs.values()].filter(
-				(c) => c.cwd === resolvedCwdForLimit && !c.isSubagent && !c.isEphemeral,
-			).length;
+			const openInProject = this.countOpenConversations(resolvedCwdForLimit);
 			const maxOpenConversations = getMaxOpenConversations();
 			if (openInProject >= maxOpenConversations) {
 				throw new Error(
@@ -1920,6 +2047,15 @@ export class ClientSession {
 	private resolveExecution(id: string): { session: ClientSession; convId: string; conv: Conversation } | undefined {
 		const owners = new Set([this, ...(this.allSubagentSessions?.() ?? [])]);
 		if (id.startsWith("exec-")) {
+			// 快路径：身份 → 持有会话的登记表（issue #946）。命中后仍校验，过户后自动回退到扫描。
+			const home = conversationHomeByIdentity(id) as ClientSession | undefined;
+			if (home && (home === this || owners.has(home))) {
+				for (const conv of home.convs.values()) {
+					if (conversationIdentity(conv) !== id) continue;
+					if (home.convs.get(conv.id) !== conv) break;
+					return { session: home, convId: conv.id, conv };
+				}
+			}
 			for (const session of owners) {
 				for (const conv of session.convs.values()) {
 					if (conversationIdentity(conv) === id) return { session, convId: conv.id, conv };
@@ -1947,7 +2083,14 @@ export class ClientSession {
 			bindConversationParent(child, parent);
 		}
 		const parent = conversationParent(child) as Conversation | undefined;
-		return parent ? this.resolveExecution(conversationIdentity(parent)) : undefined;
+		if (!parent) return undefined;
+		// 快路径：同一会话内的父对话不必再跑身份解析（issue #946：此函数在淘汰判定上被逐候选调用）。
+		if (this.convs.get(parent.id) === parent) return { session: this, convId: parent.id, conv: parent };
+		const home = conversationHomeOf(parent) as ClientSession | undefined;
+		if (home && home !== this && home.convs.get(parent.id) === parent) {
+			return { session: home, convId: parent.id, conv: parent };
+		}
+		return this.resolveExecution(conversationIdentity(parent));
 	}
 
 	private parentExecutionKey(child: Conversation): string | undefined {
@@ -2263,16 +2406,31 @@ export class ClientSession {
 
 	private async steerSubagentRound(conv: Conversation, message: string): Promise<SubagentSteerReceipt> {
 		this.assertSubagentWorktreeAdmission(conv);
-		const session = conv.session;
-		if (session.isStreaming) {
-			await session.sendUserMessage(message, { deliverAs: "steer" });
+		const mode = this.deliveryModeOf(conv);
+		if (mode === "closed") return { state: "missed" };
+		if (mode === "live") {
+			// 只投给活着的一轮：SDK 的 steering 队列由这一轮自己取走。
+			await this.submitText(conv, message, mode);
 			return { state: "delivered" };
 		}
-		if (conv.promptInFlight || !session.isIdle) {
-			await session.steer(message);
+		if (mode === "gated") {
+			// 门关着（压缩 / 等回话 / 过户）：入队，门一开就按「空闲」路径开新一轮。
+			// 回执 `queued` 从此是承诺，不是把消息丢进一个不会被取走的队列。
+			this.parkSteer(conv, message);
 			return { state: "queued" };
 		}
 
+		this.startSubagentRound(conv, message);
+		return { state: "restarted" };
+	}
+
+	/**
+	 * 真的开新一轮（空闲时直调，门开时由投递队列调）。
+	 * 只在这里写「轮次 +1 / 清已通知」——这些是开轮的因，不是「已通知」的果。
+	 */
+	private startSubagentRound(conv: Conversation, message: string): void {
+		this.detachSubagentNotice(conv);
+		const session = conv.session;
 		const generation = (conv.subagentRunGeneration ?? 0) + 1;
 		conv.subagentRunGeneration = generation;
 		conv.subagentTaskStopped = false;
@@ -2282,25 +2440,21 @@ export class ClientSession {
 		conv.subagentError = undefined;
 		conv.subagentErrorNotified = undefined;
 		this.syncSubagentLedger(conv, { state: "running", event: "steer_restart" });
-		const parentKey = this.parentExecutionKey(conv);
-		if (parentKey) {
-			const pending = this.pendingSubagentNotices.get(parentKey);
-			if (pending) {
-				pending.subagents.delete(conv);
-				if (pending.subagents.size === 0) {
-					clearTimeout(pending.timer);
-					this.pendingSubagentNotices.delete(parentKey);
-				}
-			}
-			this.parentExecution(conv)?.conv.suspendedSubagents?.delete(conv);
-		}
+		this.parentExecution(conv)?.conv.suspendedSubagents?.delete(conv);
 		conv.promptInFlight = true;
 		const isCurrent = () => conv.session === session && conv.subagentRunGeneration === generation;
+		let requeued = false;
 		conv.kickoff = (async () => {
 			try {
 				await session.sendUserMessage(message);
 			} catch (err) {
 				if (!isCurrent()) return;
+				// 门在开轮的瞬间又关上了（例如刚进来一轮压缩）：转回队列，不当作失败。
+				if (isCompactionRejection(err)) {
+					requeued = true;
+					this.parkSteer(conv, message);
+					return;
+				}
 				const error = err instanceof Error ? err.message : String(err);
 				conv.subagentError = error;
 				conv.subagentErrorNotified = error;
@@ -2317,14 +2471,14 @@ export class ClientSession {
 					conv.promptInFlight = false;
 					const holder = this.resolveExecution(conversationIdentity(conv))?.session;
 					if (holder?.convs.get(conv.id) === conv) {
-						holder.scheduleSubagentCompletionNotice(conv);
+						// 没真的开成（转回队列了）就不算一轮结束，别发完成通知。
+						if (!requeued) holder.scheduleSubagentCompletionNotice(conv);
 						holder.emitConversations();
 					}
 				}
 			}
 		})();
 		this.emitConversations();
-		return { state: "restarted" };
 	}
 
 	scheduleSubagentCompletionNotice(conv: Conversation): void {
@@ -2332,18 +2486,20 @@ export class ClientSession {
 		if (!parentId || conv.notifyOnDone === false || this.subagentTaskPending?.(conv)) return;
 		if (conv.subagentDoneNotified || conv.subagentConsumedByParent) return;
 
-		let entry = this.pendingSubagentNotices.get(parentId);
+		let entry = this.subagentNoticeTimers.get(parentId);
 		if (!entry) {
 			entry = {
 				timer: null as any,
 				subagents: new Set(),
 			};
-			this.pendingSubagentNotices.set(parentId, entry);
+			this.subagentNoticeTimers.set(parentId, entry);
 		}
 		entry.subagents.add(conv);
 		if (entry.timer) clearTimeout(entry.timer);
+		// 400ms 去抖只为等这一轮「真的结束」（stop 后紧接重试/续跑不计为完成）。
+		// 之后一律交给投递门：能投就投，不能投就留着，不存在「重试 10 次后放弃」。
 		entry.timer = setTimeout(() => {
-			void this.flushSubagentCompletionNotice(parentId);
+			this.flushSubagentNoticeTimer(parentId);
 		}, 400);
 		this.refreshCompletionState(parentId);
 	}
@@ -2422,168 +2578,502 @@ export class ClientSession {
 		return null;
 	}
 
-	private async flushSubagentCompletionNotice(parentId: string, retryCount = 0): Promise<void> {
-		if (!this.pendingSubagentNotices.has(parentId)) return;
-		this.deliveringSubagentNotices.set(parentId, (this.deliveringSubagentNotices.get(parentId) ?? 0) + 1);
+	// ── 投递门 / 意图队列（issues/929：唯一出口，见 conversation-delivery.ts） ─────────
+
+	/** 门的读侧：全仓唯一一处「现在能不能投递」判定。 */
+	private deliveryModeOf(conv: Conversation): DeliveryMode {
+		let streaming = false;
+		let compacting = false;
 		try {
-			await this.deliverSubagentCompletionNotice(parentId, retryCount);
-		} finally {
-			const remaining = (this.deliveringSubagentNotices.get(parentId) ?? 1) - 1;
-			if (remaining > 0) this.deliveringSubagentNotices.set(parentId, remaining);
-			else this.deliveringSubagentNotices.delete(parentId);
-			this.refreshCompletionState(parentId);
-			const owner = this.subagentOwnerOf(parentId);
-			const parent = owner.convs.get(this.subagentCurrentId?.(parentId) ?? parentId);
-			if (parent?.notifyOnDone === "manual" && !parent.subagentDoneNotified && !parent.subagentConsumedByParent) {
-				owner.scheduleSubagentCompletionNotice(parent);
-			}
+			streaming = conv.session.isStreaming === true;
+			compacting = (conv.session as unknown as { isCompacting?: boolean }).isCompacting === true;
+		} catch {
+			streaming = false;
+			compacting = false;
 		}
+		return deliveryMode({
+			closed: this.disposed === true || conv.deliveryClosed === true,
+			streaming,
+			starting: conv.promptInFlight === true,
+			compacting,
+			gate: conv.compaction ?? null,
+			blocked: consultWaitingParents.has(conv) || conv.transferring === true,
+		});
 	}
 
-	private async deliverSubagentCompletionNotice(parentId: string, retryCount: number): Promise<void> {
-		const entry = this.pendingSubagentNotices.get(parentId);
-		if (!entry) return;
-		this.pendingSubagentNotices.delete(parentId);
-		if (entry.timer) clearTimeout(entry.timer);
+	private deliveryQueue(conv: Conversation): ConversationDelivery {
+		return (conv.delivery ??= new ConversationDelivery());
+	}
 
-		let toNotify = Array.from(entry.subagents).filter(
-			(c) =>
-				!c.subagentConsumedByParent &&
-				!c.subagentDoneNotified &&
-				!c.promptInFlight &&
-				!c.session.isStreaming &&
-				!this.subagentTaskPending?.(c),
-		);
-		const generations = new Map(toNotify.map((c) => [c, c.subagentRunGeneration ?? 0]));
-		const isCurrent = (c: Conversation) =>
-			(c.subagentRunGeneration ?? 0) === generations.get(c) &&
-			!c.subagentConsumedByParent &&
-			!c.subagentDoneNotified &&
-			!c.promptInFlight &&
-			!c.session.isStreaming &&
-			!this.subagentTaskPending?.(c);
-		if (toNotify.length === 0) return;
+	private deliveryHost(conv: Conversation): DeliveryHost {
+		return {
+			mode: () => this.deliveryModeOf(conv),
+			deliver: (intent) => this.deliverIntent(conv, intent),
+			onDelivered: (intent) => this.commitIntent(conv, intent),
+			onDropped: (intent, reason, error) => this.dropIntent(conv, intent, reason, error),
+			onRetryable: (intent, error) => {
+				console.warn(`[delivery] ${intent.kind} 提交点副作用失败`, error);
+			},
+		};
+	}
 
-		if (typeof this.finalizeSubagentWorktree === "function") {
-			await Promise.all(toNotify.map((c) => this.finalizeSubagentWorktree(c)));
+	/**
+	 * 从对话外部送一段文字进去（角色消息 / 插件 / 审查者 / 系统续跑）。
+	 * 门关就排队，门开自动开一轮——外部调用方不再各自判断 `isStreaming ? steer : ...`。
+	 */
+	private async deliverFromOutside(
+		conv: Conversation,
+		text: string,
+		tag?: string,
+	): Promise<"delivered" | "queued" | "closed" | "rejected"> {
+		const mode = this.deliveryModeOf(conv);
+		if (mode === "closed") return "closed";
+		if (mode === "gated") {
+			const queue = this.deliveryQueue(conv);
+			if (
+				!queue.park({
+					tag: tag ?? `out:${++this.deliverySeq}`,
+					kind: "role-message",
+					text,
+					createdAt: Date.now(),
+				})
+			) {
+				this.emit({
+					type: "notice",
+					level: "warning",
+					text: "对话待发消息积压过多，最新一条未能排队。",
+					textEn: "Too many queued messages for this conversation; the newest one was not queued.",
+				});
+				return "rejected";
+			}
+			void this.drainDeliveries(conv);
+			return "queued";
 		}
+		await this.submitText(conv, text, mode);
+		return "delivered";
+	}
 
-		toNotify = toNotify.filter(isCurrent);
-		if (toNotify.length === 0) return;
-
-		const parentOwner = this.subagentOwnerOf(parentId);
-		const currentParentId = this.subagentCurrentId?.(parentId) ?? parentId;
-		const targetConv = parentOwner.convs.get(currentParentId);
-
-		if (!targetConv || !targetConv.session) {
-			for (const c of toNotify) c.subagentDoneNotified = true;
-			const ids = toNotify.map((c) => c.id.slice(0, 8)).join(", ");
+	/**
+	 * 交互式 `prompt()` 撞上压缩门：文本进意图队列，`compaction_end` 排空时自动开一轮。
+	 * 必须在「当次会话状态」下执行的链路（附件/引用/图片走 `buildAttachmentMessages`、
+	 * 斜杠命令、派活与目标执行者的路由）不排队，仍由调用方如实拒绝。
+	 * 返回 true = 已受理（入队或「积压过多」的提示都已发出），调用方直接 return。
+	 */
+	private parkGatedPrompt(conv: Conversation, text: string, attachments?: PromptAttachment[]): boolean {
+		const rawText = (text ?? "").trim();
+		if (!rawText || rawText.startsWith("/")) return false;
+		if (attachments && attachments.length > 0) return false;
+		if (conv.delegateMode === true || conv.goal?.phase === "executing") return false;
+		const queue = this.deliveryQueue(conv);
+		// tag 用正文：同一份文本重复发送（重连重试 / 手快点两下）只排一条，排空时只发一次。
+		const tag = `user-prompt:${rawText}`;
+		const alreadyQueued = queue.hasTag(tag);
+		if (!queue.park({ tag, kind: "user-prompt", text: rawText, createdAt: Date.now() })) {
 			this.emit({
 				type: "notice",
-				level: "info",
-				text: `子代理 ${ids} 已执行完毕（原父对话已关闭）。`,
-				textEn: `Subagents ${ids} completed (originating conversation is closed).`,
+				level: "warning",
+				text: "对话待发消息积压过多，这条消息没有排队；等压缩结束后再发一次。",
+				textEn:
+					"Too many queued messages for this conversation, so this one was not queued; send it again once compaction finishes.",
 			});
+			return true;
+		}
+		// 回执：客户端据此让乐观回显气泡不再按 TTL 回收（等真正的 user 消息落账时才对账收掉）。
+		this.emit({ type: "prompt_queued", conversationId: conv.id, text: rawText });
+		this.emit({
+			type: "notice",
+			level: "info",
+			text: alreadyQueued
+				? "上下文压缩进行中：这条消息已经在排队里，压缩结束后只会发送一次。"
+				: "上下文压缩进行中：消息已排队，压缩结束后会自动发送。",
+			textEn: alreadyQueued
+				? "Context compaction is in progress: this message is already queued and will be sent once when compaction finishes."
+				: "Context compaction is in progress: your message is queued and will be sent automatically once compaction finishes.",
+		});
+		void this.drainDeliveries(conv);
+		return true;
+	}
+
+	private async drainDeliveries(conv: Conversation): Promise<void> {
+		const queue = conv.delivery;
+		if (!queue || queue.size === 0 || this.disposed) return;
+		await queue.drain(this.deliveryHost(conv));
+	}
+
+	/** 把一段文字投进对话的唯一实现：live → 当前轮，其余 → 新开一轮。 */
+	private async submitText(
+		conv: Conversation,
+		text: string,
+		mode: DeliveryMode = this.deliveryModeOf(conv),
+	): Promise<void> {
+		if (mode === "live") {
+			// 已经在跑：交给这一轮的 steering 队列；刚要开始（promptInFlight）同样走这里，
+			// 因为那一轮马上会把队列取走——绝不能在这里另开一轮。
+			if (conv.session.isStreaming) await conv.session.sendUserMessage(text, { deliverAs: "steer" });
+			else await conv.session.steer(text);
 			return;
 		}
+		await conv.session.sendUserMessage(text);
+	}
 
-		if (targetConv.subagentTaskStopped) {
-			for (const child of toNotify) child.subagentDoneNotified = true;
-			return;
+	private async deliverIntent(conv: Conversation, intent: DeliveryIntent): Promise<"delivered" | "gated"> {
+		const mode = this.deliveryModeOf(conv);
+		if (mode === "gated") return "gated";
+		if (mode === "closed") throw new Error("对话已关闭，投递目标不存在");
+		if (intent.kind === "subagent-notice") return await this.deliverSubagentNotice(conv, intent);
+		const text = intent.text ?? "";
+		if (!text.trim()) return "delivered";
+		if (intent.kind === "steer") {
+			if (mode === "live") await this.submitText(conv, text, mode);
+			else this.startSubagentRound(conv, text);
+			return "delivered";
 		}
+		await this.submitText(conv, text, mode);
+		if (this.convs.get(conv.id) === conv) this.flushSnapshot();
+		return "delivered";
+	}
 
+	/**
+	 * 子代理完成通知：投递时才定稿——要等 worktree 收尾、要合并同批、要复核这一轮真的结束了。
+	 * 定稿前一律不动任何「已通知」标记（提交点在 commitIntent）。
+	 */
+	private async deliverSubagentNotice(parent: Conversation, intent: DeliveryIntent): Promise<"delivered" | "gated"> {
+		const items = (intent.items ?? []) as SubagentNoticeItem[];
+		if (items.length === 0) return "delivered";
+		// 先判「这一批还算不算完成」，再收尾 worktree：不该为了作废的通知拆工作树。
+		// intent.items 始终收敛成「这条通知实际覆盖的那一批」：成功则由 commitIntent 记账，
+		// 失败则由 dropIntent 据此报出到底是谁没通知到。
+		let current = items.filter((item) => this.subagentNoticeStillWanted(item.conv, item.generation));
+		intent.items = current;
+		if (current.length === 0) return "delivered";
+		if (typeof this.finalizeSubagentWorktree === "function") {
+			await Promise.all(current.map((item) => this.finalizeSubagentWorktree(item.conv)));
+		}
+		current = current.filter((item) => this.subagentNoticeStillWanted(item.conv, item.generation));
+		intent.items = current;
+		if (current.length === 0) return "delivered";
+		if (parent.subagentTaskStopped) {
+			for (const item of current) item.conv.subagentDoneNotified = true;
+			intent.items = [];
+			return "delivered";
+		}
 		const checker =
 			this.checkSubagentWakeCircuitBreaker ?? (ClientSession.prototype as any).checkSubagentWakeCircuitBreaker;
-		const circuit = checker.call(this, targetConv, parentOwner, toNotify);
+		const circuit = checker.call(
+			this,
+			parent,
+			this,
+			current.map((item) => item.conv),
+		);
 		if (circuit) {
-			targetConv.suspendedSubagents = targetConv.suspendedSubagents ?? new Set<Conversation>();
-			for (const c of toNotify) {
-				targetConv.suspendedSubagents.add(c);
-			}
-			const count = targetConv.suspendedSubagents.size;
-			parentOwner.emit({
+			parent.suspendedSubagents = parent.suspendedSubagents ?? new Set<Conversation>();
+			for (const item of current) parent.suspendedSubagents.add(item.conv);
+			const count = parent.suspendedSubagents.size;
+			this.emit({
 				type: "notice",
 				level: "warning",
 				text: circuit.messageZh(count),
 				textEn: circuit.messageEn(count),
 			});
-			return;
+			intent.items = [];
+			return "delivered";
 		}
+		const text = formatSubagentsCompletionNotice(
+			current.map((item) => item.conv),
+			this.getLang(),
+		);
+		if (!text.trim()) {
+			intent.items = [];
+			return "delivered";
+		}
+		// worktree 收尾与熔断判定都可能跨 await：门在那一刻可能已经关上。
+		const recheck = this.deliveryModeOf(parent);
+		if (recheck === "gated") return "gated";
+		if (recheck === "closed") throw new Error("父对话已关闭，投递目标不存在");
+		this.assertSubagentWorktreeAdmission(parent);
+		await this.submitText(parent, text, recheck);
+		return "delivered";
+	}
 
-		if ((targetConv.session as unknown as { isCompacting?: boolean }).isCompacting === true) {
-			if (retryCount < 10) {
-				const retryTimer = setTimeout(() => {
-					const current = toNotify.filter(isCurrent);
-					const pending = this.pendingSubagentNotices.get(parentId);
-					if (current.length === 0) {
-						if (pending?.timer === retryTimer) this.pendingSubagentNotices.delete(parentId);
-						this.refreshCompletionState(parentId);
-						return;
-					}
-					if (pending?.timer) clearTimeout(pending.timer);
-					this.pendingSubagentNotices.set(parentId, {
-						timer: retryTimer,
-						subagents: new Set([...(pending?.subagents ?? []), ...current]),
-					});
-					void this.flushSubagentCompletionNotice(parentId, retryCount + 1);
-				}, 800);
-				this.pendingSubagentNotices.set(parentId, { timer: retryTimer, subagents: new Set(toNotify) });
-				return;
+	/** 提交点：只有 SDK 真的接下了这条意图，才允许写这些状态。 */
+	private commitIntent(target: Conversation, intent: DeliveryIntent): void {
+		let changed = true;
+		if (intent.kind === "subagent-notice") {
+			const items = (intent.items ?? []) as SubagentNoticeItem[];
+			// 空集 = 这一批在投递途中已经作废（重新开工 / 被父取走）：什么都没发生。
+			changed = items.length > 0;
+			if (items.length > 0) {
+				for (const item of items) item.conv.subagentDoneNotified = true;
+				if (target.notifyOnDone === "manual") {
+					target.subagentDoneNotified = false;
+					target.subagentConsumedByParent = false;
+					target.subagentRunGeneration = (target.subagentRunGeneration ?? 0) + 1;
+				}
+				target.autonomousTurnsWithoutUser = (target.autonomousTurnsWithoutUser ?? 0) + 1;
+				target.wakeReason = "subagent_completion";
+				target.wakeTurnHadAction = false;
+				target.recentWakeSubagentIds = [
+					...(target.recentWakeSubagentIds ?? []),
+					...items.map((item) => item.conv.id),
+				].slice(-10);
+				if (
+					target.isSubagent &&
+					target.notifyOnDone === "manual" &&
+					!target.subagentDoneNotified &&
+					!target.subagentConsumedByParent
+				) {
+					this.scheduleSubagentCompletionNotice(target);
+				}
 			}
 		}
-
-		if (consultWaitingParents.has(targetConv)) {
-			if (retryCount < 60) {
-				const retryTimer = setTimeout(() => {
-					const current = toNotify.filter(isCurrent);
-					if (current.length === 0) return;
-					const pending = this.pendingSubagentNotices.get(parentId);
-					if (pending?.timer) clearTimeout(pending.timer);
-					this.pendingSubagentNotices.set(parentId, {
-						timer: retryTimer,
-						subagents: new Set([...(pending?.subagents ?? []), ...current]),
-					});
-					void this.flushSubagentCompletionNotice(parentId, retryCount + 1);
-				}, 400);
-				this.pendingSubagentNotices.set(parentId, { timer: retryTimer, subagents: new Set(toNotify) });
-				return;
-			}
+		if (intent.kind === "communication") {
+			this.commitCommunication(target, (intent.items ?? [])[0] as CommunicationEnvelope | undefined);
 		}
-
-		for (const c of toNotify) {
-			c.subagentDoneNotified = true;
+		if (intent.kind === "user-prompt") {
+			// 用户亲手发的话真正被 SDK 接下的这一刻，语义等同 `prompt()` 直接发送：
+			// 无人值守的唤醒计数归零，下一次自动唤醒重新计量。
+			target.autonomousTurnsWithoutUser = 0;
+			target.consecutiveIdleWakeTurns = 0;
+			target.recentWakeSubagentIds = [];
+			target.wakeReason = "user";
+			target.wakeTurnHadAction = undefined;
 		}
+		if (changed && this.convs.get(target.id) === target) this.flushSnapshot();
+		this.refreshCompletionState(target.id);
+	}
 
-		const noticeText = formatSubagentsCompletionNotice(toNotify, this.getLang());
-		if (targetConv.notifyOnDone === "manual") {
-			targetConv.subagentDoneNotified = false;
-			targetConv.subagentConsumedByParent = false;
-			targetConv.subagentRunGeneration = (targetConv.subagentRunGeneration ?? 0) + 1;
-		}
-
-		const autoTurns = targetConv.autonomousTurnsWithoutUser ?? 0;
-		targetConv.autonomousTurnsWithoutUser = autoTurns + 1;
-		targetConv.wakeReason = "subagent_completion";
-		targetConv.wakeTurnHadAction = false;
-		targetConv.recentWakeSubagentIds = [
-			...(targetConv.recentWakeSubagentIds ?? []),
-			...toNotify.map((c) => c.id),
-		].slice(-10);
-
+	/** 协作消息投递被接受：从收件箱移除并清掉「排队中」标记（收件箱是 durable 记录，提交后才删）。 */
+	private commitCommunication(conv: Conversation, envelope: CommunicationEnvelope | undefined): void {
+		if (!envelope) return;
+		conversationCommunication.acknowledge(conv, envelope.id);
+		if (envelope.requestId) conv.queuedSteeringRequestIds?.delete(envelope.requestId);
 		try {
-			parentOwner.assertSubagentWorktreeAdmission?.(targetConv);
-			await targetConv.session.sendUserMessage(
-				noticeText,
-				targetConv.session.isStreaming ? { deliverAs: "steer" } : undefined,
-			);
-			parentOwner.flushSnapshot();
-		} catch (err) {
-			parentOwner.emit({
+			const home = this.communicationHome(conv);
+			if (conv.notifyOnDone === "manual") home.owner.scheduleSubagentCompletionNotice(conv);
+		} catch {}
+	}
+
+	private dropIntent(
+		target: Conversation,
+		intent: DeliveryIntent,
+		reason: "closed" | "failed" | "superseded",
+		error?: unknown,
+	): void {
+		try {
+			this.reportDroppedIntent(target, intent, reason, error);
+		} finally {
+			// 丢弃同样改变了「还有没有待处理」的可见状态，UI 必须跟着刷新。
+			// superseded 是「这条通知本身作废了、没说出口」：不必惊动快照。
+			if (reason !== "superseded" && this.convs.get(target.id) === target) this.flushSnapshot();
+			this.refreshCompletionState(target.id);
+		}
+	}
+
+	private reportDroppedIntent(
+		target: Conversation,
+		intent: DeliveryIntent,
+		reason: "closed" | "failed" | "superseded",
+		error: unknown,
+	): void {
+		if (reason === "superseded") return;
+		const message = error instanceof Error ? error.message : String(error ?? "");
+		if (intent.kind === "subagent-notice") {
+			const items = (intent.items ?? []) as SubagentNoticeItem[];
+			const ids = items.map((item) => item.conv.id.slice(0, 8)).join(", ");
+			if (!ids) return;
+			if (reason === "closed") {
+				// 父对话已经不在了：通知无处可投，记一笔后收干净，别让它永远悬着。
+				for (const item of items) item.conv.subagentDoneNotified = true;
+				this.emit({
+					type: "notice",
+					level: "info",
+					text: `子代理 ${ids} 已执行完毕（原父对话已关闭）。`,
+					textEn: `Subagents ${ids} completed (originating conversation is closed).`,
+				});
+				return;
+			}
+			// 不写「已通知」：父对话下一轮 settle 时会重新排一次，这里只如实报一次失败。
+			this.emit({
 				type: "notice",
 				level: "warning",
-				text: `向父对话投递子代理完成通知失败：${(err as Error).message}`,
-				textEn: `Failed to deliver subagent completion notice to parent conversation: ${(err as Error).message}`,
+				text: `向父对话投递子代理完成通知失败：${message}（未标记为已通知，下次空闲会重投）`,
+				textEn: `Failed to deliver subagent completion notice: ${message} (not marked as notified; will retry when the parent is idle)`,
 			});
+			return;
+		}
+		if (intent.kind === "steer") {
+			this.emit({
+				type: "notice",
+				level: "warning",
+				text: `子代理返工指令未能送出：${message}`,
+				textEn: `Subagent instruction was not delivered: ${message}`,
+			});
+			return;
+		}
+		if (intent.kind === "communication") {
+			this.emit({
+				type: "notice",
+				level: "warning",
+				text: "协作消息投递失败，已保留在收件箱。",
+				textEn: "Collaboration delivery failed; the message remains in the inbox.",
+			});
+			console.warn(`[communication] delivery dropped: ${message}`);
+			const envelope = (intent.items ?? [])[0] as CommunicationEnvelope | undefined;
+			if (envelope?.requestId) target.queuedSteeringRequestIds?.delete(envelope.requestId);
+			return;
+		}
+		if (intent.kind === "user-prompt") {
+			// 用户的话不能静默消失：排队中丢掉也算「没送到」，必须让本人看见并重发。
+			this.emit({
+				type: "notice",
+				level: "warning",
+				text: `排队中的消息未能送出：${message || "对话已关闭"}。请重新发送。`,
+				textEn: `Your queued message was not delivered: ${message || "the conversation was closed"}. Please send it again.`,
+			});
+			return;
+		}
+		console.warn(`[delivery] dropped ${intent.kind}: ${message}`);
+	}
+
+	/**
+	 * 400ms 去抖到点：把这一批子代理交给投递门。
+	 * 「父对话此刻能不能收」不在这里判断——那是 deliveryMode() 的事。
+	 */
+	private flushSubagentNoticeTimer(parentKey: string): void {
+		const entry = this.subagentNoticeTimers.get(parentKey);
+		if (!entry) return;
+		this.subagentNoticeTimers.delete(parentKey);
+		if (entry.timer) clearTimeout(entry.timer);
+		const owner = this.subagentOwnerOf(parentKey);
+		const parent =
+			owner.convs.get(this.subagentCurrentId?.(parentKey) ?? parentKey) ??
+			owner.convs.get(parentKey) ??
+			owner.resolveExecution?.(parentKey)?.conv;
+		if (!parent) {
+			// 作废的那一批（已重新开工 / 已被父取走）不必再报「完成」。
+			const children = [...entry.subagents].filter((child) =>
+				this.subagentNoticeStillWanted(child, child.subagentRunGeneration ?? 0),
+			);
+			for (const child of children) child.subagentDoneNotified = true;
+			const ids = children.map((child) => child.id.slice(0, 8)).join(", ");
+			if (ids) {
+				this.emit({
+					type: "notice",
+					level: "info",
+					text: `子代理 ${ids} 已执行完毕（原父对话已关闭）。`,
+					textEn: `Subagents ${ids} completed (originating conversation is closed).`,
+				});
+			}
+			return;
+		}
+		owner.parkSubagentNotice(parent, [...entry.subagents]);
+		this.refreshCompletionState(parentKey);
+	}
+
+	private parkSubagentNotice(parent: Conversation, children: Conversation[]): void {
+		if (children.length === 0) return;
+		const queue = this.deliveryQueue(parent);
+		const wrappers: SubagentNoticeItem[] = children.map((conv) => ({
+			conv,
+			generation: conv.subagentRunGeneration ?? 0,
+		}));
+		const existing = queue.pending.find((intent) => intent.kind === "subagent-notice");
+		if (existing) {
+			const items = (existing.items ??= []) as SubagentNoticeItem[];
+			for (const wrapper of wrappers) {
+				const hit = items.find((item) => item.conv === wrapper.conv);
+				if (hit) hit.generation = wrapper.generation;
+				else items.push(wrapper);
+			}
+		} else if (
+			!queue.park({ tag: "subagent-notice", kind: "subagent-notice", items: wrappers, createdAt: Date.now() })
+		) {
+			this.emit({
+				type: "notice",
+				level: "warning",
+				text: "子代理完成通知积压过多，最新一条未能入队。",
+				textEn: "Too many pending subagent notices; the newest one was not queued.",
+			});
+			return;
+		}
+		void this.drainDeliveries(parent);
+	}
+
+	/** 子代理重新开工：它这一轮的「完成」作废，把它从父对话的待发通知里摘掉。 */
+	private detachSubagentNotice(child: Conversation): void {
+		const parentKey = this.parentExecutionKey(child);
+		if (parentKey) {
+			const timer = this.subagentNoticeTimers.get(parentKey);
+			if (timer) {
+				timer.subagents.delete(child);
+				if (timer.subagents.size === 0) {
+					clearTimeout(timer.timer);
+					this.subagentNoticeTimers.delete(parentKey);
+				}
+			}
+		}
+		const parent = this.parentExecution(child)?.conv;
+		if (!parent?.delivery) return;
+		const queue = parent.delivery;
+		for (const intent of queue.pending) {
+			const items = (intent.items ?? []) as SubagentNoticeItem[];
+			if (!items.some((item) => item.conv === child)) continue;
+			intent.items = items.filter((item) => item.conv !== child);
+		}
+		queue.removeKind("subagent-notice", (intent) => ((intent.items ?? []) as SubagentNoticeItem[]).length === 0);
+	}
+
+	private parkSteer(conv: Conversation, message: string): void {
+		const queue = this.deliveryQueue(conv);
+		if (!queue.park({ tag: `steer:${++this.deliverySeq}`, kind: "steer", text: message, createdAt: Date.now() })) {
+			this.emit({
+				type: "notice",
+				level: "warning",
+				text: "返工指令积压过多，最新一条未能排队。",
+				textEn: "Too many queued instructions; the newest one was not queued.",
+			});
+			return;
+		}
+		void this.drainDeliveries(conv);
+	}
+
+	private subagentNoticeStillWanted(child: Conversation, generation: number): boolean {
+		if ((child.subagentRunGeneration ?? 0) !== generation) return false;
+		if (child.subagentConsumedByParent || child.subagentDoneNotified) return false;
+		if (child.promptInFlight) return false;
+		try {
+			if (child.session.isStreaming) return false;
+		} catch {
+			return false;
+		}
+		return !this.subagentTaskPending?.(child);
+	}
+
+	// ── 压缩门（唯一写者） ────────────────────────────────────────────────────────
+
+	/** 这一轮结束后按排队顺序做压缩：门立刻翻到 running，堵住「已请求未开始」的窗口。 */
+	private scheduleQueuedCompaction(conv: Conversation, delayMs: number): void {
+		if (conv.compaction?.phase !== "queued") return;
+		if (delayMs <= 0) {
+			void this.runQueuedCompaction(conv);
+			return;
+		}
+		setTimeout(() => {
+			void this.runQueuedCompaction(conv);
+		}, delayMs);
+	}
+
+	private async runQueuedCompaction(conv: Conversation): Promise<void> {
+		const gate = conv.compaction;
+		if (!gate || gate.phase !== "queued" || !gate.request || this.disposed) return;
+		const request = gate.request;
+		conv.compaction = runningCompaction(gate.reason, gate.startedAt);
+		try {
+			await this.executeCompaction(conv, request);
+		} finally {
+			if (conv.compaction?.phase === "running") conv.compaction = null;
+			await this.drainDeliveries(conv);
+			this.emitConversations();
 		}
 	}
 
@@ -2605,7 +3095,7 @@ export class ClientSession {
 		if (!isStreaming(conv)) {
 			const graceEnd = Date.now() + Math.min(3000, Math.max(0, timeoutMs));
 			while (!isStreaming(conv) && Date.now() < graceEnd) {
-				await new Promise((resolve) => setTimeout(resolve, 50));
+				await sleep(50);
 				const again = this.convs.get(convId);
 				if (!again) return "gone";
 				conv = again;
@@ -3091,7 +3581,6 @@ export class ClientSession {
 		selectedTools: string[];
 		toolSnippets: Record<string, string>;
 		toolSignatures?: Record<string, string>;
-		toolGuidelines: string[];
 		contextFiles: { path: string; content: string }[];
 		skills: { name: string; description: string; filePath: string }[];
 		preset?: string;
@@ -3112,12 +3601,8 @@ export class ClientSession {
 			selectedTools: src.selectedTools,
 			toolSnippets: src.toolSnippets,
 			toolSignatures: src.toolSignatures,
-			toolGuidelines: src.toolGuidelines,
 			...(src.lazy ? { lazy: true } : {}),
 			...(src.lazy && src.catalogTools ? { catalogTools: src.catalogTools } : {}),
-			piReadme: PI_DOC_PATHS.readme,
-			piDocs: PI_DOC_PATHS.docs,
-			piExamples: PI_DOC_PATHS.examples,
 			pluginDocs: join(getPkgRoot(), "docs", "architecture-plugins.md"),
 			pluginSdk: join(getPkgRoot(), "plugin-sdk"),
 			pluginsDir: join(this.stateStore.dataDir, "plugins"),
@@ -3147,7 +3632,6 @@ export class ClientSession {
 		selectedTools: string[];
 		toolSnippets: Record<string, string>;
 		toolSignatures?: Record<string, string>;
-		toolGuidelines: string[];
 		contextFiles: { path: string; content: string }[];
 		skills: { name: string; description: string; filePath: string }[];
 		preset?: string;
@@ -3208,7 +3692,6 @@ export class ClientSession {
 			const baseNames = lazyOn ? this.lazyResidentNames(sess, conv) : active;
 			const snippets: Record<string, string> = {};
 			const signatures: Record<string, string> = catalog.signatures ?? {};
-			const guidelines: string[] = [];
 			for (const name of catalog.names) {
 				const def = sess.getToolDefinition(name);
 				if (!def) continue;
@@ -3218,20 +3701,12 @@ export class ClientSession {
 					snippets[name] = eff.promptSnippet.trim();
 				}
 			}
-			for (const name of baseNames) {
-				const def = sess.getToolDefinition(name);
-				if (!def) continue;
-				const ov = toolPromptOverrideOf(this.settingsSvc.current.toolPromptOverrides, name);
-				const eff = effectiveToolPrompt(def, ov);
-				if (eff.promptGuidelines) guidelines.push(...eff.promptGuidelines);
-			}
 			const texts = resolveSectionTexts(
 				this.composeInputs({
 					cwd,
 					selectedTools: baseNames,
 					toolSnippets: snippets,
 					toolSignatures: signatures,
-					toolGuidelines: guidelines,
 					...(lazyOn ? { lazy: true, catalogTools: catalog.names } : {}),
 					contextFiles: loader.getAgentsFiles().agentsFiles,
 					skills: loader.getSkills().skills.map((s) => ({
@@ -3329,7 +3804,12 @@ export class ClientSession {
 		return estimateNonSystemTokens(conv.session.agent.state.messages, conv.session.agent.state.streamingMessage);
 	}
 
-	private webUi = new WebUIContext((msg) => this.emit(msg));
+	private webUi = new WebUIContext((msg) => this.emit(msg), {
+		// widget / status 都带会话归属（issue #952）：快照只发当前会话的 + 全局的，
+		// 切会话时 refresh() 会因会话变化强推一次（切到没有 widget 的会话也要清空面板）。
+		activeConversationId: () => this.activeId,
+		isConversationAlive: (id) => this.convs.has(id),
+	});
 
 	private subagentHandoffs: SubagentHandoffRecord[] = [];
 
@@ -3589,8 +4069,11 @@ export class ClientSession {
 		});
 	}
 
-	private async executePendingCompaction(conv: Conversation, pending: PendingCompaction): Promise<void> {
-		const instructions = buildCompactionInstructions(pending.focus, pending.summary);
+	private async executeCompaction(conv: Conversation, pending: PendingCompaction): Promise<void> {
+		const provided = pending.summary?.trim();
+		const instructions = provided
+			? buildCompactionInstructions(pending.focus)
+			: buildCompactionInstructions(pending.focus, pending.summary);
 		const session = conv.session;
 		const model = session.model;
 
@@ -3613,14 +4096,25 @@ export class ClientSession {
 				});
 			}
 
-			await session.compact(instructions || undefined);
+			// Hand the checkpoint to the compaction patch: it stores these bytes and skips the
+			// summarization request, while the SDK keeps events, projection refresh and appendCompaction.
+			if (provided) this.providedCompactionSummaries.set(session, provided);
+			try {
+				await session.compact(instructions || undefined);
+			} finally {
+				if (provided) this.providedCompactionSummaries.delete(session);
+			}
 
 			const retainTokens = pending.keepRecentTokens ?? DEFAULT_KEEP_RECENT_TOKENS;
 			this.emit({
 				type: "notice",
 				level: "info",
-				text: `AI 已主动根据当前问题完成上下文压缩（保留 ~${retainTokens.toLocaleString()} tokens 近期上下文，重点保留当前问题相关内容）`,
-				textEn: `Context compacted proactively based on current issue (retained ~${retainTokens.toLocaleString()} tokens, focused on current task)`,
+				text: provided
+					? `AI 已用自己撰写的正文完成上下文压缩（${provided.length.toLocaleString()} 字，保留 ~${retainTokens.toLocaleString()} tokens 近期原文，未产生额外摘要请求）`
+					: `AI 已主动根据当前问题完成上下文压缩（保留 ~${retainTokens.toLocaleString()} tokens 近期上下文，重点保留当前问题相关内容）`,
+				textEn: provided
+					? `Context compacted with the checkpoint the model wrote itself (${provided.length.toLocaleString()} chars, retained ~${retainTokens.toLocaleString()} tokens verbatim, no extra summarization request)`
+					: `Context compacted proactively based on current issue (retained ~${retainTokens.toLocaleString()} tokens, focused on current task)`,
 			});
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
@@ -3642,8 +4136,11 @@ export class ClientSession {
 					}
 				} catch {}
 			}
+			// 门必须在这里兜底打开：compact() 抛错/被取消时也要放行排队中的投递。
+			if (conv.compaction?.phase === "running") conv.compaction = null;
 			this.applyCompactionOverrides();
 			this.flushSnapshot();
+			await this.drainDeliveries(conv);
 		}
 	}
 
@@ -3859,12 +4356,11 @@ export class ClientSession {
 				this.updatePlan(steps, undefined, convId);
 			},
 			isGitRepo: async (cwd) => {
-				try {
-					const r = await this.runAsync("git", ["rev-parse", "--is-inside-work-tree"], 5_000, cwd || this.cwd);
-					return r.code === 0;
-				} catch {
-					return false;
-				}
+				const result = await runGit(["rev-parse", "--is-inside-work-tree"], {
+					cwd: cwd || this.cwd,
+					timeoutMs: 5_000,
+				});
+				return result.ok;
 			},
 			spawnRoleAgent: async ({ role, prompt, cwd, model, parentId, title }) => {
 				const baseCwd = cwd || (parentId ? this.convs.get(parentId)?.cwd : undefined) || this.cwd;
@@ -3889,11 +4385,14 @@ export class ClientSession {
 				const conv = this.convs.get(convId);
 				if (!conv?.session) return false;
 				this.assertSubagentWorktreeAdmission(conv);
-				await conv.session.sendUserMessage(
-					message,
-					deliverAs ? { deliverAs } : conv.session.isStreaming ? { deliverAs: "steer" } : undefined,
-				);
-				return true;
+				const mode = this.deliveryModeOf(conv);
+				if (mode === "closed") return false;
+				if (mode === "live" && deliverAs === "followUp") {
+					await conv.session.sendUserMessage(message, { deliverAs: "followUp" });
+					return true;
+				}
+				const outcome = await this.deliverFromOutside(conv, message);
+				return outcome === "delivered" || outcome === "queued";
 			},
 			readRoleAgent: (convId) => {
 				const conv = this.convs.get(convId);
@@ -4007,9 +4506,46 @@ export class ClientSession {
 	}
 
 	private botExecution?: BotExecutionCapability;
-	private botMcpBridge?: McpBridge;
+	/** 新建会话时先登记、会话创建后再落到 `Conversation.bot` 的 Bot 能力。 */
+	private readonly pendingBotChat = new Map<string, BotExecutionCapability>();
 
-	private executionMcpBridge(cwd: string): McpBridge | undefined {
+	/**
+	 * 读某个会话的 Bot 身份：会话级优先（私聊），客户端级兜底（设备任务的无头会话）。
+	 * 会话对象还没创建时（运行时工厂先跑）先看 pending 槽，并顺手落到会话上。
+	 */
+	private botOf(conversationId?: string): BotExecutionCapability | undefined {
+		const id = conversationId ?? this.activeId;
+		if (!id) return this.botExecution;
+		const conv = this.convs.get(id);
+		if (conv?.bot) return conv.bot;
+		const pending = this.pendingBotChat.get(id);
+		if (pending) {
+			// 会话对象还没建好时保留 pending：等 `makeConversation` 认领时再落到会话上。
+			if (conv) this.attachBotBinding(conv, pending);
+			return pending;
+		}
+		return this.botExecution;
+	}
+	private botMcpBridge?: McpBridge;
+	/** 每个私聊会话自己的 Bot MCP 桥：不同 Bot 的 mcpServers 白名单不能互相串用。 */
+	private readonly botMcpByConversation = new Map<string, McpBridge>();
+	/** 每个会话一份记忆写入配额（每回合/每会话），回合在 `prompt()` 开新轮时归零。 */
+	private readonly memoryQuotas = new Map<string, MemoryWriteQuota>();
+
+	private memoryQuotaFor(conversationId: string): MemoryWriteQuota {
+		let quota = this.memoryQuotas.get(conversationId);
+		if (!quota) {
+			quota = createMemoryWriteQuota();
+			this.memoryQuotas.set(conversationId, quota);
+		}
+		return quota;
+	}
+
+	private executionMcpBridge(cwd: string, conversationId?: string): McpBridge | undefined {
+		// 私聊是会话级 Bot 能力：MCP 只看这个 Bot 允许的 server，绝不回落到项目的 MCP。
+		// 会话对象还没建好时（运行时工厂先跑）用 pending 槽认领，否则会错用项目桥。
+		if (conversationId && (this.convs.get(conversationId)?.bot || this.pendingBotChat.has(conversationId)))
+			return this.botMcpByConversation.get(conversationId);
 		return this.botExecution ? this.botMcpBridge : ClientSession.mcpProjects?.getBridge(cwd);
 	}
 
@@ -4018,15 +4554,18 @@ export class ClientSession {
 		cwd = this.cwd,
 		params?: unknown,
 		phase: "execute" | "register" = "execute",
+		conversationId?: string,
 	): { allowed: boolean; reason?: string } {
-		const bot = this.botExecution;
+		// 身份必须按**执行这次调用的会话**解析：私聊可能在后台跑，活动会话是另一条对话。
+		// 用 `botOf()`（活动会话）会让后台 Bot 套用前台会话的白名单，等于没有白名单。
+		const bot = this.botOf(conversationId);
 		if (!bot) return { allowed: true };
 		bot.assertActive();
 		if (bot.planOnly && phase === "execute") {
 			const denial = checkGroupTaskPlanGuard(name, params ?? {}, true);
 			if (denial) return { allowed: false, reason: denial.reason };
 		}
-		const mcp = this.executionMcpBridge(cwd)?.getTools() ?? [];
+		const mcp = this.executionMcpBridge(cwd, conversationId)?.getTools() ?? [];
 		const matches = mcp.filter((tool) => tool.name === name);
 		if (!(phase === "register" ? bot.allowsToolRegistration(name) : bot.allowsTool(name, params ?? {})))
 			return { allowed: false, reason: "Tool is not authorized for this Bot" };
@@ -4035,12 +4574,12 @@ export class ClientSession {
 		return { allowed: true };
 	}
 
-	private botToolAllowed(name: string, cwd = this.cwd, params?: unknown): boolean {
-		return this.botToolAuthorization(name, cwd, params).allowed;
+	private botToolAllowed(name: string, cwd = this.cwd, params?: unknown, conversationId?: string): boolean {
+		return this.botToolAuthorization(name, cwd, params, "execute", conversationId).allowed;
 	}
 
-	private botToolRegistrationAllowed(name: string, cwd = this.cwd): boolean {
-		return this.botToolAuthorization(name, cwd, undefined, "register").allowed;
+	private botToolRegistrationAllowed(name: string, cwd = this.cwd, conversationId?: string): boolean {
+		return this.botToolAuthorization(name, cwd, undefined, "register", conversationId).allowed;
 	}
 
 	static async create(
@@ -4065,7 +4604,7 @@ export class ClientSession {
 		const cs = new ClientSession(clientId, cwd, agentDir, stateStore);
 		cs.onNotificationEvent = opts?.onNotificationEvent;
 		cs.botExecution = botExecution;
-		botExecution?.captureModel(stateStore.getDefaultModel("pi"));
+		botExecution?.captureModel(stateStore.getDefaultModel("pi") ?? stateStore.getProjectModel(clientId, cwd, "pi"));
 		if (botExecution) opts = { blank: true };
 		if (!getGlobalRemoteSshService()) {
 			setGlobalRemoteSshService(new RemoteSshService(stateStore.dataDir));
@@ -4195,6 +4734,36 @@ export class ClientSession {
 		return cs;
 	}
 
+	/**
+	 * 解析一个会话该用哪个 Bot 能力（私聊）：
+	 * 1. 已绑定（新建后 / `botOf` 命中）→ 直接用；
+	 * 2. 会话文件里带 `webui/bot-chat`（重开、重启后恢复）→ 按**当前** Bot 配置重建能力；
+	 * 3. 都没有 → `undefined`（普通对话）。
+	 */
+	private async botExecutionForConversation(
+		ownerId: string | undefined,
+		sessionManager: { getEntries?: () => Array<{ type?: string; customType?: string; data?: unknown }> },
+		_cwd: string,
+	): Promise<BotExecutionCapability | undefined> {
+		const bound = this.botOf(ownerId);
+		if (bound) return bound;
+		let entries: Array<{ type?: string; customType?: string; data?: unknown }> = [];
+		try {
+			entries = sessionManager.getEntries?.() ?? [];
+		} catch {
+			entries = [];
+		}
+		const binding = readBotChatBinding(entries);
+		if (!binding) return undefined;
+		const created = await createBotChatCapability(binding.botId);
+		if (!created) return undefined;
+		if (!ownerId) return created.capability;
+		this.pendingBotChat.set(ownerId, created.capability);
+		const conv = this.convs.get(ownerId);
+		if (conv) this.attachBotBinding(conv, created.capability);
+		return created.capability;
+	}
+
 	private makeRuntimeFactory(
 		terminals: TerminalManager,
 		apply?: SubagentTemplate,
@@ -4204,41 +4773,80 @@ export class ClientSession {
 		noSpawnTools?: boolean,
 	): CreateAgentSessionRuntimeFactory {
 		return async ({ cwd: effectiveCwd, sessionManager }) => {
-			if (this.botExecution) await this.botExecution.assertWorkspace(effectiveCwd);
-			const botEntry = sessionManager
-				.getEntries()
-				.find((entry) => entry.type === "custom" && entry.customType === "device-bot-execution");
-			if (botEntry && !this.botExecution)
-				throw new Error("Bot execution transcripts cannot be resumed as ordinary sessions");
-			if (botEntry?.type === "custom" && this.botExecution) {
-				const owner = botEntry.data as { botId?: unknown; revision?: unknown } | undefined;
-				if (owner?.botId !== this.botExecution.bot.id || owner?.revision !== this.botExecution.bot.revision)
-					throw new Error("Bot execution transcript ownership does not match the active capability");
+			// 会话级 Bot 绑定（私聊）优先；无头设备任务仍走客户端级能力兜底。
+			const botExecution = await this.botExecutionForConversation(ownerId, sessionManager, effectiveCwd);
+			if (botExecution) await botExecution.assertWorkspace(effectiveCwd);
+			const botEntries = sessionManager.getEntries();
+			const executionAnchor = readBotExecutionAnchor(botEntries);
+			const chatAnchor = readBotChatBinding(botEntries);
+			const transcriptBinding = decideTranscriptBotBinding({
+				execution: executionAnchor,
+				chat: chatAnchor,
+				current: botExecution ? { id: botExecution.bot.id, revision: botExecution.bot.revision } : undefined,
+			});
+			if (transcriptBinding.action === "reject")
+				throw new Error(
+					transcriptBinding.reason === "orphan"
+						? "Bot execution transcripts cannot be resumed as ordinary sessions"
+						: transcriptBinding.reason === "owner"
+							? "Bot execution transcript ownership does not match the active capability"
+							: "Bot execution transcript was authorized for a different Bot revision",
+				);
+			if (botExecution) {
+				const revision = botExecution.bot.revision;
+				const rebind = transcriptBinding.action === "rebind";
+				// 锚点只追不改：读者一律取最后一条，所以重绑就是再追加一份当前身份。
+				if (!executionAnchor || rebind)
+					sessionManager.appendCustomEntry(BOT_EXECUTION_ENTRY, { botId: botExecution.bot.id, revision });
+				// 私聊会话的持久化锚点：重开/重启后据此把同一个 Bot 重新绑回来。
+				if (chatAnchor?.botId !== botExecution.bot.id || rebind)
+					sessionManager.appendCustomEntry(BOT_CHAT_ENTRY, {
+						botId: botExecution.bot.id,
+						revision,
+						name: botExecution.bot.name,
+					});
 			}
-			if (this.botExecution && !botEntry)
-				sessionManager.appendCustomEntry("device-bot-execution", {
-					botId: this.botExecution.bot.id,
-					revision: this.botExecution.bot.revision,
+			// 私聊但 Bot 没了：照样能把历史打开看（prompt 那边会拦住“当成 Bot 说话”）。
+			if (transcriptBinding.action === "degrade")
+				this.emit({
+					type: "notice",
+					level: "warning",
+					text: "这个智能体已停用或删除：这条私聊只能查看历史，不能接着对话。",
+					textEn:
+						"This agent is disabled or deleted: this chat is read-only history and cannot continue the conversation.",
 				});
-			const expectedBotCwd = this.botExecution?.executionCwd ?? this.botExecution?.bot.cwd;
-			if (this.botExecution && expectedBotCwd && resolve(effectiveCwd) !== resolve(expectedBotCwd))
+			const expectedBotCwd = botExecution?.executionCwd ?? botExecution?.bot.cwd;
+			if (botExecution && expectedBotCwd && resolve(effectiveCwd) !== resolve(expectedBotCwd))
 				throw new Error("Bot cwd is fixed");
 			const sandboxIdentity = this.sandboxes.getExecutionIdentity(effectiveCwd);
-			const releaseMcp =
-				sandboxIdentity || this.botExecution ? undefined : ClientSession.mcpProjects?.retain(effectiveCwd);
+			const releaseMcp = sandboxIdentity || botExecution ? undefined : ClientSession.mcpProjects?.retain(effectiveCwd);
 			try {
-				if (this.botExecution) {
-					if (!this.botMcpBridge) {
+				if (botExecution) {
+					// 私聊是会话级能力：每个会话按自己的 Bot 的 mcpServers 白名单建桥，互不串用。
+					// 无头设备任务仍用客户端级那一份（ownerId 在任务里就是它自己的会话）。
+					const clientLevel = this.botExecution === botExecution;
+					if (!clientLevel && ownerId && botExecution.bot.mcpServers.length > 0) {
+						if (!this.botMcpByConversation.has(ownerId)) {
+							const bridge = new McpBridge(this.stateStore.dataDir, undefined, {
+								agentDir: this.agentDir,
+								cwd: effectiveCwd,
+								allowedServers: botExecution.bot.mcpServers,
+							});
+							await bridge.load();
+							this.botMcpByConversation.set(ownerId, bridge);
+						}
+					}
+					if (clientLevel && !this.botMcpBridge) {
 						this.botMcpBridge = new McpBridge(this.stateStore.dataDir, undefined, {
 							agentDir: this.agentDir,
 							cwd: effectiveCwd,
-							allowedServers: this.botExecution.bot.mcpServers,
+							allowedServers: botExecution.bot.mcpServers,
 						});
 						await this.botMcpBridge.load();
-						await this.botExecution.assertWorkspace(effectiveCwd);
 					}
+					await botExecution.assertWorkspace(effectiveCwd);
 				} else if (!sandboxIdentity) await ClientSession.mcpProjects?.prepare(effectiveCwd);
-				const sdkBuiltins = sandboxIdentity || this.botExecution ? [] : await getSdkBuiltinExtensionFactories();
+				const sdkBuiltins = sandboxIdentity || botExecution ? [] : await getSdkBuiltinExtensionFactories();
 				const sandboxRuntimeGate = createSandboxRuntimeGate(
 					() => this.sandboxes.getExecutionIdentity(effectiveCwd, sandboxIdentity),
 					effectiveCwd,
@@ -4285,7 +4893,7 @@ export class ClientSession {
 					cwd: effectiveCwd,
 					modelRuntime: this.sharedModelRuntime,
 					resourceLoaderOptions: {
-						...sandboxExtensionOptions(Boolean(sandboxIdentity) || Boolean(this.botExecution)),
+						...sandboxExtensionOptions(Boolean(sandboxIdentity) || Boolean(botExecution)),
 						systemPromptOverride: promptBase.systemPromptOverride,
 						appendSystemPromptOverride: promptBase.appendSystemPromptOverride,
 						skillsOverride: (res) => {
@@ -4295,7 +4903,7 @@ export class ClientSession {
 								workspaceRoots: this.roots,
 							});
 							const allSkills = mergeSkillCollections(res.skills, discovered);
-							if (this.botExecution) return { ...res, skills: this.botExecution.filterSkills(allSkills) };
+							if (botExecution) return { ...res, skills: botExecution.filterSkills(allSkills) };
 							if (apply && apply.enabledSkills.length > 0) {
 								const set = new Set(apply.enabledSkills);
 								return { ...res, skills: allSkills.filter((s) => set.has(s.name)) };
@@ -4329,14 +4937,34 @@ export class ClientSession {
 							...sdkBuiltins,
 							requestContextExtension,
 							{
+								name: "pi-webui-provider-payload-overrides",
+								hidden: true,
+								factory: (pi) => {
+									pi.on("before_provider_request", (event, ctx) => {
+										const parentConversationId = this.convs.get(ownerId ?? "")?.parentId;
+										return mergeModelSamplingParamsIntoProviderPayload(
+											event.payload,
+											ctx.model,
+											getConversationSamplingOverrides(ownerId, parentConversationId),
+										);
+									});
+								},
+							},
+							{
 								name: "pi-webui-sandbox-final-gate",
 								hidden: true,
 								factory: (pi) => {
 									pi.on("tool_call", async (event) => {
-										if (this.botExecution) {
+										if (botExecution) {
 											try {
-												await this.botExecution.assertWorkspace(effectiveCwd);
-												const auth = this.botToolAuthorization(event.toolName, effectiveCwd, event.input);
+												await botExecution.assertWorkspace(effectiveCwd);
+												const auth = this.botToolAuthorization(
+													event.toolName,
+													effectiveCwd,
+													event.input,
+													"execute",
+													ownerId,
+												);
 												if (!auth.allowed)
 													return { block: true, reason: auth.reason ?? "Tool is not authorized for this Bot" };
 											} catch {
@@ -4352,7 +4980,7 @@ export class ClientSession {
 								hidden: true,
 								factory: (pi) => {
 									pi.on("context", (event, ctx) => {
-										const bot = this.botExecution;
+										const bot = botExecution;
 										if (!bot?.groupContext) return;
 										const messages = repairGroupContextRequest(bot.groupContext, event.messages, bot.bot.id);
 										const metrics =
@@ -4363,7 +4991,7 @@ export class ClientSession {
 										if (messages !== event.messages) return { messages };
 									});
 									pi.on("before_agent_start", (_event, ctx) => {
-										const bot = this.botExecution;
+										const bot = botExecution;
 										const current = bot?.groupContext;
 										if (!current) return;
 										const message = groupContextMessage(
@@ -4381,7 +5009,7 @@ export class ClientSession {
 								hidden: true,
 								factory: (pi) => {
 									pi.on("before_agent_start", (event) => {
-										const { core, rewrap } = prepareBotExecutionSystemPrompt(event, this.botExecution);
+										const { core, rewrap } = prepareBotExecutionSystemPrompt(event, botExecution);
 										if (apply) {
 											const tplPrompt = this.templatePrompt(apply).trim();
 											if (apply.promptMode !== "replace" || !tplPrompt) return undefined;
@@ -4406,7 +5034,6 @@ export class ClientSession {
 										const baseNames = lazyOn && sess ? this.lazyResidentNames(sess, conv) : activeToolNames;
 										const activeSnippets: Record<string, string> = {};
 										const activeSignatures: Record<string, string> = catalog.signatures ?? {};
-										const activeGuidelines: string[] = [];
 										if (sess) {
 											for (const name of catalog.names) {
 												const def = sess.getToolDefinition(name);
@@ -4417,13 +5044,6 @@ export class ClientSession {
 													activeSnippets[name] = eff.promptSnippet.trim();
 												}
 											}
-											for (const name of baseNames) {
-												const def = sess.getToolDefinition(name);
-												if (!def) continue;
-												const ov = toolPromptOverrideOf(this.settingsSvc.current.toolPromptOverrides, name);
-												const eff = effectiveToolPrompt(def, ov);
-												if (eff.promptGuidelines) activeGuidelines.push(...eff.promptGuidelines);
-											}
 										}
 										const currentPreset =
 											conv?.agentPreset ?? targetPreset ?? this.settingsSvc.current.defaultAgentPreset ?? "standard";
@@ -4433,7 +5053,6 @@ export class ClientSession {
 													forceSystemPrompt?: string;
 													selectedTools?: string[];
 													toolSnippets?: Record<string, string>;
-													promptGuidelines?: string[];
 													contextFiles?: { path: string; content: string }[];
 													skills?: { name: string; description?: string; filePath?: string }[];
 											  }
@@ -4446,7 +5065,6 @@ export class ClientSession {
 											selectedTools: baseNames.length > 0 ? baseNames : (opts?.selectedTools ?? []),
 											toolSnippets: activeSnippets,
 											toolSignatures: activeSignatures,
-											toolGuidelines: activeGuidelines,
 											...(lazyOn ? { lazy: true, catalogTools: catalog.names } : {}),
 											contextFiles: opts?.contextFiles ?? [],
 											skills: (opts?.skills ?? []).map((s) => ({
@@ -4481,10 +5099,20 @@ export class ClientSession {
 				const bridge = this.bridgeTarget(bridgeAnchor, ownerId);
 
 				let sessionModel: Parameters<AgentSession["setModel"]>[0] | undefined = initialModel;
-				if (this.botExecution) {
-					const fixed = this.botExecution.captureModel(undefined);
+				if (botExecution) {
+					// 重开私聊（刷新/重启后从转录恢复）走的是这里：能力是新建的，还没钉过模型。
+					// 不传兜底就会把「没给 Bot 配模型」当成致命错误抛在 `newChat` 的 try 之外。
+					let fixed: { provider: string; modelId: string };
+					try {
+						fixed = botExecution.captureModel(this.botFallbackModel(effectiveCwd));
+					} catch (error) {
+						throw new Error(this.botModelUnavailableText(error));
+					}
 					sessionModel = services.modelRuntime.getModel(fixed.provider, fixed.modelId);
-					if (!sessionModel) throw new Error("Configured Bot model is unavailable");
+					if (!sessionModel)
+						throw new Error(
+							`这个智能体配置的模型当前不可用（${fixed.provider}/${fixed.modelId}）：请在设置里重新选择一个模型 / The configured Bot model is unavailable (${fixed.provider}/${fixed.modelId}): pick another model in Settings`,
+						);
 					await this.restoreKeyForModel(`${fixed.provider}/${fixed.modelId}`, effectiveCwd);
 				}
 				if (!sessionModel) {
@@ -4515,7 +5143,7 @@ export class ClientSession {
 					}
 				}
 
-				await this.botExecution?.assertWorkspace(effectiveCwd);
+				await botExecution?.assertWorkspace(effectiveCwd);
 				const created = await createAgentSessionFromServices({
 					services,
 					sessionManager,
@@ -4645,10 +5273,12 @@ export class ClientSession {
 								}
 								return {};
 							},
+							// 用户自己开的终端标签（「引用到输入框」带过来的）：可读也可输入，安全门禁同一套。
+							resolveExternal: (terminalId) => (this.userTerminals?.has(terminalId) ? this.userTerminals : undefined),
 						}).map((tool) => withWorkspaceSnapshotGate(tool, () => this.awaitPendingWorkspaceSnapshot(ownerId))),
 						...(sandboxIdentity || (apply && apply.enabledExtensions.length > 0)
 							? []
-							: this.enabledPluginToolDefs(undefined, effectiveCwd)),
+							: this.enabledPluginToolDefs(undefined, effectiveCwd, ownerId)),
 						...(noSpawnTools
 							? []
 							: ownerId
@@ -4755,15 +5385,16 @@ export class ClientSession {
 							},
 							() => this.getLang(),
 						),
-						...(this.botExecution ? [makeDeviceCollabTool()] : []),
+						...(botExecution ? [makeDeviceCollabTool()] : []),
 						// 一句话创建：只有设备侧接入了草案仓库时才出现（Bot 执行里不需要它）。
-						...(!this.botExecution && agentBotToolAvailable() ? [makeAgentBotTool()] : []),
+						...(!botExecution && agentBotToolAvailable() ? [makeAgentBotTool()] : []),
 						// 记忆工具只对有独立记忆目录的 Bot 执行注册（普通会话与子代理不共享这份私产）。
-						...(this.botExecution?.memoryRoot
+						...(botExecution?.memoryRoot
 							? [
 									makeBotMemoryTool({
-										root: this.botExecution.memoryRoot,
-										botId: this.botExecution.bot.id,
+										root: botExecution.memoryRoot,
+										botId: botExecution.bot.id,
+										quota: ownerId ? this.memoryQuotaFor(ownerId) : undefined,
 									}),
 								]
 							: []),
@@ -4785,7 +5416,7 @@ export class ClientSession {
 					]).map((t) => this.wrapGenericTool(t, ownerId, effectiveCwd, bridgeAnchor, true)),
 				});
 				try {
-					await this.botExecution?.assertWorkspace(effectiveCwd);
+					await botExecution?.assertWorkspace(effectiveCwd);
 				} catch (error) {
 					created.session.dispose();
 					throw error;
@@ -4801,6 +5432,7 @@ export class ClientSession {
 						const file = created.session.sessionManager.getSessionFile();
 						return file ? buildContextEvidenceIndex(file) : "";
 					},
+					takeProvidedSummary: () => this.providedCompactionSummaries.get(created.session),
 				});
 				if (evidenceHooksReady && compactionReady) enableRequestEvidence(created.session.sessionManager);
 				if (noSpawnTools) SPAWN_TOOLS_BARRED.add(created.session);
@@ -4864,6 +5496,16 @@ export class ClientSession {
 
 	private nextConversationId(): string {
 		return `c${++this.convSeq}`;
+	}
+
+	/** 这条对话的转录文件（定时任务跑完后用它在面板/历史里直接打开）。 */
+	conversationSessionFile(id: string): string | undefined {
+		try {
+			const file = this.convs.get(id)?.session.sessionFile;
+			return file ? resolve(file) : undefined;
+		} catch {
+			return undefined;
+		}
 	}
 
 	private conversationViewers = new Map<Conversation, Set<() => void>>();
@@ -5032,9 +5674,23 @@ export class ClientSession {
 		const forkedFromSessionPath = parentSessionOfManager(runtime.session.sessionManager);
 		if (forkedFromSessionPath) conv.forkedFromSessionPath = forkedFromSessionPath;
 		if (conv.nativeCli) this.ensureNativeCliBinding(conv);
+		// 从转录重开的私聊：能力是运行时工厂按 `webui/bot-chat` 重建的（当时会话还不存在），
+		// 这里补上身份——否则左栏认不出它属于哪个智能体、`pickBotChatConversation` 也找不到它。
+		const pendingBot = this.pendingBotChat.get(id);
+		if (pendingBot) this.attachBotBinding(conv, pendingBot);
 		conversationIdentity(conv);
+		// issue #946：登记持有会话，让父链/执行身份解析走 O(1) 快路径（移除时 forget）。
+		registerConversationHome(conv, this);
 		this.restorePlan(conv);
 		return conv;
+	}
+
+	/** 把一份 Bot 能力落到会话上（Bot 私聊的唯一「身份」入口）。 */
+	private attachBotBinding(conv: Conversation, capability: BotExecutionCapability): void {
+		conv.bot = capability;
+		conv.botId = capability.bot.id;
+		conv.botName = capability.bot.name;
+		this.pendingBotChat.delete(conv.id);
 	}
 
 	private restorePlan(conv: Conversation): void {
@@ -5278,9 +5934,8 @@ export class ClientSession {
 			!turn.settled ||
 			busy ||
 			conv.retryState ||
-			conv.compactionState ||
-			conv.pendingCompaction ||
-			turn.compactionPending ||
+			// 压缩门（已请求 / 进行中）统一由投递门回答，不再各查一个字段。
+			this.deliveryModeOf(conv) === "gated" ||
 			this.isWaitingOnUser(conv.id) ||
 			this.subagentTaskPending(conv)
 		)
@@ -5341,7 +5996,7 @@ export class ClientSession {
 		}
 		await conv.session.bindExtensions({
 			mode: "rpc",
-			uiContext: this.webUi,
+			uiContext: this.webUi.forConversation(conv.id),
 			onError: this.makeExtensionErrorReporter(
 				conv.isEphemeral ? { text: `临时对话 ${conv.id}：`, textEn: `Ephemeral chat ${conv.id}: ` } : undefined,
 			),
@@ -5352,6 +6007,60 @@ export class ClientSession {
 		this.webUi.refresh();
 		this.startWidgetsTimer();
 		this.startStallTimer();
+		this.startSubagentRecycleTimer();
+	}
+
+	private subagentRecycleTimer: ReturnType<typeof setInterval> | null = null;
+
+	private startSubagentRecycleTimer(): void {
+		if (this.subagentRecycleTimer || SUBAGENT_RECYCLE_INTERVAL_MS <= 0) return;
+		this.subagentRecycleTimer = setInterval(() => {
+			if (this.disposed) return;
+			this.recycleFinishedSubagents();
+		}, SUBAGENT_RECYCLE_INTERVAL_MS);
+	}
+
+	/**
+	 * issue #944 根因 3：子代理结束后永不回收——每个子代理是一整份 AgentSession + 终端 + 扩展绑定。
+	 * 这里只回收「完全落定且空闲够久」的：无流式/压缩/投递/终端/存活后代，任务已结算且结果已交付或消费。
+	 * 已持久化的转录与左栏历史行不受影响，点一下就能重新打开。
+	 */
+	recycleFinishedSubagents(now = Date.now()): number {
+		const removed: string[] = [];
+		const withChildren = this.conversationsWithChildren();
+		// 直接遍历 map：删除当前项在 Map 迭代中是安全的（已删的不再被访问）。
+		for (const conv of this.convs.values()) {
+			if (!conv.isSubagent || conv.id === this.activeId || conv.pinned) continue;
+			if (now - (conv.lastSdkEventAt || conv.lastActiveAt || 0) < SUBAGENT_RECYCLE_IDLE_MS) continue;
+			if (conv.promptInFlight) continue;
+			try {
+				if (conv.session.isStreaming) continue;
+			} catch {
+				continue;
+			}
+			try {
+				if (this.deliveryModeOf(conv) !== "idle") continue;
+			} catch {
+				continue;
+			}
+			if (conv.terminals.countBlockingLive() > 0) continue;
+			if (this.hasLiveSubagentChild(conv, withChildren)) continue;
+			// 完成结果还没送到父对话：继续留着，别让父代理等一个已被回收的执行体。
+			if (conv.notifyOnDone !== false && !conv.subagentDoneNotified && !conv.subagentConsumedByParent) continue;
+			if (this.subagentTaskPending(conv)) continue;
+			this.removeConversation(conv.id);
+			removed.push(conv.title || conv.id);
+		}
+		if (removed.length > 0) {
+			this.emitConversations();
+			this.emit({
+				type: "notice",
+				level: "info",
+				text: `已自动回收 ${removed.length} 个结束很久的子代理运行（已持久化的转录与历史行保留，可在左栏重新打开）`,
+				textEn: `Auto-released ${removed.length} long-finished subagent runtime(s); persisted transcripts and history rows stay available.`,
+			});
+		}
+		return removed.length;
 	}
 
 	private startWidgetsTimer(): void {
@@ -5642,7 +6351,8 @@ export class ClientSession {
 		const conv = this.convs.get(id);
 		if (!conv?.session) return undefined;
 		this.assertSubagentWorktreeAdmission(conv);
-		await conv.session.sendUserMessage(text, conv.session.isStreaming ? { deliverAs: "steer" } : undefined);
+		const outcome = await this.deliverFromOutside(conv, text);
+		if (outcome === "closed" || outcome === "rejected") return { ok: false, error: "对话无法接收消息" };
 		return { ok: true };
 	}
 
@@ -5707,17 +6417,16 @@ export class ClientSession {
 		text: string,
 	): Promise<{ ok: true } | { ok: false; busy: boolean; error?: string }> {
 		try {
-			try {
-				if ((conv.session as unknown as { isCompacting?: boolean }).isCompacting === true) {
-					return { ok: false, busy: true, error: "上下文压缩进行中，稍后重试" };
-				}
-			} catch {}
+			const mode = this.deliveryModeOf(conv);
+			if (mode === "gated") return { ok: false, busy: true, error: "上下文压缩进行中，稍后重试" };
+			if (mode === "closed") return { ok: false, busy: true, error: "对话已关闭" };
 			this.assertSubagentWorktreeAdmission(conv);
-			await conv.session.sendUserMessage(text, conv.session.isStreaming ? { deliverAs: "steer" } : undefined);
+			await this.submitText(conv, text, mode);
 			return { ok: true };
 		} catch (err) {
 			const msg = String((err as Error)?.message ?? err);
-			if (/compaction is in progress/i.test(msg)) return { ok: false, busy: true, error: msg };
+			// 唯一的压缩文案判定在 conversation-delivery 里：这里只问「是不是撞上门了」。
+			if (isCompactionRejection(msg)) return { ok: false, busy: true, error: msg };
 			return { ok: false, busy: false, error: msg };
 		}
 	}
@@ -5922,7 +6631,7 @@ export class ClientSession {
 				this.emitConversations();
 				break;
 			case "compaction_start": {
-				conv.compactionState = { reason: event.reason, startedAt: Date.now() };
+				conv.compaction = runningCompaction(event.reason, conv.compaction?.startedAt ?? Date.now());
 				conv.lastCompactionTokens = null;
 				this.markCompactionPending(conv);
 				if (conv.id === this.conv.id) this.flushSnapshot();
@@ -5943,7 +6652,10 @@ export class ClientSession {
 									}
 								: undefined,
 				);
-				conv.compactionState = null;
+				// SDK 在 emit compaction_end 之前已经清掉自己的压缩标志，所以这里是
+				// 「一定可以提交」的时刻：开闸并排空排队中的投递（失败/取消同样排空）。
+				conv.compaction = null;
+				void this.drainDeliveries(conv);
 				if (event.errorMessage) {
 					this.emit({
 						type: "notice",
@@ -6112,21 +6824,8 @@ export class ClientSession {
 						void mergeTouchSidecar(file, extractTouches(this.convTranscript(conv)));
 					}
 				} catch {}
-				if (!event.willRetry && !aborted && conv.pendingCompaction && !this.disposed) {
-					const pending = conv.pendingCompaction;
-					const turn = this.notificationTurn(conv);
-					const compactionSession = conv.session;
-					turn.compactionPending = true;
-					conv.pendingCompaction = null;
-					setTimeout(() => {
-						if (!this.disposed) {
-							void this.executePendingCompaction(conv, pending).finally(() => {
-								turn.compactionPending = false;
-								const owner = this.findConversationHome?.(compactionSession)?.session ?? this;
-								owner.emitConversations();
-							});
-						}
-					}, 50);
+				if (!event.willRetry && !aborted && !this.disposed && conv.compaction?.phase === "queued") {
+					this.scheduleQueuedCompaction(conv, 50);
 				} else if (!event.willRetry && !aborted && !this.disposed) {
 					setTimeout(() => {
 						if (!this.disposed) {
@@ -6163,11 +6862,9 @@ export class ClientSession {
 				if (settledBaseTokens != null && this.hasSettledAssistantUsage(conv)) {
 					conv.lastTurnBaseTokens = settledBaseTokens;
 				}
-				if (conv.pendingCompaction && !this.disposed) {
-					const pending = conv.pendingCompaction;
-					conv.pendingCompaction = null;
-					void this.executePendingCompaction(conv, pending);
-				}
+				// settled 之后立刻开压缩（不等 agent_end 的 50ms 定时器），门在 runQueuedCompaction 里翻转。
+				this.scheduleQueuedCompaction(conv, 0);
+				void this.drainDeliveries(conv);
 				break;
 			}
 			case "entry_appended": {
@@ -6487,7 +7184,7 @@ export class ClientSession {
 			},
 			errorMessage: state.errorMessage,
 			retry: conv.retryState ?? null,
-			compaction: conv.compactionState ?? null,
+			compaction: compactionBanner(conv.compaction),
 			pendingQuestion: this.pendingQuestionForSnapshot(conv),
 			actionSuggestions: this.markerSvc.getActionSuggestions(conv.id) ?? null,
 			pendingApproval: this.pendingApprovalForSnapshot(conv),
@@ -6508,6 +7205,7 @@ export class ClientSession {
 						locked: conv.presetLocked || !this.isBlankConversation(conv),
 					}
 				: null,
+			bot: conv?.botId ? { id: conv.botId, name: conv.botName ?? conv.botId } : null,
 			permission: conv
 				? (conv.permissionPreset ?? this.settingsSvc.current.defaultPermissionPreset ?? "workspace-write-never")
 				: null,
@@ -6676,11 +7374,16 @@ export class ClientSession {
 	}
 
 	private emitQuestionQueue(): void {
+		// 队列覆盖「本连接的全部项目」：与工具审批同源（审批也遍历 convs，不看 cwd），
+		// 否则在别的项目里跑着的对话一提问就再也提醒不到。
+		// 别人的问卷（其他页面 / 定时任务 / 设备任务）仍只限同项目：跨页过户要求 cwd 相等。
 		const questions: import("./protocol.js").UiQueuedQuestion[] = [];
 		for (const owner of new Set([this, ...(this.allSubagentSessions?.() ?? [])])) {
+			const own = owner === this;
 			for (const request of owner.pendingQuestions.values()) {
 				const conv = owner.convs.get(request.conversationId);
-				if (!conv || request.settled || !sameCwd(conv.cwd, this.cwd)) continue;
+				if (!conv || request.settled) continue;
+				if (!own && !sameCwd(conv.cwd, this.cwd)) continue;
 				let root = conv;
 				const seen = new Set<Conversation>();
 				while (root.parentId && !seen.has(root)) {
@@ -6696,6 +7399,7 @@ export class ClientSession {
 					conversationId: conv.id,
 					conversationTitle: conv.title,
 					rootConversationId: root.id,
+					cwd: conv.cwd,
 					createdAt: request.createdAt,
 					...(request.deadline !== undefined ? { deadline: request.deadline } : {}),
 					audience: request.audience,
@@ -7008,11 +7712,8 @@ export class ClientSession {
 		this.communicationHost().authorize(source, conv, envelope.action);
 		if (envelope.action === "request" && consultWaitingParents.has(conv)) return "queued";
 		const circuit = owner.checkSubagentWakeCircuitBreaker(conv, owner, [source]);
-		if (
-			circuit ||
-			owner.isWaitingOnUser(conv.id) ||
-			(conv.session as unknown as { isCompacting?: boolean }).isCompacting
-		) {
+		// 熔断 / 等用户回答：这是「故意不唤醒」，消息留在收件箱等对方读取，不是投递失败。
+		if (circuit || owner.isWaitingOnUser(conv.id)) {
 			if (envelope.requestId)
 				await conversationCommunication.communicate(this.communicationHost(), conv, "escalate", {
 					requestId: envelope.requestId,
@@ -7026,11 +7727,33 @@ export class ClientSession {
 				});
 			return "queued";
 		}
+		const mode = owner.deliveryModeOf(conv);
+		if (mode === "closed") throw new Error("Communication target conversation is gone");
+		const text = formatCommunicationMessage(envelope, source);
+		if (envelope.requestId) {
+			conv.queuedSteeringRequestIds = conv.queuedSteeringRequestIds ?? new Set<string>();
+			conv.queuedSteeringRequestIds.add(envelope.requestId);
+		}
+		if (mode === "gated") {
+			// 压缩 / 等回话 / 过户：不是「不唤醒」，是「现在投不进去」。
+			// 入投递队列，compaction_end 一到自动唤醒；收件箱同时保留原文作 durable 记录。
+			const queue = owner.deliveryQueue(conv);
+			if (
+				!queue.park({
+					tag: `comm:${envelope.id}`,
+					kind: "communication",
+					text,
+					items: [envelope],
+					createdAt: Date.now(),
+				})
+			)
+				throw new Error("Communication target is not accepting messages");
+			void owner.drainDeliveries(conv);
+			return "queued";
+		}
 		owner.assertSubagentWorktreeAdmission(conv);
 		if (conv.subagentTaskStopped) throw new Error("Communication target task was stopped");
-		const busy = conv.session.isStreaming || conv.promptInFlight;
-		const text = formatCommunicationMessage(envelope, source);
-		if (!busy) {
+		if (mode === "idle") {
 			if (conv.isSubagent && (conv.subagentDoneNotified || conv.subagentConsumedByParent)) {
 				conv.subagentDoneNotified = false;
 				conv.subagentConsumedByParent = false;
@@ -7041,32 +7764,18 @@ export class ClientSession {
 			conv.wakeReason = "other";
 			conv.wakeTurnHadAction = false;
 		}
-		if (busy && envelope.requestId) {
-			conv.queuedSteeringRequestIds = conv.queuedSteeringRequestIds ?? new Set<string>();
-			conv.queuedSteeringRequestIds.add(envelope.requestId);
-		}
-		const delivery = conv.session.sendUserMessage(text, busy ? { deliverAs: "steer" } : undefined);
-		void delivery.finally(() => {
-			if (envelope.requestId) conv.queuedSteeringRequestIds?.delete(envelope.requestId);
-		});
-		void delivery.catch((error) => {
-			owner.sendNotice({
-				type: "notice",
-				level: "warning",
-				text: "协作消息投递失败，已保留在收件箱。",
-				textEn: "Collaboration delivery failed; the message remains in the inbox.",
-			});
-			console.warn("[communication] delivery failed", error);
-		});
-		void delivery.then(
-			() => {
-				conversationCommunication.acknowledge(conv, envelope.id);
-				try {
-					const home = this.communicationHome(conv);
-					if (conv.notifyOnDone === "manual") home.owner.scheduleSubagentCompletionNotice(conv);
-				} catch {}
+		void this.submitText(conv, text, mode).then(
+			() => this.commitCommunication(conv, envelope),
+			(error) => {
+				owner.sendNotice({
+					type: "notice",
+					level: "warning",
+					text: "协作消息投递失败，已保留在收件箱。",
+					textEn: "Collaboration delivery failed; the message remains in the inbox.",
+				});
+				console.warn("[communication] delivery failed", error);
+				if (envelope.requestId) conv.queuedSteeringRequestIds?.delete(envelope.requestId);
 			},
-			() => {},
 		);
 		owner.emitConversations();
 		return "queued";
@@ -7958,57 +8667,6 @@ export class ClientSession {
 		ClientSession.piCliProbe = null;
 	}
 
-	private runAsync(
-		cmd: string,
-		args: string[],
-		timeoutMs: number,
-		cwd?: string,
-	): Promise<{ code: number | null; out: string }> {
-		return new Promise((resolve) => {
-			let p;
-			try {
-				const isWin = process.platform === "win32";
-				const spawnCmd = isWin ? process.env.ComSpec || "cmd.exe" : cmd;
-				const spawnArgs = isWin ? ["/d", "/s", "/c", cmd, ...args] : args;
-				p = spawn(spawnCmd, spawnArgs, {
-					...(cwd ? { cwd } : {}),
-					stdio: ["ignore", "pipe", "pipe"],
-					windowsHide: true,
-					detached: !isWin,
-				});
-			} catch (err) {
-				resolve({ code: -1, out: String(err) });
-				return;
-			}
-			let out = "";
-			let settled = false;
-			const done = (code: number | null, text?: string) => {
-				if (settled) return;
-				settled = true;
-				clearTimeout(t);
-				resolve({ code, out: text ?? out });
-			};
-			const t = setTimeout(() => {
-				const plan = processTreeKillPlan(process.platform, p.pid);
-				try {
-					if (plan.kind === "taskkill") {
-						spawn(plan.cmd, plan.args, { stdio: "ignore", windowsHide: true });
-					} else if (plan.kind === "group-signal") {
-						process.kill(-p.pid!, plan.signal);
-					} else {
-						p.kill();
-					}
-				} catch {
-					p.kill();
-				}
-			}, timeoutMs);
-			p.stdout?.on("data", (d: Buffer) => (out += d.toString()));
-			p.stderr?.on("data", (d: Buffer) => (out += d.toString()));
-			p.on("error", (err) => done(-1, String(err)));
-			p.on("close", (code) => done(code));
-		});
-	}
-
 	private static currentAppVersion(): string {
 		return getAppVersion() || "0.0.0";
 	}
@@ -8026,6 +8684,8 @@ export class ClientSession {
 	allSubagentSessions: (() => ClientSession[]) | undefined = undefined;
 	findSessionOwner: ((targetPath: string) => SessionOwnerInfo | null) | undefined = undefined;
 	takeOverConversationElsewhere: ((ownerId: string, convId: string) => Promise<void>) | undefined = undefined;
+	/** 点开定时任务的对话时，让后台持有方先放手；返回 false = 还在跑，不要打开。 */
+	releaseSchedulerConversation: ((ownerId: string, convId: string) => Promise<boolean>) | undefined = undefined;
 	prepareBotSessionResume: ((targetPath: string) => Promise<void>) | undefined = undefined;
 	steerConversationElsewhere:
 		((id: string, text: string) => Promise<{ ok: boolean; error?: string } | undefined>) | undefined = undefined;
@@ -8262,7 +8922,15 @@ export class ClientSession {
 				text: "正在安装 pi agent CLI（npm i -g @earendil-works/pi-coding-agent）…",
 				textEn: "Installing pi agent CLI (npm i -g @earendil-works/pi-coding-agent)…",
 			});
-			const { code, out } = await this.runAsync("npm", ["i", "-g", "@earendil-works/pi-coding-agent"], 180_000);
+			const install = await runProcess({
+				cmd: "npm",
+				args: ["i", "-g", "@earendil-works/pi-coding-agent"],
+				timeoutMs: 180_000,
+				// Windows 上 npm 是 .cmd 包装器，必须经 cmd.exe /d /s /c 起。
+				windowsShell: true,
+			});
+			const code = install.code;
+			const out = `${install.stdout}${install.stderr}`;
 			if (code === 0) {
 				this.emit({
 					type: "notice",
@@ -8327,6 +8995,17 @@ export class ClientSession {
 		emit: (msg) => this.emit(msg),
 		cwd: () => this.cwd,
 		getSession: () => this.session,
+		// /compact 也走同一道门：从请求到 compaction_end 之间不许再投递（含 prompt() 的 abort 窗口）。
+		compact: async (instructions?: string) => {
+			const conv = this.conv;
+			conv.compaction = runningCompaction("manual", Date.now());
+			try {
+				await conv.session.compact(instructions);
+			} finally {
+				if (conv.compaction?.phase === "running") conv.compaction = null;
+				await this.drainDeliveries(conv);
+			}
+		},
 		newChat: () => this.newChat(),
 		prompt: (text) => this.prompt(text),
 		setModel: (id) => this.setModel(id),
@@ -8692,9 +9371,11 @@ export class ClientSession {
 		session: AgentSession,
 		model: Parameters<AgentSession["setModel"]>[0],
 	): Promise<void> {
-		if (this.botExecution) {
-			const fixed = this.botExecution.captureModel(undefined);
-			if (model.provider !== fixed.provider || model.id !== fixed.modelId) throw new Error("Bot model is fixed");
+		const bot = this.botOf();
+		if (bot) {
+			const fixed = bot.captureModel(undefined);
+			if (model.provider !== fixed.provider || model.id !== fixed.modelId)
+				throw new Error("这个智能体的模型由身份固定：请到设备中心改 Bot，或新开一条私聊。 / Bot model is fixed");
 		}
 		await session.setModel(model);
 		this.applyCompactionOverrides();
@@ -8746,7 +9427,15 @@ export class ClientSession {
 			if (currentTokens < cap) return false;
 
 			const instructions = this.settingsSvc.current.autoCompactionInstructions?.trim() || undefined;
-			await session.compact(instructions);
+			// compact() 是先 await abort() 再发 compaction_start 的：中间这一小段里没有任何信号
+			// 说明「正在压缩」，只有我们自己把门先关上才拦得住抢在这时提交的投递。
+			conv.compaction = runningCompaction("overflow", Date.now());
+			try {
+				await session.compact(instructions);
+			} finally {
+				if (conv.compaction?.phase === "running") conv.compaction = null;
+				await this.drainDeliveries(conv);
+			}
 			return true;
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
@@ -8827,8 +9516,11 @@ export class ClientSession {
 		quickAskEnabled?: boolean;
 		quickAskModel?: string | null;
 		quickAskThinking?: ThinkingLevel;
+		botDraftModel?: string | null;
+		botDraftThinking?: ThinkingLevel;
 		quickAskSystemPrompt?: string;
 		quickAskExplainPrompt?: string;
+		quickAskTranslateModel?: import("./quick-ask-settings.js").QuickAskSettings["quickAskTranslateModel"];
 		quickAskTranslateEnabled?: import("./quick-ask-settings.js").QuickAskSettings["quickAskTranslateEnabled"];
 		quickAskTranslateTarget?: import("./quick-ask-settings.js").QuickAskSettings["quickAskTranslateTarget"];
 		quickAskTranslateStyle?: import("./quick-ask-settings.js").QuickAskSettings["quickAskTranslateStyle"];
@@ -9737,11 +10429,11 @@ export class ClientSession {
 			this.settingsSvc.current.defaultAgentPreset ??
 			"standard";
 		this.syncPluginTools(session, targetPreset);
-		if (this.botExecution) {
+		if (this.botOf(conv?.id)) {
 			session.setActiveToolsByName(
 				session
 					.getAllTools()
-					.filter((tool) => this.botToolRegistrationAllowed(tool.name))
+					.filter((tool) => this.botToolRegistrationAllowed(tool.name, conv?.cwd ?? this.cwd, conv?.id))
 					.map((tool) => tool.name),
 			);
 			return;
@@ -10117,10 +10809,8 @@ export class ClientSession {
 			if (!execConv?.session) return false;
 			try {
 				this.assertSubagentWorktreeAdmission(execConv);
-				await execConv.session.sendUserMessage(
-					trimmed,
-					execConv.session.isStreaming ? { deliverAs: "steer" } : undefined,
-				);
+				const outcome = await this.deliverFromOutside(execConv, trimmed);
+				if (outcome === "closed" || outcome === "rejected") return false;
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
 				this.emit({
@@ -10183,10 +10873,15 @@ export class ClientSession {
 
 		try {
 			this.assertSubagentWorktreeAdmission(execConv);
-			await execConv.session.sendUserMessage(
-				trimmed,
-				execConv.session.isStreaming ? { deliverAs: queue ? "followUp" : "steer" } : undefined,
-			);
+			const mode = this.deliveryModeOf(execConv);
+			if (mode === "gated") {
+				// 门关着：排队，压缩结束会自动开一轮（目标对话不会因此漏活）。
+				void this.deliverFromOutside(execConv, trimmed);
+			} else if (mode === "live" && queue) {
+				await execConv.session.sendUserMessage(trimmed, { deliverAs: "followUp" });
+			} else {
+				await this.submitText(execConv, trimmed, mode);
+			}
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			this.emit({
@@ -10327,18 +11022,22 @@ export class ClientSession {
 		);
 	}
 
-	private enabledPluginToolDefs(preset?: string, cwd?: string): ToolDefinition[] {
+	private enabledPluginToolDefs(preset?: string, cwd?: string, conversationId?: string): ToolDefinition[] {
 		if (!presetAllowsPluginTools(preset)) return [];
 		const off = new Set(normalizeDisabledPluginTools(this.settingsSvc.current.disabledPluginTools));
 		const disabledPlugins = new Set(this.settingsSvc.current.disabledPlugins ?? []);
-		return (this.botExecution ? (this.botMcpBridge?.getTools() ?? []) : (this.pluginToolsProvider?.(cwd) ?? []))
+		// Bot 会话只暴露这个 Bot 的 MCP server 工具；普通会话才看全局插件目录。
+		const bot = this.botOf(conversationId);
+		const botBridge = bot ? this.executionMcpBridge(cwd ?? this.cwd, conversationId) : undefined;
+		const coreNames = ["bash", "read", "write", "edit", "powershell", "ls", "grep", "find"];
+		return (bot ? (botBridge?.getTools() ?? []) : (this.pluginToolsProvider?.(cwd) ?? []))
 			.filter((t) => {
-				if (this.botExecution) {
-					const mcp = this.executionMcpBridge(cwd ?? this.cwd)?.getTools() ?? [];
+				if (bot) {
+					const mcp = botBridge?.getTools() ?? [];
 					return (
 						mcp.includes(t) &&
-						this.botToolRegistrationAllowed(t.name, cwd) &&
-						!["bash", "read", "write", "edit", "powershell", "ls", "grep", "find"].includes(t.name)
+						this.botToolRegistrationAllowed(t.name, cwd, conversationId) &&
+						!coreNames.includes(t.name)
 					);
 				}
 				if (t.pluginId && disabledPlugins.has(t.pluginId)) return false;
@@ -10346,14 +11045,15 @@ export class ClientSession {
 			})
 			.map((tool) => {
 				const def = pluginToolToDefinition(tool);
-				if (!this.botExecution) return def;
+				if (!bot) return def;
 				const execute = def.execute;
 				return {
 					...def,
 					execute: async (...args: Parameters<typeof execute>) => {
-						await this.botExecution?.assertWorkspace(cwd ?? this.cwd);
-						const current = this.executionMcpBridge(cwd ?? this.cwd)?.getTools() ?? [];
-						if (!current.includes(tool) || !this.botToolAllowed(tool.name, cwd, args[1]))
+						bot.assertActive();
+						await bot.assertWorkspace(cwd ?? this.cwd);
+						const current = botBridge?.getTools() ?? [];
+						if (!current.includes(tool) || !this.botToolAllowed(tool.name, cwd, args[1], conversationId))
 							throw new Error("Bot MCP tool authorization expired");
 						return execute(...args);
 					},
@@ -10375,7 +11075,7 @@ export class ClientSession {
 		try {
 			if (!cwd) return;
 			if (this.sandboxes.getExecutionIdentity(cwd)) return;
-			const defs = this.enabledPluginToolDefs(targetPreset, cwd).map((t) =>
+			const defs = this.enabledPluginToolDefs(targetPreset, cwd, ownerId).map((t) =>
 				this.wrapGenericTool(t, ownerId, undefined, { session }),
 			);
 			const universe = new Set([
@@ -10512,15 +11212,11 @@ export class ClientSession {
 
 	private completionPending(conv: Conversation): boolean {
 		if (conv.promptInFlight || conv.queueSteering?.length || conv.queueFollowUp?.length) return true;
-		const owners = new Set([this, ...(this.allSubagentSessions?.() ?? [])]);
-		for (const owner of owners) {
-			const key = conversationIdentity(conv);
-			if (owner.pendingSubagentNotices.has(key) || owner.deliveringSubagentNotices.has(key)) return true;
-			if (
-				owner.convs.get(conv.id) === conv &&
-				(owner.pendingSubagentNotices.has(conv.id) || owner.deliveringSubagentNotices.has(conv.id))
-			)
-				return true;
+		// 待发的子代理通知就近挂在父对话上（原来要跨所有 owner 按 execution key 反查）。
+		if (conv.delivery?.hasKind("subagent-notice")) return true;
+		const key = conversationIdentity(conv);
+		for (const owner of new Set([this, ...(this.allSubagentSessions?.() ?? [])])) {
+			if (owner.subagentNoticeTimers.has(key) || owner.subagentNoticeTimers.has(conv.id)) return true;
 		}
 		return false;
 	}
@@ -10571,36 +11267,18 @@ export class ClientSession {
 		return out;
 	}
 
-	streamingSummariesAll(): {
-		title: string;
-		cwd: string;
-		isStreaming: boolean;
-		convId: string;
-		independent: boolean;
-		forked: boolean;
-		hasQuestion: boolean;
-		questionTitle?: string;
-		sessionFile?: string;
-		activity: number;
-	}[] {
+	streamingSummariesAll(): ElsewhereClientRow[] {
 		if (this.clientId?.startsWith("canvas:") || this.clientId?.startsWith("canvas-")) {
 			return [];
 		}
-		const out: {
-			title: string;
-			cwd: string;
-			isStreaming: boolean;
-			convId: string;
-			independent: boolean;
-			forked: boolean;
-			hasQuestion: boolean;
-			questionTitle?: string;
-			sessionFile?: string;
-			activity: number;
-		}[] = [];
+		// 无人值守持有方（定时任务 / 插件 / 设备任务）没人给它开浏览器，子代理行只能靠
+		// 「别处运行中」列表透出去；普通浏览器持有方的子代理仍由自己的对话列表负责，
+		// 不往别处列表重复推。
+		const exposeSubagents = isUnattendedClientId(this.clientId ?? "");
+		const out: ElsewhereClientRow[] = [];
 		const seenFiles = new Set<string>();
 		for (const conv of this.convs.values()) {
-			if (conv.isSubagent) continue;
+			if (conv.isSubagent && !exposeSubagents) continue;
 			const streaming = this.conversationStreaming(conv);
 			if (!streaming && !this.shownInRunningList(conv)) continue;
 			const pq = this.getPendingQuestionForConv(conv.id);
@@ -10614,6 +11292,7 @@ export class ClientSession {
 				if (seenFiles.has(sessionFile)) continue;
 				seenFiles.add(sessionFile);
 			}
+			const parentId = conv.isSubagent ? this.localParentId(conv) : undefined;
 			out.push({
 				title: conv.title,
 				cwd: conv.cwd,
@@ -10622,6 +11301,8 @@ export class ClientSession {
 				independent: conv.independent !== false,
 				forked: Boolean(conv.forkFrom || conv.forkedFromSessionPath),
 				hasQuestion: !!pq,
+				isSubagent: !!conv.isSubagent,
+				...(parentId ? { parentId } : {}),
 				...(pq?.title ? { questionTitle: pq.title } : {}),
 				...(sessionFile ? { sessionFile } : {}),
 				activity: Math.max(conv.lastActiveAt || 0, conv.lastSdkEventAt || 0),
@@ -10676,10 +11357,38 @@ export class ClientSession {
 		attachments?: PromptAttachment[],
 		queue = false,
 		targetConversation?: Conversation,
+		samplingOverrides?: import("./protocol.js").SamplingOverrides,
 	): Promise<void> {
-		this.botExecution?.assertActive();
-		if (this.botExecution && text.trimStart().startsWith("/")) throw new Error("Bot slash commands are disabled");
+		// 私聊会话的能力挂在会话上（`conv.bot`）；无头设备任务才有客户端级能力。
+		(this.botOf(targetConversation?.id) ?? this.botExecution)?.assertActive();
 		const conv = targetConversation ?? this.conv;
+		if (samplingOverrides) setConversationSamplingOverrides(conv.id, samplingOverrides);
+		// 私聊会话的能力挂在会话上（`conv.bot`），无头设备任务挂在客户端上：两处都要认。
+		const botCapability = this.botOf(conv.id);
+		// 已开的私聊也要按"当前注册表"复核：Bot 可能刚被停用/删除，冻结的能力不能继续当授权用。
+		if (conv.bot) {
+			const currentBot = await resolveBotChatBot(conv.bot.bot.id);
+			if (!currentBot) {
+				this.emit({
+					type: "notice",
+					level: "error",
+					text: "这个智能体已停用或删除：这条私聊只能查看历史，不能再发言。",
+					textEn: "This agent is disabled or deleted: this chat is read-only history and cannot continue.",
+				});
+				return;
+			}
+		}
+		// 私聊发消息前做一次忙检查：群/设备任务在跑时让用户看到一句能懂的话，而不是并发抢同一个工作区。
+		// 只查会话级绑定（conv.bot）；无头设备任务本身就是租约持有者，不能拦自己。
+		if (conv.bot && !conv.session.isStreaming) this.memoryQuotaFor(conv.id).beginTurn();
+		if (conv.bot && botChatBusy(conv.bot.bot.id))
+			throw new Error(
+				"这个智能体正在执行任务：等它结束后再发。 / This agent is executing a task; send again after it finishes.",
+			);
+		if (botCapability && text.trimStart().startsWith("/"))
+			throw new Error(
+				"私聊不支持斜杠命令：需要压缩请用上下文压缩按钮，换模型请到设备中心改 Bot。 / Bot slash commands are disabled",
+			);
 		if (conv.nativeCli) {
 			this.emit({
 				type: "notice",
@@ -10689,17 +11398,48 @@ export class ClientSession {
 			});
 			return;
 		}
-		if (this.botExecution) await this.botExecution.assertWorkspace(conv.cwd);
+		if (botCapability) {
+			// 长会话里刚 promote/写入的记忆，这一轮就要出现在 system prompt 里（不是等重开）。
+			await botCapability.refreshMemory();
+			await botCapability.assertWorkspace(conv.cwd);
+		}
 		this.assertSubagentWorktreeAdmission(conv);
 		if (
-			!this.botExecution &&
+			!botCapability &&
 			conv.session.sessionManager
 				?.getEntries?.()
-				.some((entry) => entry.type === "custom" && entry.customType === "device-bot-execution")
+				.some((entry) => entry.type === "custom" && entry.customType === BOT_CHAT_ENTRY)
 		)
 			throw new Error("Bot transcripts are inspection-only outside their execution capability");
 		if (targetConversation && this.convs.get(conv.id) !== conv) {
 			throw new Error("Prompt conversation is no longer available");
+		}
+		if (this.deliveryModeOf(conv) === "gated") {
+			// 压缩期间 pi 的 prompt() 会直接抛英文异常。这里提前用一句话说清楚，
+			// 不让用户看到 pi 抛出的那句英文异常。
+			let compacting = !!conv.compaction;
+			try {
+				compacting = compacting || conv.session.isCompacting === true;
+			} catch {}
+			// 压缩只是「等一会儿就能投」的门：文本进意图队列，compaction_end 排空时自动开一轮。
+			// 带附件/引用/图片、斜杠命令、派活路由不能在排空时重放，仍然如实拒绝。
+			if (compacting && this.parkGatedPrompt(conv, text, attachments)) return;
+			const needsLiveContext = Boolean(attachments && attachments.length > 0) || (text ?? "").trim().startsWith("/");
+			this.emit({
+				type: "notice",
+				level: "warning",
+				text: compacting
+					? needsLiveContext
+						? "上下文压缩进行中：带附件、引用或斜杠命令的消息无法排队，请等压缩结束后再发。"
+						: "上下文压缩进行中，这条消息没有送出；等压缩结束后再发一次。"
+					: "这个对话正在等回话或过户，暂时不能接收新消息；稍后再发。",
+				textEn: compacting
+					? needsLiveContext
+						? "Context compaction is in progress: messages with attachments, quotes or slash commands cannot be queued — please resend them once compaction finishes."
+						: "Context compaction is in progress, so this message was not sent. Send it again once compaction finishes."
+					: "This conversation is waiting on a reply or being transferred and cannot accept new messages right now; try again shortly.",
+			});
+			return;
 		}
 		conv.autonomousTurnsWithoutUser = 0;
 		conv.consecutiveIdleWakeTurns = 0;
@@ -10797,7 +11537,22 @@ export class ClientSession {
 			);
 		}
 		const s = conv.session;
+		let botTurnLease: { release(): void } | undefined;
 		try {
+			// 私聊回合与群任务共用同一把 Bot 租约：同一 Bot 不并发。
+			// 群任务侧遇 BOT_BUSY 会有界等待（runtime 最多 2 分钟），所以这里不必排队。
+			if (conv.bot && !s.isStreaming) {
+				try {
+					botTurnLease = await acquireBotChatLease(conv.bot.bot.id);
+				} catch (error) {
+					const busy = (error as { code?: string } | undefined)?.code === "BOT_BUSY";
+					throw new Error(
+						busy
+							? "这个智能体正在执行任务：等它结束后再发。 / This agent is executing a task; send again after it finishes."
+							: (error as Error).message,
+					);
+				}
+			}
 			const slash = parseSlash(text);
 			if (slash && (await this.slash.exec(slash.name, slash.args))) {
 				this.flushSnapshot();
@@ -11064,6 +11819,10 @@ export class ClientSession {
 								settings: this.settingsSvc.current,
 								session: s,
 								getLang: () => this.getLang(),
+								resolveTerminal: (terminalId) =>
+									this.findTerminalManager(terminalId)
+										?.list()
+										.find((item) => item.id === terminalId),
 							},
 							nonQuoteAttachments,
 						)
@@ -11202,6 +11961,9 @@ export class ClientSession {
 				textEn: `Failed to send prompt: ${(err as Error).message}`,
 			});
 		} finally {
+			try {
+				botTurnLease?.release();
+			} catch {}
 			conv.promptInFlight = false;
 			if (!conv.session.isStreaming && !conv.retryState) {
 				finishTurnTiming(conv);
@@ -11653,10 +12415,17 @@ export class ClientSession {
 			textEn: "Bash command stopped (conversation continues)",
 		});
 		try {
-			if (ownerConv) this.assertSubagentWorktreeAdmission(ownerConv);
-			await runtime?.session.sendUserMessage(
-				"（系统：用户手动停止了刚才的 bash 命令——命令被中止，终止前已输出的内容在对应工具结果里。请据此继续，不要重跑被中止的命令，除非确实必要。）",
-			);
+			if (ownerConv) {
+				this.assertSubagentWorktreeAdmission(ownerConv);
+				await this.deliverFromOutside(
+					ownerConv,
+					"（系统：用户手动停止了刚才的 bash 命令——命令被中止，终止前已输出的内容在对应工具结果里。请据此继续，不要重跑被中止的命令，除非确实必要。）",
+				);
+			} else {
+				await runtime?.session.sendUserMessage(
+					"（系统：用户手动停止了刚才的 bash 命令——命令被中止，终止前已输出的内容在对应工具结果里。请据此继续，不要重跑被中止的命令，除非确实必要。）",
+				);
+			}
 		} catch {}
 		this.flushSnapshot();
 	}
@@ -11722,7 +12491,7 @@ export class ClientSession {
 			});
 		}
 		if (!ended && !session.isIdle && !forced) {
-			await new Promise((r) => setTimeout(r, ClientSession.HARD_ABORT_SETTLE_MS));
+			await sleep(ClientSession.HARD_ABORT_SETTLE_MS);
 		}
 		clearTimeout(abortTimer);
 		off();
@@ -12018,13 +12787,226 @@ export class ClientSession {
 		await this.pushSessionsForCwd(cwd);
 	}
 
+	/**
+	 * 打开某个 Bot 的私聊（左栏「智能体」点一行 = 这个方法，**不是**「新建对话」）。
+	 *
+	 * 默认语义是「回到**同一个**对话」，依次尝试：
+	 * 1. 内存里已经开着的它的私聊 → 切过去（当前就在这条上就什么都不做）；
+	 * 2. 磁盘上它最近一次的私聊转录（`bot-sessions/<botId>`）→ 重新打开，绑定由 `webui/bot-chat` 条目重建；
+	 * 3. 都没有 → 建一条新的（`newChat(botId)` 那条路）。
+	 *
+	 * `fresh: true` 才是「清空当前、开一条新的」：跳过 1、2 直接新建；旧转录留在磁盘上，不删。
+	 */
+	async openBotChat(botId: string, opts?: { fresh?: boolean }): Promise<boolean> {
+		if (this.quiesceBlocked()) return false;
+		const bot = await resolveBotChatBot(botId);
+		if (!bot) {
+			this.emit({
+				type: "notice",
+				level: "error",
+				text: "这个智能体已不可用（被删除或停用），请到设备中心确认后再试。",
+				textEn: "This agent is unavailable (deleted or disabled). Check the device center and retry.",
+			});
+			return false;
+		}
+		// 私聊属于 Bot 自己的工作目录：从别的项目点这一行，先把工作区切过去。
+		// 否则建会话时会撞 `Bot execution cwd mismatch`，用户只看到「新建对话失败」。
+		if (!this.sameWorkspace(this.cwd, bot.cwd)) {
+			await this.setCwd(bot.cwd, { forBotChat: true });
+			if (!this.sameWorkspace(this.cwd, bot.cwd)) {
+				this.emit({
+					type: "notice",
+					level: "error",
+					text: `无法切换到智能体的工作目录：${bot.cwd}。请确认目录存在，或到设备中心修改 Bot 的工作目录。`,
+					textEn: `Could not switch to the agent workspace: ${bot.cwd}. Check that it exists, or edit the Bot workspace in the device center.`,
+				});
+				return false;
+			}
+		}
+		if (opts?.fresh !== true) {
+			// 只认落在 Bot 当前工作目录里的会话：Bot 改过 cwd 之后，旧会话的 conv.cwd 已经对不上，
+			// 切过去下一轮会被 assertWorkspace 拦住。
+			const open = pickBotChatConversation(
+				[...this.convs.values()].filter((conv) => this.sameWorkspace(conv.cwd, bot.cwd)),
+				bot.id,
+				this.activeId,
+			);
+			if (open) {
+				if (open.id === this.activeId) {
+					this.pushSettings();
+					this.flushSnapshot();
+				} else await this.switchConversation(open.id);
+				// 编辑过 Bot 后，已开的私聊按新配置重绑（工具/提示词/模型/记忆）。
+				await this.rebindBotChatIfStale(open, bot.id);
+				return true;
+			}
+			const latest = latestBotChatTranscript(this.agentDir, bot.id, bot.cwd);
+			if (latest) {
+				await this.switchSession(latest);
+				return true;
+			}
+		}
+		try {
+			return await this.newChat(undefined, false, undefined, true, bot.id);
+		} catch (error) {
+			this.emit({
+				type: "notice",
+				level: "error",
+				text: `无法打开私聊：${(error as Error).message}`,
+				textEn: `Could not open the private chat: ${(error as Error).message}`,
+			});
+			return false;
+		}
+	}
+
+	/**
+	 * Bot 没配模型时的兜底：本机默认模型 → 这个工作区/项目的模型 → 当前会话正在用的模型。
+	 * 只认「本机默认」会在没设默认模型的客户端上直接抛错（Bot 私聊根本建不出来），
+	 * 而项目模型是用户实际在工作区里用的那个：刷新/重启后重开私聊靠它兜底。
+	 */
+	private botFallbackModel(cwd?: string): string | undefined {
+		const configured = this.stateStore?.getDefaultModel("pi");
+		if (configured) return configured;
+		const workspace = cwd || this.cwd;
+		if (workspace) {
+			try {
+				const forProject = this.stateStore?.getProjectModel(this.clientId, workspace, "pi");
+				if (forProject) return forProject;
+			} catch {}
+		}
+		try {
+			const model = this.conv?.session?.agent?.state?.model as { provider?: string; id?: string } | undefined;
+			if (model?.provider && model.id) return `${model.provider}/${model.id}`;
+		} catch {}
+		return undefined;
+	}
+
+	/** `captureModel` 没有可用兜底时的可读提示（嵌套在「切换会话失败：」后面也要能看懂）。 */
+	private botModelUnavailableText(error: unknown): string {
+		const reason = (error as Error)?.message ?? String(error);
+		return `这个智能体还没有可用模型（${reason}）：请先在设置里选择一个模型，或到设备中心给它配置模型 / This agent has no usable model yet (${reason}): pick one in Settings or set it for the agent in the device center`;
+	}
+
+	/** 两个工作目录是不是同一个（win32 下大小写无意义）。 */
+	private sameWorkspace(a?: string, b?: string): boolean {
+		if (!a || !b) return false;
+		try {
+			const left = resolve(a);
+			const right = resolve(b);
+			return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * 已开的私聊遇到 Bot 改过配置（revision 变了）：按**当前**配置重绑。
+	 *
+	 * 能力是冻结快照（这是白名单不被运行期篡改的前提），所以编辑 Bot 后必须显式换一份，
+	 * 否则用户会看到「改了没生效」。正在跑的轮次不换（会打断工具授权），给一条提示。
+	 */
+	private async rebindBotChatIfStale(conv: Conversation, botId: string): Promise<void> {
+		const current = conv.bot;
+		if (!current) return;
+		const bot = await resolveBotChatBot(botId);
+		if (!bot || bot.revision === current.bot.revision) return;
+		let busy = false;
+		try {
+			busy = conv.session.isIdle === false;
+		} catch {}
+		if (busy) {
+			this.emit({
+				type: "notice",
+				level: "info",
+				text: "这个智能体的配置已更新：本轮结束后再点开它，就会按新配置生效。",
+				textEn: "This agent was updated; open it again after the current turn to apply the new configuration.",
+			});
+			return;
+		}
+		const created = await createBotChatCapability(botId);
+		if (!created) return;
+		try {
+			created.capability.captureModel(this.botFallbackModel(bot.cwd));
+		} catch (error) {
+			this.emit({
+				type: "notice",
+				level: "warning",
+				text: `智能体已更新，但新配置没有可用模型：${(error as Error).message}。先选一个模型后再点开它。`,
+				textEn: `The agent was updated, but its new configuration has no usable model: ${(error as Error).message}. Pick a model, then open it again.`,
+			});
+			return;
+		}
+		current.revoke();
+		this.attachBotBinding(conv, created.capability);
+		// MCP server 白名单也可能改了：旧桥按旧配置连的，必须按新配置重建（否则新 server 要等新开对话）。
+		const staleBridge = this.botMcpByConversation.get(conv.id);
+		if (staleBridge) {
+			this.botMcpByConversation.delete(conv.id);
+			try {
+				staleBridge.dispose();
+			} catch {}
+		}
+		if (created.bot.mcpServers.length > 0) {
+			try {
+				const bridge = new McpBridge(this.stateStore.dataDir, undefined, {
+					agentDir: this.agentDir,
+					cwd: conv.cwd,
+					allowedServers: created.bot.mcpServers,
+				});
+				await bridge.load();
+				this.botMcpByConversation.set(conv.id, bridge);
+			} catch {}
+		}
+		this.applyToolGating(conv.session, conv.agentPreset);
+		const target = bot.model;
+		if (target) {
+			try {
+				await this.setModel(`${target.provider}/${target.modelId}`, conv);
+			} catch {}
+		}
+		this.emit({
+			type: "notice",
+			level: "info",
+			text: "这个智能体已更新：身份、工具与记忆按新配置生效。",
+			textEn: "Agent updated: identity, tools and memory now follow the new configuration.",
+		});
+	}
+
 	async newChat(
 		_preset?: string,
 		ephemeral?: boolean,
 		onReady?: (id: string) => void,
 		independent = true,
+		botId?: string,
 	): Promise<boolean> {
 		if (this.quiesceBlocked()) return false;
+		// 私聊 = 普通对话 + Bot 身份：先把常驻能力建好，建会话时按 Bot 的目录/模型/工具/prompt 走。
+		const botChat = botId ? await createBotChatCapability(botId) : undefined;
+		if (botId && !botChat) {
+			this.emit({
+				type: "notice",
+				level: "error",
+				text: "这个智能体已不可用（被删除或停用），请到设备中心确认后再试。",
+				textEn: "This agent is unavailable (deleted or disabled). Check the device center and retry.",
+			});
+			return false;
+		}
+		// Bot 没配模型时用本机默认模型（与无头设备任务一致：`captureModel` 只认第一次传入的兜底值）。
+		// 兜底再退到"当前会话正在用的模型"：没设默认模型的客户端否则会直接抛错，且没人接。
+		if (botChat) {
+			try {
+				botChat.capability.captureModel(this.botFallbackModel(botChat.bot.cwd));
+			} catch (error) {
+				this.emit({
+					type: "notice",
+					level: "error",
+					text: `无法创建私聊：${(error as Error).message}。请先选择一个模型，或到设备中心给这个智能体配置模型。`,
+					textEn: `Could not start the private chat: ${(error as Error).message}. Pick a model first, or set one for this agent in the device center.`,
+				});
+				return false;
+			}
+		}
+		const sameBotChat = (c: Conversation | undefined) => !!botChat && c?.botId === botChat.bot.id;
 		const isBlank = (c: Conversation): boolean => {
 			if (c.transferring || c.nativeCli) return false;
 			try {
@@ -12035,7 +13017,8 @@ export class ClientSession {
 			}
 		};
 		const active = this.convs.get(this.activeId);
-		if (!ephemeral && active && !active.transferring && isBlank(active)) {
+		const reuseActive = botChat ? sameBotChat(active) : !active?.botId;
+		if (!ephemeral && active && !active.transferring && isBlank(active) && reuseActive) {
 			if (_preset) await this.selectAgentPreset(_preset);
 			else {
 				this.pushSettings();
@@ -12048,6 +13031,7 @@ export class ClientSession {
 		if (!ephemeral) {
 			for (const conv of this.convs.values()) {
 				if (conv.id === this.activeId || conv.transferring) continue;
+				if (botChat ? conv.botId !== botChat.bot.id : !!conv.botId) continue;
 				if (isBlank(conv)) {
 					await this.switchConversation(conv.id);
 					if (_preset) await this.selectAgentPreset(_preset);
@@ -12060,9 +13044,7 @@ export class ClientSession {
 		}
 		if (!ephemeral) {
 			this.makeRoomForConversation(this.cwd, 1);
-			const openInProject = [...this.convs.values()].filter(
-				(c) => c.cwd === this.cwd && !c.isSubagent && !c.isEphemeral,
-			).length;
+			const openInProject = this.countOpenConversations(this.cwd);
 			const maxOpenConversations = getMaxOpenConversations();
 			if (openInProject >= maxOpenConversations) {
 				const notice = this.maxOpenConversationsNotice(maxOpenConversations);
@@ -12102,11 +13084,21 @@ export class ClientSession {
 					mkdirSync(ephemeralDir, { recursive: true });
 					(sessionManager as unknown as { sessionDir: string }).sessionDir = ephemeralDir;
 				} catch {}
+			} else if (botChat) {
+				// Bot 私聊的转录落在 bot 自己的目录里：与普通会话历史分开，下次点这个 Bot 就回到这一份。
+				sessionManager = SessionManager.create(sessionBaseDir, botChatSessionDir(this.agentDir, botChat.bot.id));
 			} else {
 				sessionManager = SessionManager.create(sessionBaseDir);
 			}
+			if (botChat) this.pendingBotChat.set(conversationId, botChat.capability);
 			const runtime = await createAgentSessionRuntime(
-				this.makeRuntimeFactory(terminals, undefined, conversationId, prevModel ?? undefined, _preset),
+				this.makeRuntimeFactory(
+					terminals,
+					undefined,
+					conversationId,
+					prevModel ?? undefined,
+					botChat ? undefined : _preset,
+				),
 				{
 					cwd: sessionBaseDir,
 					agentDir: this.agentDir,
@@ -12116,6 +13108,12 @@ export class ClientSession {
 			const conv = this.makeConversation(runtime, conversationId, terminals);
 			conv.cwd = this.cwd;
 			conv.independent = independent;
+			if (botChat) {
+				conv.bot = botChat.capability;
+				conv.botId = botChat.bot.id;
+				conv.botName = botChat.bot.name;
+				this.pendingBotChat.delete(conversationId);
+			}
 			conv.session.sessionManager.appendCustomEntry("webui/independent", { independent });
 			if (ephemeral) conv.isEphemeral = true;
 			if (_preset) {
@@ -12211,8 +13209,8 @@ export class ClientSession {
 	private markCompactionPending(conv: Conversation): void {
 		try {
 			markCompactionState(this.compactionFile(conv), {
-				reason: conv.compactionState?.reason ?? "manual",
-				startedAt: conv.compactionState?.startedAt ?? Date.now(),
+				reason: conv.compaction?.reason ?? "manual",
+				startedAt: conv.compaction?.startedAt ?? Date.now(),
 			});
 		} catch (error) {
 			this.compactionPersistenceFailed(error);
@@ -12231,7 +13229,7 @@ export class ClientSession {
 		try {
 			if (outcome)
 				conv.session.sessionManager.appendCustomEntry("pi-web-ui/compaction-done", {
-					reason: conv.compactionState?.reason ?? "manual",
+					reason: conv.compaction?.reason ?? "manual",
 					...outcome,
 				});
 			finishCompactionState(this.compactionFile(conv));
@@ -12481,10 +13479,28 @@ export class ClientSession {
 		return conv;
 	}
 
-	private hasLiveSubagentChild(conv: Conversation): boolean {
-		return [...new Set([this, ...(this.allSubagentSessions?.() ?? [])])].some((owner) =>
-			[...owner.convs.values()].some((child) => owner.parentExecution(child)?.conv === conv),
-		);
+	/**
+	 * 有子对话的对话集合：一次全量父链解析得出。
+	 * issue #946：原先 `hasLiveSubagentChild` 在 `makeRoomForConversation` 里被逐候选调用，内部又是 S×C 全扫
+	 * → 合计 O((S·C)²)。现在每轮只算一次，候选判定降为 O(1)。
+	 */
+	private conversationsWithChildren(): Set<Conversation> {
+		const owners = new Set([this, ...(this.allSubagentSessions?.() ?? [])]);
+		const withChildren = new Set<Conversation>();
+		for (const owner of owners) {
+			for (const child of owner.convs.values()) {
+				const parent = owner.parentExecution(child)?.conv;
+				if (parent) withChildren.add(parent);
+			}
+		}
+		return withChildren;
+	}
+
+	private hasLiveSubagentChild(conv: Conversation, withChildren?: ReadonlySet<Conversation>): boolean {
+		if (withChildren) return withChildren.has(conv);
+		// 绑定是 spawn / 过户时做的（`bindConversationParent` 是唯一入口），反向索引即权威。
+		if (hasConversationChildren(conv)) return true;
+		return this.conversationsWithChildren().has(conv);
 	}
 
 	private isRetainedOnDisplace(conv: Conversation): boolean {
@@ -12500,7 +13516,7 @@ export class ClientSession {
 				reviewing: conv.goal.reviewing,
 				wizardRunning: conv.wizardRunning,
 				streaming: conv.session.isStreaming,
-				compacting: conv.session.isCompacting,
+				compacting: conv.session.isCompacting || !!conv.compaction,
 				openTerminals: conv.terminals.countBlockingLive(),
 				listed: conv.listed,
 				promptedSinceActive: conv.promptedSinceActive,
@@ -12521,22 +13537,51 @@ export class ClientSession {
 		return !this.isRetainedOnDisplace(conv);
 	}
 
-	private countProjectSlots(cwd: string): number {
+	/**
+	 * 计入名额的对话：本项目的普通对话。钉住的是用户明确要求常驻，不占自动名额
+	 * （否则「钉满 12 个」就会把历史会话彻底锁死，issue #944）。
+	 */
+	private countOpenConversations(cwd: string): number {
 		let open = 0;
-		for (const c of this.convs.values()) if (c.cwd === cwd && !c.isSubagent && !c.isEphemeral) open++;
-		return open + (this.creatingConversations.get(cwd) ?? 0);
+		for (const c of this.convs.values()) {
+			if (c.cwd === cwd && !c.isSubagent && !c.isEphemeral && !c.pinned) open++;
+		}
+		return open;
 	}
 
-	private isEvictableViewedConversation(c: Conversation): boolean {
-		if (!c.viewOnly || c.id === this.activeId || c.pinned || c.transferring) return false;
+	private countProjectSlots(cwd: string): number {
+		return this.countOpenConversations(cwd) + (this.creatingConversations.get(cwd) ?? 0);
+	}
+
+	/** 新建 / 打开一个对话后本项目将占用多少个名额（含即将切走释放的当前对话）。 */
+	private projectedOpenSlots(cwd: string, displaced?: Conversation | null): number {
+		const freed =
+			displaced && displaced.cwd === cwd && !displaced.isSubagent && !displaced.isEphemeral && !displaced.pinned
+				? 1
+				: 0;
+		return this.countOpenConversations(cwd) + (this.creatingConversations.get(cwd) ?? 0) + 1 - freed;
+	}
+
+	/**
+	 * 可被 LRU 自动收起的对话：空闲、非当前、非钉住、无任何活（流式/压缩/投递/终端/子代理/后台任务）。
+	 * issue #944：不再限制必须是 `viewOnly`——跟你在里面说过话的对话一样可以收起，转录在磁盘上、
+	 * 左栏历史行保留，点一下就能重新打开；否则「从历史打开过并发过消息」的对话会永久常驻（实测每份几百 MB）。
+	 */
+	private isEvictableViewedConversation(c: Conversation, withChildren?: ReadonlySet<Conversation>): boolean {
+		if (c.id === this.activeId || c.pinned || c.transferring) return false;
 		if (c.isSubagent || c.isEphemeral || c.nativeCli || c.promptInFlight) return false;
+		// 用户显式选择「保留已结束的对话」时不自动收起（这是用户自己的选择）。
+		if (this.settingsSvc?.current.retainFinishedConversations) return false;
+		// 刚切走的对话留一个冷却期：避免「点错一下就把我刚在写的对话收掉」。
+		if (Date.now() - (c.lastActiveAt || 0) < EVICT_MIN_IDLE_MS) return false;
 		try {
-			if (c.session.isStreaming || c.session.isCompacting) return false;
+			// 正在跑 / 正在压缩 / 压缩已排队 / 还有待投递意图：一律不驱逐。
+			if (this.deliveryModeOf(c) !== "idle") return false;
 		} catch {
 			return false;
 		}
 		if (c.terminals.countBlockingLive() > 0) return false;
-		if (this.hasLiveSubagentChild(c)) return false;
+		if (this.hasLiveSubagentChild(c, withChildren)) return false;
 		return !shouldRetainActive({
 			reviewing: c.goal.reviewing,
 			wizardRunning: c.wizardRunning,
@@ -12561,16 +13606,18 @@ export class ClientSession {
 		if (this.countProjectSlots(cwd) + needed <= max) return true;
 		const active = this.convs.size > 0 ? this.conv : null;
 		const freed = typeof activeWillBeFreed === "function" ? activeWillBeFreed() : activeWillBeFreed;
-		const activeCredit = freed && active && active.cwd === cwd && !active.isSubagent && !active.isEphemeral ? 1 : 0;
+		const activeCredit =
+			freed && active && active.cwd === cwd && !active.isSubagent && !active.isEphemeral && !active.pinned ? 1 : 0;
 		const over = () => this.countProjectSlots(cwd) + needed - activeCredit > max;
 		if (!over()) return true;
 		const candidates = [...this.convs.values()]
 			.filter((c) => c.cwd === cwd)
 			.sort((a, b) => a.lastActiveAt - b.lastActiveAt);
+		const withChildren = this.conversationsWithChildren();
 		const evicted: string[] = [];
 		for (const c of candidates) {
 			if (!over()) break;
-			if (!this.isEvictableViewedConversation(c)) continue;
+			if (!this.isEvictableViewedConversation(c, withChildren)) continue;
 			evicted.push(c.title || basename(c.session.sessionFile ?? "") || c.id);
 			this.removeConversation(c.id);
 		}
@@ -12579,8 +13626,8 @@ export class ClientSession {
 			this.emit({
 				type: "notice",
 				level: "info",
-				text: `运行的对话已达上限（${max} 个），已自动收起较早仅查看过的对话 ${names}，可在历史对话中重新打开`,
-				textEn: `Running chats reached the limit (${max}); closed ${evicted.length} earlier view-only chat(s) to make room. Reopen them from history anytime.`,
+				text: `运行的对话已达上限（${max} 个），已自动收起较早的对话 ${names}，可在历史对话中重新打开`,
+				textEn: `Running chats reached the limit (${max}); closed ${evicted.length} earlier chat(s) to make room. Reopen them from history anytime.`,
 			});
 			this.emitConversations();
 		}
@@ -12590,6 +13637,15 @@ export class ClientSession {
 	private removeConversation(id: string, runtimeDisposed = false): void {
 		const conv = this.convs.get(id);
 		if (!conv || id === this.activeId) return;
+		// 会话关掉就把它专属的 Bot MCP 桥释放掉，避免一个 Bot 一份桥常驻。
+		const botBridge = this.botMcpByConversation.get(id);
+		if (botBridge) {
+			this.botMcpByConversation.delete(id);
+			try {
+				botBridge.dispose();
+			} catch {}
+		}
+		this.memoryQuotas.delete(id);
 		if (conv.nativeCli) conv.nativeCliClosed = true;
 		this.settlePendingsForConv(id);
 		conversationCommunication.close(conv);
@@ -12609,22 +13665,25 @@ export class ClientSession {
 			this.getClaimStore?.().releaseByOwner(id);
 		} catch {}
 		this.convs.delete(id);
+		forgetConversationHome(conv);
+		// 反向索引不能把已 dispose 的子对话吊在父对话上（否则那份 runtime 永远回收不掉）。
+		unindexConversationChild(conv);
 		conv.suspendedSubagents?.clear();
 		for (const c of this.convs.values()) {
 			c.suspendedSubagents?.delete(conv);
 		}
-		const pendingNotice = this.pendingSubagentNotices.get(id);
-		if (pendingNotice) {
-			clearTimeout(pendingNotice.timer);
-			this.pendingSubagentNotices.delete(id);
-		}
-		for (const [pId, entry] of this.pendingSubagentNotices) {
+		for (const [pId, entry] of this.subagentNoticeTimers) {
 			entry.subagents.delete(conv);
 			if (entry.subagents.size === 0) {
 				clearTimeout(entry.timer);
-				this.pendingSubagentNotices.delete(pId);
+				this.subagentNoticeTimers.delete(pId);
 			}
 		}
+		// 对话没了：还排在它身上的投递意图不再有落点，就地清干净并如实提示。
+		conv.deliveryClosed = true;
+		const deliveryQueue = conv.delivery;
+		conv.delivery = undefined;
+		deliveryQueue?.close(this.deliveryHost(conv));
 		this.pluginModelKeys?.delete(id);
 		this.planManager.unbindConversation(id);
 		this.markerSvc.clearConversation(id);
@@ -12776,7 +13835,11 @@ export class ClientSession {
 		// 按对象身份摘，不按 id：`insertTakeoverConvs` 在目标页撞号时会把 conv.id 重编，
 		// 那时来源页 map 的 key 还是旧 id，按 id 删会漏（留下一条「已搬走却还在」的幽灵行）。
 		const moved = new Set(payload.convs);
-		for (const [id, conv] of this.convs) if (moved.has(conv)) this.convs.delete(id);
+		for (const [id, conv] of this.convs) {
+			if (!moved.has(conv)) continue;
+			this.convs.delete(id);
+			forgetConversationHome(conv);
+		}
 		if (!this.convs.has(this.activeId)) {
 			const fallback = [...this.convs.values()].find((c) => !c.isSubagent) ?? [...this.convs.values()][0];
 			if (fallback) this.activeId = fallback.id;
@@ -12867,6 +13930,8 @@ export class ClientSession {
 			}
 
 			this.convs.set(conv.id, conv);
+			registerConversationHome(conv, this);
+			indexConversationChild(conv);
 		}
 		if (!mainId) mainId = payload.convs[0]?.id ?? "";
 		for (const q of payload.questions) {
@@ -12930,7 +13995,9 @@ export class ClientSession {
 			}
 		}
 		for (const [id, conv] of this.convs) {
-			if (moved.has(conv)) this.convs.delete(id);
+			if (!moved.has(conv)) continue;
+			this.convs.delete(id);
+			forgetConversationHome(conv);
 		}
 		if (!this.convs.has(this.activeId)) {
 			const fallback = [...this.convs.values()].find((c) => !c.isSubagent) ?? [...this.convs.values()][0];
@@ -13076,7 +14143,11 @@ export class ClientSession {
 	}
 
 	private emitConversations(): void {
-		for (const conv of this.convs.values()) this.notifyConversationCompletion(conv);
+		for (const conv of this.convs.values()) {
+			this.notifyConversationCompletion(conv);
+			// 对账兜底：门开着的对话，把排队中的意图推一把（drain 幂等且自带重入保护）。
+			if (conv.delivery?.size) void this.drainDeliveries(conv);
+		}
 		const conversations: ConversationSummary[] = [];
 		const visibleParents = new Set(
 			[...this.convs.values()]
@@ -13144,6 +14215,9 @@ export class ClientSession {
 				...(conv.terminals.countUserBlockingLive() > 0 ? { hasUserTerminals: true as const } : {}),
 				...(conv.forkFrom ? { forkFrom: conv.forkFrom } : {}),
 				...(conv.forkFrom || conv.forkedFromSessionPath ? { forked: true as const } : {}),
+				// 私聊 = 普通对话 + Bot 身份：左栏/头部据此显示是谁，并高亮「智能体」区那一行。
+				...(conv.botId ? { botId: conv.botId } : {}),
+				...(conv.botName ? { botName: conv.botName } : {}),
 			});
 		}
 		try {
@@ -13179,7 +14253,7 @@ export class ClientSession {
 	 */
 	private sessionsPushTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-	private static projectsCache: { at: number; projects: ProjectSummary[] } | null = null;
+	private static projectsCache: { at: number; projects: ProjectSummary[]; stale?: boolean } | null = null;
 	private static readonly PROJECTS_CACHE_TTL = 60_000;
 	private static projectsInFlight: Promise<ProjectSummary[] | null> | null = null;
 
@@ -13616,7 +14690,8 @@ export class ClientSession {
 				if (stillHeld) {
 					let stillRunning: boolean;
 					try {
-						stillRunning = stillHeld.session.isStreaming || stillHeld.session.isCompacting;
+						// 跑着 / 压缩中 / 还有待投递意图：都算「不是空闲」，别把会话从脚下抽走。
+						stillRunning = this.deliveryModeOf(stillHeld) !== "idle";
 					} catch {
 						stillRunning = true;
 					}
@@ -14352,6 +15427,11 @@ export class ClientSession {
 		let outcome: "loaded" | "reused" | "stopped" | "error" = "stopped";
 		let openedRuntime: AgentSessionRuntime | null = null;
 		let openedTerminals: TerminalManager | null = null;
+		// issue #943：同一份 transcript 的并发打开必须共用一次创建，否则两个请求各建一份 runtime、双写同一份记录。
+		let openingKey: string | null = null;
+		let openingPromise: Promise<string | undefined> | null = null;
+		let settleOpening: (conversationId?: string) => void = () => {};
+		let openedConversationId: string | undefined;
 		try {
 			const wantSid = sessionId?.trim() ?? "";
 			if (!path.trim() && wantSid) {
@@ -14420,6 +15500,43 @@ export class ClientSession {
 				}
 			}
 
+			// 正在打开同一份 transcript：等第一次创建的结果直接复用，绝不进第二遍创建（issue #943）。
+			const inflight = this.openingSessions.get(targetPath);
+			if (inflight) {
+				const ongoingId = await inflight.catch(() => undefined);
+				const ongoing = ongoingId ? this.convs.get(ongoingId) : undefined;
+				if (ongoing) {
+					if (independent !== undefined) this.setConversationIndependent(ongoing.id, independent);
+					if (ongoing.id !== this.activeId) await this.switchConversation(ongoing.id);
+					outcome = "reused";
+					this.emit({
+						type: "transition_progress",
+						kind: "session",
+						target: targetPath,
+						phase: "done",
+						progress: 100,
+						text: "会话加载完成",
+						textEn: "Session loaded",
+					});
+					this.flushSnapshot();
+					return;
+				}
+				// 第一份没打开成功：不再重复一轮长耗时创建，让用户重试即可。
+				this.emit({
+					type: "notice",
+					level: "warning",
+					text: "该会话刚刚打开失败，请重试",
+					textEn: "Opening this session just failed — please retry",
+				});
+				this.flushSnapshot();
+				return;
+			}
+			openingKey = targetPath;
+			openingPromise = new Promise<string | undefined>((resolveOpening) => {
+				settleOpening = resolveOpening;
+			});
+			this.openingSessions.set(targetPath, openingPromise);
+
 			if (this.botExecution) {
 				this.botExecution.assertActive();
 				if (targetPath !== resolve(this.botExecution.authorizedResumePath ?? ""))
@@ -14429,23 +15546,28 @@ export class ClientSession {
 			}
 			const owner = this.findSessionOwner?.(targetPath);
 			if (owner && this.botExecution) throw new Error("Bot transcript still has an active owner");
-			if (owner && owner.isStreaming) {
-				this.emit({
-					type: "notice",
-					level: "warning",
-					text: `该对话正在另一处运行中（「${owner.title}」），为避免两个 agent 同时写同一份记录，已停止打开。请等它结束后再试，或回到原窗口继续。`,
-					textEn: `This conversation is running in another window ("${owner.title}"). Opening it here would create a second writer for the same transcript, so it was blocked. Wait for it to finish, or continue in the original window.`,
-				});
-				this.flushSnapshot();
-				return;
-			}
-			if (owner) {
-				if (owner.clientId.startsWith("scheduler:")) {
+			if (owner?.clientId.startsWith("scheduler:")) {
+				// 定时任务的报告对话就是一条普通对话：不拦，也不做成「另一处」只读行。
+				// 打开前让后台持有方放手（否则两个 writer 抢同一份转录）；正在跑就拒绝，
+				// 让用户等这一轮结束再来（面板/历史随时可以再点）。
+				const released = (await this.releaseSchedulerConversation?.(owner.clientId, owner.convId)) ?? false;
+				if (!released) {
 					this.emit({
 						type: "notice",
 						level: "warning",
-						text: `该对话正在由后台定时任务使用（「${owner.title}」），为避免并发写入，已停止打开。可在后台任务面板查看进度。`,
-						textEn: `This conversation is currently used by a background scheduled task ("${owner.title}"). Opening was blocked to prevent concurrent writes.`,
+						text: `这条对话正在被定时任务「${owner.title}」使用，等这一轮结束再打开（也可以到「定时任务」面板看进度）。`,
+						textEn: `A scheduled task ("${owner.title}") is still running in this conversation. Open it after this run finishes, or watch progress in the Scheduled tasks panel.`,
+					});
+					this.flushSnapshot();
+					return;
+				}
+			} else if (owner) {
+				if (owner.isStreaming) {
+					this.emit({
+						type: "notice",
+						level: "warning",
+						text: `该对话正在另一处运行中（「${owner.title}」），为避免两个 agent 同时写同一份记录，已停止打开。请等它结束后再试，或回到原窗口继续。`,
+						textEn: `This conversation is running in another window ("${owner.title}"). Opening it here would create a second writer for the same transcript, so it was blocked. Wait for it to finish, or continue in the original window.`,
 					});
 					this.flushSnapshot();
 					return;
@@ -14521,15 +15643,15 @@ export class ClientSession {
 
 			const oldListed = this.conv.listed;
 			const displaced = this.displaceActive();
-			const openInProject =
-				[...this.convs.values()].filter((c) => c.cwd === targetCwd && !c.isSubagent && !c.isEphemeral).length +
-				(this.creatingConversations?.get(targetCwd) ?? 0) +
-				1 -
-				(displaced?.cwd === targetCwd && !displaced?.isSubagent && !displaced?.isEphemeral ? 1 : 0);
+			const openInProject = this.projectedOpenSlots(targetCwd, displaced);
 			const maxOpenConversations = getMaxOpenConversations();
 			if (
 				openInProject > maxOpenConversations &&
-				!this.makeRoomForConversation(targetCwd, 1, displaced?.cwd === targetCwd && !displaced?.isSubagent)
+				!this.makeRoomForConversation(
+					targetCwd,
+					1,
+					displaced?.cwd === targetCwd && !displaced?.isSubagent && !displaced?.pinned,
+				)
 			) {
 				this.conv.listed = oldListed;
 				openedTerminals.killAll();
@@ -14557,6 +15679,7 @@ export class ClientSession {
 			this.noticeInterruptedCompaction(conv);
 			this.convs.set(conv.id, conv);
 			this.activeId = conv.id;
+			openedConversationId = conv.id;
 			openedRuntime = null;
 			openedTerminals = null;
 			if (displaced) this.removeConversation(displaced.id);
@@ -14618,6 +15741,10 @@ export class ClientSession {
 				textEn: `Failed to switch session: ${(err as Error).message}`,
 			});
 		} finally {
+			settleOpening(openedConversationId);
+			if (openingKey && openingPromise && this.openingSessions.get(openingKey) === openingPromise) {
+				this.openingSessions.delete(openingKey);
+			}
 			timing.finish(outcome);
 		}
 		if (outcome !== "loaded") this.flushSnapshot();
@@ -14746,11 +15873,7 @@ export class ClientSession {
 
 			const oldListed = this.conv.listed;
 			const displaced = this.displaceActive();
-			const openInProject =
-				[...this.convs.values()].filter((c) => c.cwd === targetConv.cwd && !c.isSubagent && !c.isEphemeral).length +
-				(this.creatingConversations?.get(targetConv.cwd) ?? 0) +
-				1 -
-				(displaced?.cwd === targetConv.cwd && !displaced?.isSubagent && !displaced?.isEphemeral ? 1 : 0);
+			const openInProject = this.projectedOpenSlots(targetConv.cwd, displaced);
 			const maxOpenConversations = getMaxOpenConversations();
 			if (openInProject > maxOpenConversations) {
 				this.conv.listed = oldListed;
@@ -15119,8 +16242,9 @@ export class ClientSession {
 			const cache = ClientSession.projectsCache;
 			if (!cache) {
 				await this.ensureProjectsCache(false);
-			} else if (now - cache.at >= ClientSession.PROJECTS_CACHE_TTL) {
-				void this.ensureProjectsCache(false).catch(() => {});
+			} else if (cache.stale || now - cache.at >= ClientSession.PROJECTS_CACHE_TTL) {
+				// stale-while-revalidate（issue #946）：先用现有列表渲染，后台重扫，扫完再推。
+				void this.ensureProjectsCache(true).catch(() => {});
 			}
 			const recent = await this.stateStore.getRecentProjects(this.clientId);
 			this.emit({ type: "projects", projects: this.withCurrentCwd(recent, now) });
@@ -15206,7 +16330,10 @@ export class ClientSession {
 	}
 
 	private invalidateProjectsCache(): void {
-		ClientSession.projectsCache = null;
+		// 标脏而非置空（issue #946）：`applyCwdSideEffects` 每次跨项目切换都会走到这里，
+		// 置空会让紧接着的 `pushProjects` 同步 `await` 一次全盘 session 根扫描（并阻塞切换）。
+		// 列表权威数据在 stateStore，`pushProjects` 每次都会重读，旧缓存只是不再代表「刚刚扫过」。
+		if (ClientSession.projectsCache) ClientSession.projectsCache = { ...ClientSession.projectsCache, stale: true };
 	}
 
 	async listFiles(relPath?: string): Promise<void> {
@@ -15388,7 +16515,7 @@ export class ClientSession {
 		this.flushSnapshot();
 	}
 
-	async setCwd(newCwd: string): Promise<void> {
+	async setCwd(newCwd: string, options?: { forBotChat?: boolean }): Promise<void> {
 		if (this.botExecution) throw new Error("Bot cwd is fixed");
 		try {
 			const { resolve } = await import("node:path");
@@ -15432,7 +16559,9 @@ export class ClientSession {
 
 			const displaced = this.displaceActive();
 
-			const openRecent = this.settingsSvc?.current.openRecentSessionOnProjectSwitch ?? true;
+			// 打开 Bot 私聊时不要顺带恢复“该项目最近的普通会话”：用户要的是和这个 Bot 说话。
+			const openRecent =
+				options?.forBotChat === true ? false : (this.settingsSvc?.current.openRecentSessionOnProjectSwitch ?? true);
 
 			let target: Conversation | undefined;
 			if (openRecent) {
@@ -15969,14 +17098,10 @@ export class ClientSession {
 
 	private async gitDiff(cwd: string): Promise<string> {
 		try {
-			const { code, out } = await this.runAsync("git", ["diff", "HEAD"], 10_000, cwd);
-			if (code !== 0) return "";
-			let status = "";
-			try {
-				const st = await this.runAsync("git", ["status", "--porcelain"], 10_000, cwd);
-				if (st.code === 0) status = st.out;
-			} catch {}
-			return buildDiffFingerprint(out, status);
+			const diff = await runGit(["diff", "HEAD"], { cwd, timeoutMs: 10_000 });
+			if (!diff.ok) return "";
+			const st = await runGit(["status", "--porcelain"], { cwd, timeoutMs: 10_000 });
+			return buildDiffFingerprint(diff.stdout, st.ok ? st.stdout : "");
 		} catch {
 			return "";
 		}
@@ -16140,6 +17265,13 @@ export class ClientSession {
 		this.settingsSvc.dispose();
 		this.botExecution?.revoke();
 		this.botMcpBridge?.dispose();
+		for (const bridge of this.botMcpByConversation.values()) {
+			try {
+				bridge.dispose();
+			} catch {}
+		}
+		this.botMcpByConversation.clear();
+		this.memoryQuotas.clear();
 		this.sessionSearchController?.abort();
 		this.pluginModelKeys?.clear();
 		this.modelAdmin.dispose();
@@ -16163,14 +17295,30 @@ export class ClientSession {
 			clearInterval(this.stallTimer);
 			this.stallTimer = null;
 		}
+		if (this.subagentRecycleTimer) {
+			clearInterval(this.subagentRecycleTimer);
+			this.subagentRecycleTimer = null;
+		}
 		this.files.unwatchDir();
 		this.files.unwatchGit();
 		this.unwatchMcpInventory();
 		this.webUi.dispose();
-		for (const entry of this.pendingSubagentNotices.values()) {
+		for (const entry of this.subagentNoticeTimers.values()) {
 			clearTimeout(entry.timer);
 		}
-		this.pendingSubagentNotices.clear();
+		this.subagentNoticeTimers.clear();
+		for (const conv of this.convs.values()) {
+			conv.deliveryClosed = true;
+			const queue = conv.delivery;
+			conv.delivery = undefined;
+			queue?.close({
+				mode: () => "closed",
+				deliver: async () => "gated",
+				onDelivered: () => {},
+				onDropped: () => {},
+				onRetryable: () => {},
+			});
+		}
 		for (const c of this.convs.values()) {
 			c.suspendedSubagents?.clear();
 		}
@@ -16209,7 +17357,7 @@ export class ClientSession {
 	}
 }
 
-import { checkPluginCwd, isPseudoClientId } from "./client-id-utils.js";
+import { checkPluginCwd, isPseudoClientId, isUnattendedClientId } from "./client-id-utils.js";
 export { checkPluginCwd, isPseudoClientId };
 
 import { AgentService } from "./agent-service-daemon.js";
